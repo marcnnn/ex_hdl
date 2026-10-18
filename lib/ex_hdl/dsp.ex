@@ -137,6 +137,11 @@ defmodule ExHdl.DSP do
   Options: `:kernel_opts` (a trailing keyword list for the kernel) plus
   everything `ExHdl.DSP.Compiler` accepts.
 
+  With `compiler: EXLA` (or another Nx compiler) all samples run in one
+  compiled `while` loop (`ExHdl.DSP.ScanLoop`), after the same width check;
+  results are bit-identical. `stacked: true` then returns the outputs as
+  tensors with the sample index as first axis instead of a list.
+
   Returns `{outputs, final_state}`.
   """
   def run_scan(fun, samples, initial_state, params \\ [], opts \\ [])
@@ -159,11 +164,129 @@ defmodule ExHdl.DSP do
       [template.(first), template.(initial_state) | Enum.map(params, template)] ++
         if(kernel_opts, do: [kernel_opts], else: [])
 
-    step = Nx.Defn.compile(fun, templates, Keyword.put(opts, :compiler, ExHdl.DSP.Compiler))
+    case Keyword.pop(opts, :compiler) do
+      {nil, opts} ->
+        {_stacked, opts} = Keyword.pop(opts, :stacked)
+        step = Nx.Defn.compile(fun, templates, Keyword.put(opts, :compiler, ExHdl.DSP.Compiler))
 
-    Enum.map_reduce(samples, initial_state, fn sample, state ->
-      apply(step, [sample, state | params])
-    end)
+        Enum.map_reduce(samples, initial_state, fn sample, state ->
+          apply(step, [sample, state | params])
+        end)
+
+      {compiler, opts} ->
+        run_scan_loop(fun, samples, initial_state, params, templates, kernel_opts, compiler, opts)
+    end
+  end
+
+  # Width-checks the step once, then runs all samples in one compiled loop.
+  defp run_scan_loop(fun, samples, initial_state, params, _templates, kernel_opts, compiler, opts) do
+    {stacked?, opts} = Keyword.pop(opts, :stacked, false)
+    opts = [compiler: compiler, kernel_opts: kernel_opts] ++ opts
+
+    {outputs, final} =
+      run_scan_stacked(fun, ExHdl.DSP.ScanLoop.stack(samples), initial_state, params, opts)
+
+    if stacked?, do: {outputs, final}, else: {unstack(outputs, length(samples)), final}
+  end
+
+  @doc """
+  Like `run_scan/5`, but `samples` is one container whose tensors carry the
+  sample index as first axis (e.g. `{i, q}` with two `s16[n]` tensors), and
+  the outputs come back the same way. This is the fast path: no per-sample
+  Elixir data.
+
+  Options: `:compiler` (default `EXLA` if available, else the Nx evaluator),
+  `:kernel_opts`, and the width-check options of `analyze/3`. With EXLA the
+  inputs are moved to `EXLA.Backend` first; the results stay there.
+  """
+  def run_scan_stacked(fun, samples, initial_state, params \\ [], opts \\ []) do
+    {kernel_opts, opts} = Keyword.pop(opts, :kernel_opts)
+    {compiler, opts} = Keyword.pop_lazy(opts, :compiler, &default_compiler/0)
+
+    {own, compiler_opts} =
+      Keyword.split(opts, [
+        :param_ranges,
+        :case_split,
+        :split_threshold,
+        :split_budget,
+        :allow_float,
+        :name
+      ])
+
+    sample_template =
+      Nx.Defn.Composite.traverse(samples, fn t ->
+        t = Nx.tensor(t)
+        Nx.template(t.shape |> Tuple.delete_at(0), t.type)
+      end)
+
+    template = &Nx.Defn.Composite.traverse(&1, fn t -> Nx.to_template(Nx.tensor(t)) end)
+    extra = if kernel_opts, do: [kernel_opts], else: []
+    templates = [sample_template, template.(initial_state) | Enum.map(params, template)] ++ extra
+
+    float? =
+      templates
+      |> Enum.take(2 + length(params))
+      |> Nx.Defn.Composite.flatten_list()
+      |> Enum.any?(&match?({:f, _}, &1.type))
+
+    own = Keyword.put_new(own, :allow_float, float?)
+
+    out_templates = checked_output_templates(fun, templates, own)
+    n = [samples] |> Nx.Defn.Composite.flatten_list() |> hd() |> Nx.axis_size(0)
+
+    # jit with BinaryBackend arguments is several times slower than with
+    # arguments that already live on the compiler's backend.
+    move = fn container ->
+      if compiler == EXLA,
+        do:
+          Nx.Defn.Composite.traverse(container, &Nx.backend_transfer(Nx.tensor(&1), EXLA.Backend)),
+        else: container
+    end
+
+    loop =
+      Nx.Defn.jit(&ExHdl.DSP.ScanLoop.loop/4, Keyword.put(compiler_opts, :compiler, compiler))
+
+    loop.(move.(samples), move.(initial_state), move.(List.to_tuple(params)),
+      step: fun,
+      kernel_opts: kernel_opts,
+      outputs: out_templates,
+      n: n
+    )
+  end
+
+  # The width check depends only on the kernel, the argument types/shapes and
+  # the options, so its result (the output templates) is cached per VM.
+  defp checked_output_templates(fun, templates, own) do
+    key = {__MODULE__, :checked, fun, templates, own}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        traced = fun |> Nx.Defn.debug_expr() |> apply(templates)
+
+        case analyze_expr(traced, own) do
+          {:ok, _graph} -> :ok
+          {:error, error} -> raise error
+        end
+
+        {out_templates, _} = traced
+        out_templates = Nx.Defn.Composite.traverse(out_templates, &Nx.to_template/1)
+        :persistent_term.put(key, out_templates)
+        out_templates
+
+      out_templates ->
+        out_templates
+    end
+  end
+
+  defp default_compiler, do: if(Code.ensure_loaded?(EXLA), do: EXLA, else: Nx.Defn.Evaluator)
+
+  defp unstack(stacked, n) do
+    for i <- 0..(n - 1)//1 do
+      Nx.Defn.Composite.traverse(
+        stacked,
+        &Nx.squeeze(Nx.slice_along_axis(&1, i, 1, axis: 0), axes: [0])
+      )
+    end
   end
 
   @doc "Runs the analysis on an already traced output expression."

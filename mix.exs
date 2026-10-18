@@ -22,6 +22,8 @@ defmodule ExHdl.MixProject do
   defp deps do
     [
       {:nx, "~> 1.0"},
+      # Optional: fast CPU execution of stream kernels (ExHdl.DSP.run_scan/5, compiler: EXLA).
+      {:exla, "~> 1.0", optional: true},
       {:stream_data, "~> 1.1", only: [:dev, :test]}
     ]
   end

@@ -60,20 +60,27 @@ defmodule ExHdl.Test.GnuRadioFixture do
     opts = Enum.map(block["opts"] || %{}, fn {k, v} -> {String.to_atom(k), value(v, params)} end)
     fun = Function.capture(ExHdl.DSP.Blocks, String.to_atom(block["name"]), 3 + length(args))
 
+    # All samples at once through the compiled loop (EXLA when available).
     samples =
-      if complex?(case),
-        do: Enum.map(input, fn {i, q} -> {sample(i, format), sample(q, format)} end),
-        else: Enum.map(input, &sample(&1, format))
+      if complex?(case) do
+        {re, im} = Enum.unzip(input)
+        {samples(re, format), samples(im, format)}
+      else
+        samples(input, format)
+      end
 
     {outputs, _state} =
-      DSP.run_scan(fun, samples, state(block["state"], params, format), args,
+      DSP.run_scan_stacked(fun, samples, state(block["state"], params, format), args,
         kernel_opts: [format: format] ++ opts
       )
 
-    Enum.map(outputs, &ExHdl.Num.to_float/1)
+    case ExHdl.Num.to_float(outputs) do
+      {re, im} -> Enum.zip(re, im)
+      values -> values
+    end
   end
 
-  defp sample(v, format), do: ExHdl.Num.from_int(Nx.tensor(v, type: :s16), 15, format)
+  defp samples(ints, format), do: ExHdl.Num.from_int(Nx.tensor(ints, type: :s16), 15, format)
 
   # Argument and state specs: {"phase": p} is a u16 phase word in every
   # format, {"real": p} a real number in the instance's format.
