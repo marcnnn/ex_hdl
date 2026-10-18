@@ -63,6 +63,14 @@ defmodule ExHdl.GnuRadioReferenceTest do
       assert_in_delta snr("ddc_rotator_lut12") - snr("ddc_rotator_lut10"), 12.0, 1.0
     end
 
+    test "rounding the NCO phase buys about 6 dB" do
+      assert_in_delta snr("ddc_rotator_lut10_round") - snr("ddc_rotator_lut10"), 6.0, 1.0
+    end
+
+    test "rounding the FIR output buys about 6 dB" do
+      assert_in_delta snr("fir_ccf_31tap_round") - snr("fir_ccf_31tap_truncate"), 6.0, 1.0
+    end
+
     test "rounding the IIR update beats truncation by more than 20 dB at alpha = 0.01" do
       assert snr("one_pole_a328_round") - snr("one_pole_a328_truncate") > 20
     end

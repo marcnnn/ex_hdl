@@ -132,6 +132,37 @@ defmodule ExHdl.Passes.WidthCheck do
     end
   end
 
+  # Every element of the result is one of the inputs' elements.
+  defp transfer(%{op: :concatenate}, sets, _graph, _), do: Enum.reduce(sets, &IntSet.union/2)
+  defp transfer(%{op: :slice}, [x], _graph, _), do: x
+
+  # n elements, each from x: the hull scaled by n.
+  defp transfer(%{op: :sum, inputs: [x_id], attrs: opts}, [x], graph, _) do
+    shape = graph.nodes[x_id].shape
+    axes = opts[:axes] || Enum.to_list(0..(tuple_size(shape) - 1)//1)
+    n = axes |> Enum.map(&elem(shape, &1)) |> Enum.product()
+    {lo, hi} = IntSet.bounds(x)
+    IntSet.range(n * lo, n * hi)
+  end
+
+  # With a constant operand c (e.g. FIR taps): sum over i of x * c_i, so the
+  # bound is exact per coefficient. Otherwise n times the product hull.
+  defp transfer(%{op: :dot, inputs: [a_id, b_id], attrs: {contract_a, _, _, _}}, [a, b], graph, _) do
+    case {Dataflow.constant_values(graph, a_id), Dataflow.constant_values(graph, b_id)} do
+      {_, coeffs} when is_list(coeffs) ->
+        weighted_sum(a, coeffs)
+
+      {coeffs, _} when is_list(coeffs) ->
+        weighted_sum(b, coeffs)
+
+      _ ->
+        shape = graph.nodes[a_id].shape
+        n = contract_a |> Enum.map(&elem(shape, &1)) |> Enum.product()
+        {lo, hi} = a |> IntSet.multiply(b) |> IntSet.bounds()
+        IntSet.range(n * lo, n * hi)
+    end
+  end
+
   # Exact lookup for small index sets; the whole table otherwise.
   defp transfer(%{op: :take, inputs: [table_id, _]}, [table, idx], graph, _) do
     values = graph.nodes[table_id].attrs |> Nx.to_flat_list() |> List.to_tuple()
@@ -146,6 +177,17 @@ defmodule ExHdl.Passes.WidthCheck do
         |> IntSet.from_list()
         |> IntSet.widen(),
       else: table
+  end
+
+  defp weighted_sum(x, coeffs) do
+    {lo, hi} = IntSet.bounds(x)
+
+    {sum_lo, sum_hi} =
+      Enum.reduce(coeffs, {0, 0}, fn c, {acc_lo, acc_hi} ->
+        {acc_lo + min(lo * c, hi * c), acc_hi + max(lo * c, hi * c)}
+      end)
+
+    IntSet.range(sum_lo, sum_hi)
   end
 
   # -- stage 2: case splitting --------------------------------------------------------

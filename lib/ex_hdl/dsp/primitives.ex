@@ -42,6 +42,16 @@ defmodule ExHdl.DSP.Primitives do
     x |> Nx.clip(lo, hi) |> Nx.as_type(type)
   end
 
+  @doc """
+  `x >> k` rounded to nearest (ties towards +infinity): `(x + 2^(k-1)) >> k`.
+  Truncating shifts (`Nx.right_shift/2`) are biased by half an LSB on
+  average, which in feedback loops turns into a dead band; this one is not.
+  `x` needs one bit of headroom, which `ExHdl.Passes.WidthCheck` verifies.
+  """
+  deftransform shift_round(x, k) when is_integer(k) and k > 0 do
+    x |> Nx.add(1 <<< (k - 1)) |> Nx.right_shift(k)
+  end
+
   @doc "Saturates to s16."
   deftransform saturate_s16(x), do: saturate(x, :s16)
 
@@ -63,13 +73,14 @@ defmodule ExHdl.DSP.Primitives do
   @doc """
   Table-based NCO. `phase` is a u16 phase word (full circle = 65536); the top
   `:bits` bits (default 10) address a sine table of `:amplitude` (default
-  32767, so +1.0 is representable). Returns `{cos, sin}`.
+  32767, so +1.0 is representable). With `round: true` the phase is rounded
+  to the nearest entry instead of truncated. Returns `{cos, sin}`.
 
   The table is the same constant in every backend: Highway loads it, the
   FPGA backend maps it to block RAM.
   """
   deftransform lut_sincos_q15(phase, opts \\ []) do
-    opts = Keyword.validate!(opts, bits: 10, amplitude: 32767)
+    opts = Keyword.validate!(opts, bits: 10, amplitude: 32767, round: false)
     bits = opts[:bits]
     n = 1 <<< bits
 
@@ -77,9 +88,42 @@ defmodule ExHdl.DSP.Primitives do
       do: raise(ArgumentError, "lut_sincos_q15 expects a u16 phase and bits in 2..16")
 
     table = sine_table(n, opts[:amplitude])
-    idx = Nx.right_shift(phase, 16 - bits)
+
+    # Rounding the phase to the nearest table entry halves the worst phase
+    # error and removes its mean (about +6 dB SNR); index n wraps to 0.
+    idx =
+      if opts[:round] and bits < 16,
+        do: phase |> Nx.as_type(:u32) |> shift_round(16 - bits) |> Nx.bitwise_and(n - 1),
+        else: Nx.right_shift(phase, 16 - bits)
+
     cos_idx = idx |> Nx.add(div(n, 4)) |> Nx.bitwise_and(n - 1)
     {Nx.take(table, cos_idx), Nx.take(table, idx)}
+  end
+
+  @doc """
+  One step of a FIR filter with constant Q15 taps: `y = sum(taps[k] * x[n-k])`.
+
+  `line` holds the previous `length(taps) - 1` samples (newest first) and is
+  the stream state; returns `{y, next_line}`. The taps are compile-time
+  constants, so the accumulator bound is exactly `32768 * sum(|taps|)` and
+  the hardware uses constant multipliers. The Q30 sum is shifted back to
+  Q15 with rounding (`round: false` truncates) and saturated.
+  """
+  deftransform fir_q15(x, line, taps, opts \\ []) when is_list(taps) and length(taps) >= 2 do
+    opts = Keyword.validate!(opts, round: true)
+    n = length(taps)
+
+    unless Nx.shape(line) == {n - 1},
+      do:
+        raise(
+          ArgumentError,
+          "fir_q15: line must have shape {#{n - 1}} for #{n} taps, got #{inspect(Nx.shape(line))}"
+        )
+
+    window = Nx.concatenate([Nx.reshape(x, {1}), line])
+    acc = Nx.dot(Nx.as_type(window, :s32), Nx.tensor(taps, type: :s32, backend: Nx.BinaryBackend))
+    y = if opts[:round], do: shift_round(acc, 15), else: Nx.right_shift(acc, 15)
+    {saturate(y, Nx.type(x)), Nx.slice(window, [0], [n - 1])}
   end
 
   @doc "The NCO sine table as plain integers: `round(amplitude * sin(2*pi*k/n))`."

@@ -57,8 +57,10 @@ def make_block(spec, params):
     """Instantiates e.g. {"block": "blocks.rotator_cc", "args": ["2 * pi * phase_inc / 65536"]}."""
     module, name = spec["block"].rsplit(".", 1)
     cls = getattr(importlib.import_module("gnuradio." + module), name)
-    env = {"pi": math.pi, **{k: v for k, v in params.items() if isinstance(v, (int, float))}}
-    args = [eval(a, {"__builtins__": {}}, env) if isinstance(a, str) else a for a in spec.get("args", [])]
+    # Globals (not locals), so comprehensions like "[t / 32768 for t in taps_q15]" see them.
+    env = {"__builtins__": {}, "pi": math.pi}
+    env.update({k: v for k, v in params.items() if isinstance(v, (int, float, list))})
+    args = [eval(a, env) if isinstance(a, str) else a for a in spec.get("args", [])]
     return cls(*args)
 
 

@@ -10,7 +10,7 @@ software and SystemVerilog hardware.
 |---|---|
 | `ExHdl.Protocol`: `defpacket` DSL, BEAM codecs, AXI4-Stream parser/emitter in SystemVerilog | done |
 | Verilator co-simulation (`ExHdl.Sim.Verilator`) | done |
-| Fixed-point DSP: dataflow IR, range analysis (`ExHdl.Passes.WidthCheck`), primitives, checked Nx reference compiler | done |
+| Fixed-point DSP: dataflow IR, range analysis (`ExHdl.Passes.WidthCheck`), primitives (NCO, complex mixer, FIR with constant taps, rounding shifts), checked Nx reference compiler | done |
 | Stateful streams: recurrence analysis, `ii:`/`channels:`, Zynq timing model (`ExHdl.DSP.analyze_scan`) | done |
 | CPU reference vs GNU Radio 3.10: shared cases in `test/dsp_cases/*.json`, per-sample bounds and SNR | done |
 | Nx-to-SystemVerilog, retiming, `accelerator` DSL | planned |

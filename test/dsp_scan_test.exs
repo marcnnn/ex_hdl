@@ -69,6 +69,44 @@ defmodule ExHdl.DSPScanTest do
     end
   end
 
+  describe "FIR with constant taps" do
+    @taps "test/dsp_cases/fir_ccf_31tap_round.json"
+          |> File.read!()
+          |> JSON.decode!()
+          |> get_in(["params", "taps_q15"])
+
+    defp fir(opts \\ []) do
+      args = [
+        {t(:s16), t(:s16)},
+        {Nx.template({30}, :s16), Nx.template({30}, :s16)},
+        [taps: @taps]
+      ]
+
+      DSP.analyze_scan(&K.fir_ccf_step/3, args, [state: 1] ++ opts)
+    end
+
+    test "the accumulator bound is exactly 32768 * sum(|taps|)" do
+      assert {:ok, scan} = fir()
+      sum_abs = @taps |> Enum.map(&abs/1) |> Enum.sum()
+      bound = 32768 * sum_abs
+
+      dots =
+        for n <- Map.values(scan.graph.nodes),
+            n.op == :dot,
+            do: ExHdl.Types.IntSet.bounds(n.range)
+
+      assert [{lo, hi}, {lo, hi}] = dots
+      # extremes: -32768 on positive taps and 32767 on negative ones, and vice versa
+      assert -lo <= bound and hi <= bound and -lo > bound - sum_abs and hi > bound - 2 * sum_abs
+    end
+
+    test "only the delay line is in the loop, so it runs at one sample per cycle" do
+      assert {:ok, scan} = fir()
+      assert %{loop_latency: 1, ii: 1, throughput: 1.0} = scan
+      assert ops(scan, scan.critical_path) == [:parameter, :concatenate, :slice]
+    end
+  end
+
   test "next_state must keep the state's type" do
     assert {:error, %DSP.ScheduleError{message: msg}} =
              DSP.analyze_scan(&K.widening_state_step/2, [t(:s16), t(:s16)], state: 1)

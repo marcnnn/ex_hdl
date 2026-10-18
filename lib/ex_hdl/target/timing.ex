@@ -30,7 +30,7 @@ defmodule ExHdl.Target.Timing do
   @type t :: %__MODULE__{}
   @type cost :: {:comb, float()} | {:reg, pos_integer(), atom()}
 
-  @free ~w(parameter constant tensor as_type reshape broadcast squeeze transpose)a
+  @free ~w(parameter constant tensor as_type reshape broadcast squeeze transpose concatenate slice)a
   @adder ~w(add subtract negate equal not_equal less less_equal greater greater_equal)a
   @bitwise ~w(bitwise_and bitwise_or bitwise_xor)a
 
@@ -90,6 +90,20 @@ defmodule ExHdl.Target.Timing do
     if size <= t.lut_rom_max,
       do: {:comb, t.lut_ns * (div(ceil_log2(size), 6) + 1)},
       else: {:reg, t.bram_latency, :bram}
+  end
+
+  # One multiplier per product, then a registered adder tree.
+  def cost(%{op: :dot, inputs: [a | _], attrs: {contract, _, _, _}}, graph, t) do
+    n = contract |> Enum.map(&elem(graph.nodes[a].shape, &1)) |> Enum.product()
+    {:reg, t.dsp_latency + ceil_log2(n), :dsp48_tree}
+  end
+
+  # Upper bound: all elements summed.
+  def cost(%{op: :sum, inputs: [x]}, graph, t) do
+    case graph.nodes[x].shape |> Tuple.to_list() |> Enum.product() do
+      n when n <= 2 -> {:comb, adder(t, width(graph, x) + 1)}
+      n -> {:reg, ceil_log2(n), :adder_tree}
+    end
   end
 
   def cost(_node, _graph, t), do: {:comb, t.lut_ns}

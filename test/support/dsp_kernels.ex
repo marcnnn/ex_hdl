@@ -5,19 +5,23 @@ defmodule ExHdl.Test.DSP do
 
   # The ddc_step from the architecture plan, with explicit wrap and saturate.
   defn ddc_step(sample, phase_acc, phase_inc, gain_q15, opts \\ []) do
-    opts = keyword!(opts, amplitude: 32767, lut_bits: 10)
+    opts = keyword!(opts, amplitude: 32767, lut_bits: 10, round: false)
     {i_in, q_in} = sample
 
     next_phase = add_wrap(phase_acc, phase_inc, :u16)
 
     {nco_i, nco_q} =
-      lut_sincos_q15(next_phase, amplitude: opts[:amplitude], bits: opts[:lut_bits])
+      lut_sincos_q15(next_phase,
+        amplitude: opts[:amplitude],
+        bits: opts[:lut_bits],
+        round: opts[:round]
+      )
 
     {mix_i, mix_q} = complex_widening_mul_q15({i_in, q_in}, {nco_i, nco_q})
 
     gain = Nx.as_type(gain_q15, :s32)
-    out_i = (Nx.right_shift(mix_i, 15) * gain) |> Nx.right_shift(15) |> saturate_s16()
-    out_q = (Nx.right_shift(mix_q, 15) * gain) |> Nx.right_shift(15) |> saturate_s16()
+    out_i = (q15_shift(mix_i, opts[:round]) * gain) |> q15_shift(opts[:round]) |> saturate_s16()
+    out_q = (q15_shift(mix_q, opts[:round]) * gain) |> q15_shift(opts[:round]) |> saturate_s16()
 
     {{out_i, out_q}, next_phase}
   end
@@ -46,9 +50,23 @@ defmodule ExHdl.Test.DSP do
   defn one_pole_rounded_step(x, y, a) do
     y32 = Nx.as_type(y, :s32)
     diff = Nx.as_type(x, :s32) - y32
-    y_next = (y32 + Nx.right_shift(Nx.as_type(a, :s32) * diff + 16384, 15)) |> saturate_s16()
+    y_next = (y32 + shift_round(Nx.as_type(a, :s32) * diff, 15)) |> saturate_s16()
     {y_next, y_next}
   end
+
+  # GNU Radio's fir_filter_ccf: complex samples, real taps, I and Q filtered
+  # with the same taps. The state is one delay line per component.
+  defn fir_ccf_step(sample, lines, opts \\ []) do
+    opts = keyword!(opts, taps: [], round: true)
+    {i, q} = sample
+    {line_i, line_q} = lines
+    {y_i, next_i} = fir_q15(i, line_i, opts[:taps], round: opts[:round])
+    {y_q, next_q} = fir_q15(q, line_q, opts[:taps], round: opts[:round])
+    {{y_i, y_q}, {next_i, next_q}}
+  end
+
+  deftransformp q15_shift(x, round),
+    do: if(round, do: shift_round(x, 15), else: Nx.right_shift(x, 15))
 
   # The state comes back with a different type.
   defn widening_state_step(x, acc) do

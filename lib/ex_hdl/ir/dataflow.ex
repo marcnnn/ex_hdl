@@ -52,6 +52,19 @@ defmodule ExHdl.IR.Dataflow do
     %{state.graph | outputs: outputs, order: Enum.reverse(state.graph.order)}
   end
 
+  @doc """
+  The constant values behind a node, looking through value-preserving ops
+  (`as_type`, `reshape`), or `nil` if the node is not a constant tensor.
+  """
+  def constant_values(%__MODULE__{} = graph, id) do
+    case graph.nodes[id] do
+      %{op: :tensor, attrs: t} -> Nx.to_flat_list(t)
+      %{op: :constant, attrs: v} -> [v]
+      %{op: op, inputs: [x]} when op in [:as_type, :reshape] -> constant_values(graph, x)
+      _ -> nil
+    end
+  end
+
   @doc "Output node ids, flattened."
   def output_ids(%__MODULE__{outputs: outputs}), do: flatten(outputs)
 
@@ -92,6 +105,33 @@ defmodule ExHdl.IR.Dataflow do
   end
 
   defp convert_op(:as_type, [x], t, key, state), do: unary(:as_type, x, t, key, state)
+
+  defp convert_op(:concatenate, [tensors, axis], t, key, state) do
+    {ids, state} = Enum.map_reduce(tensors, state, &convert/2)
+    add(state, key, :concatenate, ids, axis, t)
+  end
+
+  defp convert_op(:slice, [x, starts, lengths, strides], t, key, state) do
+    unless Enum.all?(starts, &is_integer/1),
+      do: raise(ArgumentError, "ExHdl supports Nx.slice only with constant start indices")
+
+    {id, state} = convert(x, state)
+    add(state, key, :slice, [id], {starts, lengths, strides}, t)
+  end
+
+  defp convert_op(:dot, [a, contract_a, batch_a, b, contract_b, batch_b], t, key, state) do
+    # The range rule assumes one sum of products per output element.
+    if batch_a != [], do: raise(ArgumentError, "ExHdl does not support batched Nx.dot yet")
+
+    {a_id, state} = convert(a, state)
+    {b_id, state} = convert(b, state)
+    add(state, key, :dot, [a_id, b_id], {contract_a, batch_a, contract_b, batch_b}, t)
+  end
+
+  defp convert_op(:sum, [x, opts], t, key, state) do
+    {id, state} = convert(x, state)
+    add(state, key, :sum, [id], opts, t)
+  end
 
   defp convert_op(
          :block,

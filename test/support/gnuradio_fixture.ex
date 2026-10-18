@@ -70,6 +70,14 @@ defmodule ExHdl.Test.GnuRadioFixture do
   defp value(name, params) when is_binary(name), do: Map.fetch!(params, name)
   defp value(v, _params), do: v
 
+  # State/argument specs: ["s16", 0], ["u16", "param"], ["s16", {"zeros": 30}]
+  # or {"tuple": [spec, ...]}.
+  defp tensor(%{"tuple" => specs}, params),
+    do: specs |> Enum.map(&tensor(&1, params)) |> List.to_tuple()
+
+  defp tensor([type, %{"zeros" => n}], _params),
+    do: Nx.broadcast(Nx.tensor(0, type: String.to_atom(type)), {n})
+
   defp tensor([type, v], params), do: Nx.tensor(value(v, params), type: String.to_atom(type))
 
   @doc "SNR in dB of `signal` against `reference`."
