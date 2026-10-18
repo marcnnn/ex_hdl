@@ -5,11 +5,14 @@ defmodule ExHdl.Test.DSP do
 
   # The ddc_step from the architecture plan, with explicit wrap and saturate.
   defn ddc_step(sample, phase_acc, phase_inc, gain_q15, opts \\ []) do
-    opts = keyword!(opts, amplitude: 32767)
+    opts = keyword!(opts, amplitude: 32767, lut_bits: 10)
     {i_in, q_in} = sample
 
     next_phase = add_wrap(phase_acc, phase_inc, :u16)
-    {nco_i, nco_q} = lut_sincos_q15(next_phase, amplitude: opts[:amplitude])
+
+    {nco_i, nco_q} =
+      lut_sincos_q15(next_phase, amplitude: opts[:amplitude], bits: opts[:lut_bits])
+
     {mix_i, mix_q} = complex_widening_mul_q15({i_in, q_in}, {nco_i, nco_q})
 
     gain = Nx.as_type(gain_q15, :s32)
@@ -35,6 +38,15 @@ defmodule ExHdl.Test.DSP do
     y32 = Nx.as_type(y, :s32)
     diff = Nx.as_type(x, :s32) - y32
     y_next = (y32 + Nx.right_shift(Nx.as_type(a, :s32) * diff, 15)) |> saturate_s16()
+    {y_next, y_next}
+  end
+
+  # Same filter with round-to-nearest instead of truncation in the update,
+  # which halves and centres the dead band.
+  defn one_pole_rounded_step(x, y, a) do
+    y32 = Nx.as_type(y, :s32)
+    diff = Nx.as_type(x, :s32) - y32
+    y_next = (y32 + Nx.right_shift(Nx.as_type(a, :s32) * diff + 16384, 15)) |> saturate_s16()
     {y_next, y_next}
   end
 

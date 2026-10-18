@@ -1,0 +1,2 @@
+test/fixtures/**/*.s16le binary
+test/fixtures/**/*.f32le binary

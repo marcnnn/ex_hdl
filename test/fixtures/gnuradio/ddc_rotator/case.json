@@ -1,0 +1,15 @@
+{
+  "case": "ddc_rotator",
+  "generator": "test/gnuradio/golden.py",
+  "gnuradio": "3.10.12.0",
+  "input": "input.s16le: little-endian int16, interleaved I/Q",
+  "kind": "complex",
+  "numpy": "2.3.5",
+  "params": {
+    "gain_q15": 26214,
+    "initial_phase": 62535,
+    "phase_inc": 3001
+  },
+  "reference": "gnuradio.f32le: little-endian float32, 1.0 = 32768, interleaved I/Q",
+  "samples": 4096
+}

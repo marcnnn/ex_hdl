@@ -128,6 +128,37 @@ defmodule ExHdl.DSP do
     end
   end
 
+  @doc """
+  Runs a stream kernel `step(sample, state, params...)` over `samples` on
+  the CPU, threading the state from sample to sample. This is the checked
+  Nx reference (`ExHdl.DSP.Compiler`): the kernel is width-checked once
+  when it is compiled.
+
+  `params` are the remaining tensor arguments, constant over the stream.
+  Options: `:kernel_opts` (a trailing keyword list for the kernel) plus
+  everything `ExHdl.DSP.Compiler` accepts.
+
+  Returns `{outputs, final_state}`.
+  """
+  def run_scan(fun, samples, initial_state, params \\ [], opts \\ [])
+
+  def run_scan(_fun, [], initial_state, _params, _opts), do: {[], initial_state}
+
+  def run_scan(fun, [first | _] = samples, initial_state, params, opts) do
+    {kernel_opts, opts} = Keyword.pop(opts, :kernel_opts)
+    template = &Nx.Defn.Composite.traverse(&1, fn t -> Nx.to_template(Nx.tensor(t)) end)
+
+    templates =
+      [template.(first), template.(initial_state) | Enum.map(params, template)] ++
+        if(kernel_opts, do: [kernel_opts], else: [])
+
+    step = Nx.Defn.compile(fun, templates, Keyword.put(opts, :compiler, ExHdl.DSP.Compiler))
+
+    Enum.map_reduce(samples, initial_state, fn sample, state ->
+      apply(step, [sample, state | params])
+    end)
+  end
+
   @doc "Runs the analysis on an already traced output expression."
   def analyze_expr(output, opts \\ []) do
     {graph, violations} = output |> Dataflow.from_expr() |> WidthCheck.run(opts)
