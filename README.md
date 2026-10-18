@@ -15,7 +15,7 @@ software and SystemVerilog hardware.
 | Format-generic algorithms (`ExHdl.Num`, `ExHdl.DSP.Blocks`): one definition, float reference or fixed point (`q(bits, frac)`) | done |
 | GNU Radio 3.10 comparison: float instance vs GNU Radio, fixed-point variants vs float instance | done |
 | Nx-to-SystemVerilog, retiming, `accelerator` DSL | planned |
-| Google Highway CPU backend | planned |
+| CPU: compiled block loop (EXLA) and Highway SIMD NIF for Q15 blocks, bit-identical; see `docs/cpu_backend.md` | done |
 | openXC7 bitstream builder, Zynq runtime | planned |
 
 ## Development
@@ -45,4 +45,9 @@ the ExHdl side; outputs are compared sample by sample. Adding a case or a
 format variant is editing JSON and running `scripts/gnuradio_golden.sh`;
 stale reference data fails the tests.
 
-Requires Elixir 1.18+, and Verilator 5 for co-simulation.
+Requires Elixir 1.18+, a C++17 compiler, `make` and `curl` (the SIMD NIF
+fetches Google Highway on first build), and Verilator 5 for co-simulation.
+
+```sh
+MIX_ENV=test mix run scripts/bench_cpu.exs   # CPU throughput per implementation
+```

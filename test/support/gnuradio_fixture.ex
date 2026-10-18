@@ -54,7 +54,9 @@ defmodule ExHdl.Test.GnuRadioFixture do
   Runs the case's `ExHdl.DSP.Blocks` block over `input` (Q15 integers) in
   `format`; returns Elixir floats (1.0 = full scale), `{re, im}` for complex.
   """
-  def run_block(case, input, %ExHdl.Num.Format{} = format) do
+  def run_block(case, input, format, implementation \\ :nx)
+
+  def run_block(case, input, %ExHdl.Num.Format{} = format, implementation) do
     %{"block" => block, "params" => params} = case
     args = Enum.map(block["args"] || [], &arg(&1, params, format))
     opts = Enum.map(block["opts"] || %{}, fn {k, v} -> {String.to_atom(k), value(v, params)} end)
@@ -69,11 +71,24 @@ defmodule ExHdl.Test.GnuRadioFixture do
         samples(input, format)
       end
 
-    {outputs, _state} =
-      DSP.run_scan_stacked(fun, samples, state(block["state"], params, format), args,
-        kernel_opts: [format: format] ++ opts
-      )
+    state = state(block["state"], params, format)
+    kernel_opts = [format: format] ++ opts
 
+    case implementation do
+      :nx ->
+        {outputs, _state} =
+          DSP.run_scan_stacked(fun, samples, state, args, kernel_opts: kernel_opts)
+
+        to_floats(outputs)
+
+      # ExHdl.CPU: SIMD kernels where available; returns which one ran.
+      :cpu ->
+        {outputs, _state, impl} = ExHdl.CPU.run_block(fun, samples, state, args, kernel_opts)
+        {to_floats(outputs), impl}
+    end
+  end
+
+  defp to_floats(outputs) do
     case ExHdl.Num.to_float(outputs) do
       {re, im} -> Enum.zip(re, im)
       values -> values

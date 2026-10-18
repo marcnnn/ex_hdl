@@ -225,13 +225,18 @@ defmodule ExHdl.Num do
         {Nx.dot(window, Nx.tensor(taps, type: :f32, backend: Nx.BinaryBackend)), next}
 
       :fixed ->
-        {lo, hi} = range(f.bits)
-        q_taps = Enum.map(taps, &(round(&1 * (1 <<< f.frac)) |> max(lo) |> min(hi)))
+        q_taps = quantize_constants(taps, f)
         bound = (1 <<< (bits_of(x) - 1)) * Enum.sum(Enum.map(q_taps, &abs/1))
         c = if bound < 1 <<< 31, do: :s32, else: :s64
         acc = Nx.dot(Nx.as_type(window, c), Nx.tensor(q_taps, type: c, backend: Nx.BinaryBackend))
         {%Fixed{t: acc, frac: x.frac + f.frac}, %Fixed{t: next, frac: x.frac}}
     end
+  end
+
+  @doc "Real constants (e.g. FIR taps) as the integers of a fixed-point format: rounded, saturated."
+  def quantize_constants(values, %Format{kind: :fixed} = f) do
+    {lo, hi} = range(f.bits)
+    Enum.map(values, &(round(&1 * (1 <<< f.frac)) |> max(lo) |> min(hi)))
   end
 
   defp value_tensor(%Fixed{t: t}), do: t

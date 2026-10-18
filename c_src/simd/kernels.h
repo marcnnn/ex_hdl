@@ -1,0 +1,49 @@
+// ExHdl SIMD kernels: Q15 fixed-point stream kernels, bit-identical to the
+// Nx reference (ExHdl.DSP.Blocks instantiated with ExHdl.Num.q(16, 15)).
+//
+// Arithmetic contract (shared with the Nx reference):
+//   * products and sums are exact in int32 (the ranges are proven by
+//     ExHdl.Passes.WidthCheck; the callers validate the inputs that make
+//     those proofs hold, e.g. |table| <= 32767),
+//   * rescale from Q30 to Q15: nearest = (v + 2^14) >> 15, truncate = v >> 15
+//     (arithmetic shift),
+//   * quantize = rescale, then saturate to int16.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+namespace exhdl {
+
+struct DdcParams {
+  uint16_t phase;        // phase word before the first sample
+  uint16_t phase_inc;    // added before each lookup (mod 2^16)
+  int16_t gain;          // Q15
+  int lut_bits;          // sine table address bits, 2..14
+  bool round;            // nearest (true) or truncate (false)
+  const int32_t* table;  // 2^lut_bits entries, round(32767 * sin(2*pi*k/n))
+};
+
+// NCO + complex mix + gain. Returns the phase word after the last sample.
+uint16_t DdcQ15(const int16_t* in_i, const int16_t* in_q, size_t n, int16_t* out_i,
+                int16_t* out_q, const DdcParams& p);
+
+// FIR with constant Q15 taps over `ext` = (n_taps - 1) history samples
+// (oldest first) followed by n new samples: out[j] = sum_k taps[k] * x[j - k].
+// The int32 accumulator must be proven not to overflow by the caller.
+void FirQ15(const int16_t* ext, size_t n, const int32_t* taps, size_t n_taps, bool round,
+            int16_t* out);
+
+// One-pole low-pass y' = y + alpha * (x - y). Returns the last y.
+int16_t OnePoleQ15(const int16_t* x, size_t n, int16_t y0, int16_t alpha, bool round, int16_t* out);
+
+// Scalar implementations with identical semantics (tails and tests).
+uint16_t DdcQ15Scalar(const int16_t* in_i, const int16_t* in_q, size_t n, int16_t* out_i,
+                      int16_t* out_q, const DdcParams& p);
+void FirQ15Scalar(const int16_t* ext, size_t n, const int32_t* taps, size_t n_taps, bool round,
+                  int16_t* out);
+
+// Name of the SIMD target chosen at runtime (e.g. "NEON", "SVE2", "AVX2").
+const char* SimdTarget();
+
+}  // namespace exhdl

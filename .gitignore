@@ -24,3 +24,6 @@ ex_hdl-*.tar
 
 # Default output of `mix ex_hdl.gen.sv`.
 /hdl/generated/
+
+# Compiled SIMD NIF (Makefile).
+/priv/native/

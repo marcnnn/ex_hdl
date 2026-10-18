@@ -52,7 +52,17 @@ defmodule ExHdl.GnuRadioReferenceTest do
       @variant variant
       test "#{case["name"]}: #{variant["variant"]} vs float instance", %{runs: runs} do
         %{case: case, data: data, float: float} = runs[@name]
-        fixed = F.run_block(case, data.input, F.format(@variant["format"]))
+        format = F.format(@variant["format"])
+        fixed = F.run_block(case, data.input, format)
+
+        # Where the SIMD kernels cover the format, they must give the same bits.
+        case F.run_block(case, data.input, format, :cpu) do
+          {simd, :simd} ->
+            assert simd == fixed, "#{@name} #{@variant["variant"]}: SIMD differs from Nx"
+
+          {_, :nx} ->
+            :ok
+        end
 
         assert_close(
           float,
