@@ -1,0 +1,6 @@
+{
+  "case": "ddc_rotator_lut10",
+  "case_sha256": "92303c514e9f1084bf4f4fb8b1d8cc205291699b088bfd012d419adf2e57fcf5",
+  "gnuradio": "3.10.12.0",
+  "numpy": "2.3.5"
+}

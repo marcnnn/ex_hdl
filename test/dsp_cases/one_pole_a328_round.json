@@ -1,0 +1,52 @@
+{
+  "name": "one_pole_a328_round",
+  "description": "one-pole IIR y' = y + a*(x - y), alpha = 328/32768, rounding update, vs single_pole_iir_filter_ff",
+  "samples": 4096,
+  "seed": 1002,
+  "params": {
+    "alpha_q15": 328
+  },
+  "input": {
+    "type": "real",
+    "tones": [
+      {
+        "freq": 0.003,
+        "amp": 0.4,
+        "phase": 0.0
+      }
+    ],
+    "steps": [
+      {
+        "at": 2048,
+        "amp": 0.3
+      }
+    ],
+    "noise_rms": 0.001
+  },
+  "exhdl": {
+    "kernel": "one_pole_rounded_step",
+    "state": [
+      "s16",
+      0
+    ],
+    "args": [
+      [
+        "s16",
+        "alpha_q15"
+      ]
+    ]
+  },
+  "gnuradio": [
+    {
+      "block": "filter.single_pole_iir_filter_ff",
+      "args": [
+        "alpha_q15 / 32768"
+      ]
+    }
+  ],
+  "expect": {
+    "snr_db_min": 70.0,
+    "max_error_lsb": 51.0,
+    "rationale": "The update a*(x - y) >> 15 stops once it rounds to 0: dead band 1/(2*alpha) = 50.0 LSB, plus 1 LSB output quantization. SNR bound is the measured value minus 1 dB (regression guard)."
+  }
+}
