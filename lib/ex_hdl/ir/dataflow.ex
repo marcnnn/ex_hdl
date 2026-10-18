@@ -78,6 +78,11 @@ defmodule ExHdl.IR.Dataflow do
 
   defp convert_container(%Nx.Tensor{} = t, state), do: convert(t, state)
 
+  # Other containers (e.g. ExHdl.Num.Fixed): their tensors, as a tuple.
+  defp convert_container(container, state) do
+    [container] |> Nx.Defn.Composite.flatten_list() |> List.to_tuple() |> convert_container(state)
+  end
+
   defp convert(%Nx.Tensor{data: %Nx.Defn.Expr{id: expr_id, op: op, args: args}} = t, state) do
     key = {state.scope, expr_id}
 
@@ -159,6 +164,18 @@ defmodule ExHdl.IR.Dataflow do
   defp convert_op(op, args, t, key, state) when op in @elementwise or op in @shape_only do
     {ids, state} =
       args
+      |> Enum.filter(&match?(%Nx.Tensor{}, &1))
+      |> Enum.map_reduce(state, &convert/2)
+
+    add(state, key, op, ids, nil, t)
+  end
+
+  # Float reference instances may use any Nx operation (cos, sin, ...). They
+  # are kept as opaque nodes: no range, never synthesised to hardware.
+  defp convert_op(op, args, %Nx.Tensor{type: {:f, _}} = t, key, state) do
+    {ids, state} =
+      args
+      |> List.flatten()
       |> Enum.filter(&match?(%Nx.Tensor{}, &1))
       |> Enum.map_reduce(state, &convert/2)
 

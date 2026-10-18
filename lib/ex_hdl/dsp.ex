@@ -95,15 +95,14 @@ defmodule ExHdl.DSP do
     Enum.to_list(offset..(offset + leaf_count(Enum.at(args, arg)) - 1)//1)
   end
 
-  defp leaf_count(t) when is_tuple(t),
-    do: t |> Tuple.to_list() |> Enum.map(&leaf_count/1) |> Enum.sum()
-
-  defp leaf_count(%Nx.Tensor{}), do: 1
-  defp leaf_count(n) when is_number(n), do: 1
-  defp leaf_count(_), do: 0
+  # Keyword lists (kernel options) are not parameters; every other argument
+  # is a container of tensors (tuples, ExHdl.Num.Fixed, ...).
+  defp leaf_count(list) when is_list(list), do: 0
+  defp leaf_count(arg), do: length(leaves(arg))
 
   defp leaves(t) when is_tuple(t), do: t |> Tuple.to_list() |> Enum.flat_map(&leaves/1)
-  defp leaves(other), do: [other]
+  defp leaves(n) when is_integer(n), do: [n]
+  defp leaves(arg), do: Nx.Defn.Composite.flatten_list([arg])
 
   # next_state must have exactly the state's types and shapes.
   defp check_state_types(args, arg, graph, next_ids) do
@@ -147,6 +146,14 @@ defmodule ExHdl.DSP do
   def run_scan(fun, [first | _] = samples, initial_state, params, opts) do
     {kernel_opts, opts} = Keyword.pop(opts, :kernel_opts)
     template = &Nx.Defn.Composite.traverse(&1, fn t -> Nx.to_template(Nx.tensor(t)) end)
+
+    # Float reference instances (ExHdl.Num.float/0) are allowed to contain floats.
+    float? =
+      [first, initial_state | params]
+      |> Nx.Defn.Composite.flatten_list()
+      |> Enum.any?(&match?({:f, _}, Nx.type(&1)))
+
+    opts = Keyword.put_new(opts, :allow_float, float?)
 
     templates =
       [template.(first), template.(initial_state) | Enum.map(params, template)] ++

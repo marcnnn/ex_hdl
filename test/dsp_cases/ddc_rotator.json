@@ -1,0 +1,111 @@
+{
+  "name": "ddc_rotator",
+  "description": "NCO + complex mixer + gain vs rotator_cc + multiply_const_cc",
+  "samples": 4096,
+  "seed": 1000,
+  "input": {
+    "type": "complex",
+    "tones": [
+      {
+        "freq": 0.05,
+        "amp": 0.45,
+        "phase": 0.0
+      },
+      {
+        "freq": -0.17,
+        "amp": 0.2,
+        "phase": 0.3
+      }
+    ],
+    "noise_rms": 0.001
+  },
+  "params": {
+    "phase_inc": 3001,
+    "initial_phase": 62535,
+    "gain": 0.8,
+    "initial_phase_note": "(-phase_inc) mod 65536: the block advances the phase before use, so the first sample uses phase 0 like rotator_cc"
+  },
+  "block": {
+    "name": "ddc",
+    "state": {
+      "phase": "initial_phase"
+    },
+    "args": [
+      {
+        "phase": "phase_inc"
+      },
+      {
+        "real": "gain"
+      }
+    ]
+  },
+  "gnuradio": [
+    {
+      "block": "blocks.rotator_cc",
+      "args": [
+        "2 * pi * phase_inc / 65536"
+      ]
+    },
+    {
+      "block": "blocks.multiply_const_cc",
+      "args": [
+        "gain"
+      ]
+    }
+  ],
+  "float_vs_gnuradio": {
+    "max_error_lsb": 2.0,
+    "snr_db_min": 85.0,
+    "rationale": "rotator_cc advances its phase by multiplying with a complex64 increment whose angle is off by about 2e-8 rad, so its phase drifts linearly (measured: mean error 0.07 LSB in the first 512 samples, 0.95 LSB in the last 512, max 1.4 LSB at sample 4082). The float instance computes cos/sin from the exact phase word, so this is GNU Radio's error; the bound holds for 4096 samples at |x| * gain <= 0.53."
+  },
+  "fixed_vs_float": [
+    {
+      "variant": "q15_lut10_truncate",
+      "format": {
+        "bits": 16,
+        "frac": 15,
+        "rounding": "truncate",
+        "lut_bits": 10
+      },
+      "snr_db_min": 48.0,
+      "max_error_lsb": 110,
+      "rationale": "Phase truncated to 10 table bits: phase error power (2*pi/2^10)^2/3 -> 49.0 dB. Per sample |x| * gain * 2*pi/2^10 = 106.2 LSB (|x| <= 0.66, gain 0.8) plus up to 3 LSB from the two requantizations."
+    },
+    {
+      "variant": "q15_lut10_nearest",
+      "format": {
+        "bits": 16,
+        "frac": 15,
+        "rounding": "nearest",
+        "lut_bits": 10
+      },
+      "snr_db_min": 54.0,
+      "max_error_lsb": 57,
+      "rationale": "Phase rounded to 10 table bits: phase error power (2*pi/2^10)^2/12 -> 55.0 dB. Per sample |x| * gain * pi/2^10 = 53.1 LSB (|x| <= 0.66, gain 0.8) plus up to 3 LSB from the two requantizations."
+    },
+    {
+      "variant": "q15_lut12_truncate",
+      "format": {
+        "bits": 16,
+        "frac": 15,
+        "rounding": "truncate",
+        "lut_bits": 12
+      },
+      "snr_db_min": 60.1,
+      "max_error_lsb": 30,
+      "rationale": "Phase truncated to 12 table bits: phase error power (2*pi/2^12)^2/3 -> 61.1 dB. Per sample |x| * gain * 2*pi/2^12 = 26.5 LSB (|x| <= 0.66, gain 0.8) plus up to 3 LSB from the two requantizations."
+    },
+    {
+      "variant": "q17_lut12_nearest",
+      "format": {
+        "bits": 18,
+        "frac": 17,
+        "rounding": "nearest",
+        "lut_bits": 12
+      },
+      "snr_db_min": 66.1,
+      "max_error_lsb": 17,
+      "rationale": "Phase rounded to 12 table bits: phase error power (2*pi/2^12)^2/12 -> 67.1 dB. Per sample |x| * gain * pi/2^12 = 13.3 LSB (|x| <= 0.66, gain 0.8) plus up to 3 LSB from the two requantizations."
+    }
+  ]
+}

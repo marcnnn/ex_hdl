@@ -1,78 +1,119 @@
 defmodule ExHdl.GnuRadioReferenceTest do
   @moduledoc """
-  Runs every shared DSP case (test/dsp_cases/*.json) through ExHdl's
-  fixed-point kernels on the CPU and compares the output sample by sample
-  with GNU Radio's output for the same input (test/fixtures/gnuradio/).
+  Two layers per shared DSP case (test/dsp_cases/*.json), both on the CPU:
 
-  GNU Radio computes in float, so each case states an SNR minimum and a
-  per-sample error bound, with the reasoning in `expect.rationale`.
+    1. The block's float instance against GNU Radio on the same input:
+       is the algorithm right?
+    2. Each fixed-point variant against the float instance: what does the
+       number format cost?
+
+  Each comparison checks a per-sample error bound and an SNR minimum; the
+  reasoning is in the case file. GNU Radio's output is committed in
+  test/fixtures/gnuradio/, so GNU Radio is not needed to run this.
   """
   use ExUnit.Case, async: true
 
   alias ExHdl.Test.GnuRadioFixture, as: F
 
-  @moduletag timeout: 120_000
+  @moduletag timeout: 300_000
+
+  setup_all do
+    # Float instance per case, shared by its variant tests.
+    runs =
+      Map.new(F.case_paths(), fn path ->
+        case = F.read_case(path)
+        data = F.load(case, path)
+
+        {case["name"],
+         %{case: case, data: data, float: F.run_block(case, data.input, ExHdl.Num.float())}}
+      end)
+
+    %{runs: runs}
+  end
 
   for path <- F.case_paths() do
     @external_resource path
-    case_data = F.read_case(path)
+    case = F.read_case(path)
+    @name case["name"]
 
-    @case_data case_data
-    @case_path path
-    test "#{case_data["name"]}: #{case_data["description"]}" do
-      check_case(@case_data, @case_path, F.fixtures_dir())
+    test "#{case["name"]}: float instance vs GNU Radio (#{case["description"]})", %{runs: runs} do
+      %{case: case, data: data, float: float} = runs[@name]
+
+      assert_close(
+        data.reference,
+        float,
+        case["float_vs_gnuradio"],
+        "#{@name} float vs GNU Radio",
+        data.input
+      )
+    end
+
+    for variant <- case["fixed_vs_float"] do
+      @variant variant
+      test "#{case["name"]}: #{variant["variant"]} vs float instance", %{runs: runs} do
+        %{case: case, data: data, float: float} = runs[@name]
+        fixed = F.run_block(case, data.input, F.format(@variant["format"]))
+
+        assert_close(
+          float,
+          fixed,
+          @variant,
+          "#{@name} #{@variant["variant"]} vs float",
+          data.input
+        )
+      end
     end
   end
 
   @doc false
-  def check_case(case, path, root) do
-    data = F.load(case, path, root)
-    ours = F.run_exhdl(case, data.input)
-    expect = case["expect"]
-
-    assert length(ours) == length(data.reference)
-
-    {worst, i} = F.worst_sample(data.reference, ours)
+  # `expect` has max_error_lsb, snr_db_min and rationale.
+  def assert_close(reference, signal, expect, label, input) do
+    assert length(signal) == length(reference)
+    {worst, i} = F.worst_sample(reference, signal)
 
     assert worst <= expect["max_error_lsb"], """
-    #{case["name"]}: sample #{i} is off by #{Float.round(worst, 1)} LSB (bound #{expect["max_error_lsb"]})
-      input:     #{inspect(Enum.at(data.input, i))}
-      GNU Radio: #{inspect(Enum.at(data.reference, i))}
-      ExHdl:     #{inspect(Enum.at(ours, i))}
+    #{label}: sample #{i} is off by #{Float.round(worst, 3)} LSB (bound #{expect["max_error_lsb"]})
+      input:     #{inspect(Enum.at(input, i))}
+      reference: #{inspect(Enum.at(reference, i))}
+      got:       #{inspect(Enum.at(signal, i))}
       bound:     #{expect["rationale"]}
     """
 
-    snr = F.snr_db(data.reference, ours)
+    snr = F.snr_db(reference, signal)
 
     assert snr >= expect["snr_db_min"],
-           "#{case["name"]}: SNR #{Float.round(snr, 1)} dB < #{expect["snr_db_min"]} dB (#{expect["rationale"]})"
+           "#{label}: SNR #{Float.round(snr, 1)} dB < #{expect["snr_db_min"]} dB (#{expect["rationale"]})"
 
     %{snr: snr, worst_lsb: worst}
   end
 
-  # Relations between cases: what a design change buys.
+  # What a format decision buys, measured against the float instance.
   describe "design comparisons" do
-    defp snr(name) do
-      path = Path.join(F.cases_dir(), name <> ".json")
-      case = F.read_case(path)
-      data = F.load(case, path)
-      F.snr_db(data.reference, F.run_exhdl(case, data.input))
+    defp snr(runs, name, variant) do
+      %{case: case, data: data, float: float} = runs[name]
+      v = Enum.find(case["fixed_vs_float"], &(&1["variant"] == variant))
+      F.snr_db(float, F.run_block(case, data.input, F.format(v["format"])))
     end
 
-    test "two more sine table bits buy about 12 dB" do
-      assert_in_delta snr("ddc_rotator_lut12") - snr("ddc_rotator_lut10"), 12.0, 1.0
+    test "NCO: rounding the phase buys 6 dB, two more table bits 12 dB", %{runs: runs} do
+      base = snr(runs, "ddc_rotator", "q15_lut10_truncate")
+      assert_in_delta snr(runs, "ddc_rotator", "q15_lut10_nearest") - base, 6.0, 1.0
+      assert_in_delta snr(runs, "ddc_rotator", "q15_lut12_truncate") - base, 12.0, 1.0
     end
 
-    test "rounding the NCO phase buys about 6 dB" do
-      assert_in_delta snr("ddc_rotator_lut10_round") - snr("ddc_rotator_lut10"), 6.0, 1.0
+    test "18-bit (Q17) data paths buy at least 12 dB over Q15", %{runs: runs} do
+      assert snr(runs, "fir_ccf_31tap", "q17_nearest") - snr(runs, "fir_ccf_31tap", "q15_nearest") >=
+               12
+
+      assert snr(runs, "one_pole_a0p01", "q17_nearest") -
+               snr(runs, "one_pole_a0p01", "q15_nearest") >= 12
     end
 
-    test "rounding the FIR output buys about 6 dB" do
-      assert_in_delta snr("fir_ccf_31tap_round") - snr("fir_ccf_31tap_truncate"), 6.0, 1.0
-    end
-
-    test "rounding the IIR update beats truncation by more than 20 dB at alpha = 0.01" do
-      assert snr("one_pole_a328_round") - snr("one_pole_a328_truncate") > 20
+    test "rounding the IIR update beats truncation by more than 20 dB at alpha = 0.01", %{
+      runs: runs
+    } do
+      assert snr(runs, "one_pole_a0p01", "q15_nearest") -
+               snr(runs, "one_pole_a0p01", "q15_truncate") > 20
     end
   end
 end

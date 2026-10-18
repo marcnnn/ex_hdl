@@ -49,6 +49,7 @@ defmodule ExHdl.Passes.WidthCheck do
     * `:case_split` - enable stage 2 (default `true`).
     * `:split_threshold` - max values of a split node (default 4096).
     * `:split_budget` - max node evaluations spent on splitting (default 2_000_000).
+    * `:allow_float` - accept float nodes (float reference instances).
   """
   @spec run(Dataflow.t(), keyword()) :: {Dataflow.t(), [Violation.t()]}
   def run(%Dataflow{} = graph, opts \\ []) do
@@ -65,7 +66,16 @@ defmodule ExHdl.Passes.WidthCheck do
       | nodes: Map.new(graph.nodes, fn {id, n} -> {id, %{n | range: ranges[id]}} end)
     }
 
-    {graph, check(graph, param_ranges)}
+    violations = check(graph, param_ranges)
+
+    # A float instance (ExHdl.Num.float/0) is a reference: its float nodes are
+    # fine, only its integer parts (phase words, ...) are checked.
+    violations =
+      if Keyword.get(opts, :allow_float, false),
+        do: Enum.reject(violations, &(&1.kind == :float)),
+        else: violations
+
+    {graph, violations}
   end
 
   @doc "Value range `{min, max}` representable by an Nx integer type."

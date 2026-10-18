@@ -70,10 +70,11 @@ defmodule ExHdl.DSPScanTest do
   end
 
   describe "FIR with constant taps" do
-    @taps "test/dsp_cases/fir_ccf_31tap_round.json"
+    @taps "test/dsp_cases/fir_ccf_31tap.json"
           |> File.read!()
           |> JSON.decode!()
-          |> get_in(["params", "taps_q15"])
+          |> get_in(["params", "taps"])
+          |> Enum.map(&round(&1 * 32768))
 
     defp fir(opts \\ []) do
       args = [

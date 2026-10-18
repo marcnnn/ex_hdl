@@ -30,8 +30,17 @@ defmodule ExHdl.GnuRadioLiveTest do
     @case_data case_data
     @case_path path
 
-    test "#{case_data["name"]} against live GNU Radio", %{live: live} do
-      GnuRadioReferenceTest.check_case(@case_data, @case_path, live)
+    test "#{case_data["name"]}: float instance against live GNU Radio", %{live: live} do
+      data = F.load(@case_data, @case_path, live)
+      float = F.run_block(@case_data, data.input, ExHdl.Num.float())
+
+      GnuRadioReferenceTest.assert_close(
+        data.reference,
+        float,
+        @case_data["float_vs_gnuradio"],
+        @case_data["name"],
+        data.input
+      )
     end
 
     test "#{case_data["name"]}: committed data matches live GNU Radio", %{live: live} do

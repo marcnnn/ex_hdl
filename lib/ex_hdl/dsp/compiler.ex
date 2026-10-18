@@ -11,7 +11,7 @@ defmodule ExHdl.DSP.Compiler do
   """
   @behaviour Nx.Defn.Compiler
 
-  @own_opts [:param_ranges, :case_split, :split_threshold, :split_budget]
+  @own_opts [:param_ranges, :case_split, :split_threshold, :split_budget, :allow_float]
 
   @impl true
   def __jit__(key, vars, fun, args_list, opts), do: __compile__(key, vars, fun, opts).(args_list)

@@ -1,0 +1,121 @@
+{
+  "name": "fir_ccf_31tap",
+  "description": "31-tap low-pass FIR on complex samples vs fir_filter_ccf",
+  "samples": 4096,
+  "seed": 1010,
+  "input": {
+    "type": "complex",
+    "tones": [
+      {
+        "freq": 0.03,
+        "amp": 0.4,
+        "phase": 0.0
+      },
+      {
+        "freq": 0.3,
+        "amp": 0.3,
+        "phase": 1.0
+      }
+    ],
+    "noise_rms": 0.001
+  },
+  "params": {
+    "taps": [
+      6.226492714606378e-19,
+      0.0012014263758827752,
+      0.0027843278479828906,
+      0.004227316085446902,
+      0.003942763412776412,
+      -2.4127659269099726e-18,
+      -0.008256777292656482,
+      -0.018583210130235964,
+      -0.025389820435008308,
+      -0.021235308698378603,
+      5.992999237808639e-18,
+      0.039588112570909856,
+      0.09188887702052764,
+      0.14509908103158412,
+      0.18490287856182103,
+      0.1996606672986955,
+      0.18490287856182103,
+      0.14509908103158412,
+      0.09188887702052764,
+      0.039588112570909856,
+      5.992999237808639e-18,
+      -0.021235308698378603,
+      -0.025389820435008308,
+      -0.018583210130235964,
+      -0.008256777292656482,
+      -2.4127659269099726e-18,
+      0.003942763412776412,
+      0.004227316085446902,
+      0.0027843278479828906,
+      0.0012014263758827752,
+      6.226492714606378e-19
+    ],
+    "taps_note": "windowed-sinc low-pass, cutoff 0.1 cycles/sample, Hamming window, DC gain 1"
+  },
+  "block": {
+    "name": "fir_complex",
+    "state": {
+      "zeros": 30,
+      "complex": true
+    },
+    "args": [],
+    "opts": {
+      "taps": "taps"
+    }
+  },
+  "gnuradio": [
+    {
+      "block": "filter.fir_filter_ccf",
+      "args": [
+        1,
+        "taps"
+      ]
+    }
+  ],
+  "float_vs_gnuradio": {
+    "max_error_lsb": 0.01,
+    "snr_db_min": 140.0,
+    "rationale": "Same float taps on both sides; differences are float32 accumulation order only (measured 0.002 LSB, 144.7 dB)."
+  },
+  "fixed_vs_float": [
+    {
+      "variant": "q15_nearest",
+      "format": {
+        "bits": 16,
+        "frac": 15,
+        "rounding": "nearest",
+        "lut_bits": 10
+      },
+      "snr_db_min": 82.6,
+      "max_error_lsb": 6.6,
+      "rationale": "Q15 taps (sum of |tap rounding error| = 5.9 LSB per unit input) and rounded output (0.5 LSB per component): per component <= 0.5 + 5.9 * 0.7 LSB (|x| <= 0.7 FS per component). SNR: rounding noise 1/12 LSB^2 plus the tap error acting on 0.125 FS^2 per component -> about 83 dB; minimum is the measured 83.6 dB - 1 dB."
+    },
+    {
+      "variant": "q15_truncate",
+      "format": {
+        "bits": 16,
+        "frac": 15,
+        "rounding": "truncate",
+        "lut_bits": 10
+      },
+      "snr_db_min": 80.4,
+      "max_error_lsb": 7.3,
+      "rationale": "As q15_nearest, but truncation adds up to 1 LSB per component with mean -0.5 LSB; minimum is the measured 81.4 dB - 1 dB."
+    },
+    {
+      "variant": "q17_nearest",
+      "format": {
+        "bits": 18,
+        "frac": 17,
+        "rounding": "nearest",
+        "lut_bits": 10
+      },
+      "snr_db_min": 98.0,
+      "max_error_lsb": 1.6,
+      "rationale": "Q17 taps (sum of |tap rounding error| = 1.41 Q15 LSB per unit input) and 0.125 Q15 LSB output rounding per component. 4x finer steps: about 12 dB over Q15 from rounding alone; minimum is the measured 99.0 dB - 1 dB."
+    }
+  ]
+}

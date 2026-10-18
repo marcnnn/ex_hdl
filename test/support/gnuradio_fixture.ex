@@ -40,45 +40,54 @@ defmodule ExHdl.Test.GnuRadioFixture do
   defp complex?(case), do: case["input"]["type"] == "complex"
   defp pairs(list), do: list |> Enum.chunk_every(2) |> Enum.map(&List.to_tuple/1)
 
-  @doc "Runs the case's ExHdl kernel over `input`; returns outputs scaled so 1.0 = 32768."
-  def run_exhdl(case, input) do
-    %{"kernel" => kernel, "state" => state, "args" => args} = ex = case["exhdl"]
-    params = case["params"]
+  @doc "The `ExHdl.Num` format described by a case's `format` map."
+  def format(%{"bits" => bits, "frac" => frac} = f),
+    do:
+      ExHdl.Num.q(bits, frac,
+        rounding: String.to_atom(f["rounding"]),
+        lut_bits: f["lut_bits"] || 10
+      )
 
-    kernel_opts =
-      Map.new(ex["kernel_opts"] || %{}, fn {k, v} -> {String.to_atom(k), value(v, params)} end)
+  def format("float"), do: ExHdl.Num.float()
 
-    arity = 2 + length(args) + if(kernel_opts == %{}, do: 0, else: 1)
-    fun = Function.capture(ExHdl.Test.DSP, String.to_atom(kernel), arity)
+  @doc """
+  Runs the case's `ExHdl.DSP.Blocks` block over `input` (Q15 integers) in
+  `format`; returns Elixir floats (1.0 = full scale), `{re, im}` for complex.
+  """
+  def run_block(case, input, %ExHdl.Num.Format{} = format) do
+    %{"block" => block, "params" => params} = case
+    args = Enum.map(block["args"] || [], &arg(&1, params, format))
+    opts = Enum.map(block["opts"] || %{}, fn {k, v} -> {String.to_atom(k), value(v, params)} end)
+    fun = Function.capture(ExHdl.DSP.Blocks, String.to_atom(block["name"]), 3 + length(args))
 
     samples =
       if complex?(case),
-        do: Enum.map(input, fn {i, q} -> {Nx.s16(i), Nx.s16(q)} end),
-        else: Enum.map(input, &Nx.s16/1)
-
-    opts = if kernel_opts == %{}, do: [], else: [kernel_opts: Keyword.new(kernel_opts)]
+        do: Enum.map(input, fn {i, q} -> {sample(i, format), sample(q, format)} end),
+        else: Enum.map(input, &sample(&1, format))
 
     {outputs, _state} =
-      DSP.run_scan(fun, samples, tensor(state, params), Enum.map(args, &tensor(&1, params)), opts)
+      DSP.run_scan(fun, samples, state(block["state"], params, format), args,
+        kernel_opts: [format: format] ++ opts
+      )
 
-    Enum.map(outputs, fn
-      {i, q} -> {Nx.to_number(i) / 32768, Nx.to_number(q) / 32768}
-      x -> Nx.to_number(x) / 32768
-    end)
+    Enum.map(outputs, &ExHdl.Num.to_float/1)
   end
+
+  defp sample(v, format), do: ExHdl.Num.from_int(Nx.tensor(v, type: :s16), 15, format)
+
+  # Argument and state specs: {"phase": p} is a u16 phase word in every
+  # format, {"real": p} a real number in the instance's format.
+  defp arg(%{"phase" => p}, params, _format), do: Nx.tensor(value(p, params), type: :u16)
+  defp arg(%{"real" => p}, params, format), do: ExHdl.Num.constant(value(p, params), format)
+
+  defp state(%{"zeros" => n, "complex" => true}, _params, format),
+    do: {ExHdl.Num.zeros({n}, format), ExHdl.Num.zeros({n}, format)}
+
+  defp state(%{"zeros" => n}, _params, format), do: ExHdl.Num.zeros({n}, format)
+  defp state(spec, params, format), do: arg(spec, params, format)
 
   defp value(name, params) when is_binary(name), do: Map.fetch!(params, name)
   defp value(v, _params), do: v
-
-  # State/argument specs: ["s16", 0], ["u16", "param"], ["s16", {"zeros": 30}]
-  # or {"tuple": [spec, ...]}.
-  defp tensor(%{"tuple" => specs}, params),
-    do: specs |> Enum.map(&tensor(&1, params)) |> List.to_tuple()
-
-  defp tensor([type, %{"zeros" => n}], _params),
-    do: Nx.broadcast(Nx.tensor(0, type: String.to_atom(type)), {n})
-
-  defp tensor([type, v], params), do: Nx.tensor(value(v, params), type: String.to_atom(type))
 
   @doc "SNR in dB of `signal` against `reference`."
   def snr_db(reference, signal) do

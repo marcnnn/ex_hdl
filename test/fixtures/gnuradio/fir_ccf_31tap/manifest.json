@@ -1,0 +1,6 @@
+{
+  "case": "fir_ccf_31tap",
+  "case_sha256": "62257bbebe3fe781e95c71aacfdbbfba70fa72abc094933f653d584a07896c34",
+  "gnuradio": "3.10.12.0",
+  "numpy": "2.3.5"
+}
