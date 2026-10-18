@@ -124,6 +124,20 @@ defmodule ExHdl.Types.IntSet do
   @doc "`{min, max}` of a non-empty set."
   def bounds([{lo, _} | _] = set), do: {lo, set |> List.last() |> elem(1)}
 
+  @doc """
+  Smallest `{:u, bits}` or `{:s, bits}` (two's complement) holding every
+  value of a finite set.
+  """
+  def bit_width([]), do: {:u, 1}
+
+  def bit_width(set) do
+    {lo, hi} = bounds(finite!(set))
+
+    if lo >= 0,
+      do: {:u, Kernel.max(1, bit_length(hi))},
+      else: {:s, Kernel.max(bit_length(-lo - 1), bit_length(Kernel.max(hi, 0))) + 1}
+  end
+
   def to_list(set), do: Enum.flat_map(set, fn {lo, hi} -> Enum.to_list(lo..hi//1) end)
 
   # -- printing ---------------------------------------------------------------------

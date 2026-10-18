@@ -11,7 +11,7 @@ software and SystemVerilog hardware.
 | `ExHdl.Protocol`: `defpacket` DSL, BEAM codecs, AXI4-Stream parser/emitter in SystemVerilog | done |
 | Verilator co-simulation (`ExHdl.Sim.Verilator`) | done |
 | Fixed-point DSP: dataflow IR, range analysis (`ExHdl.Passes.WidthCheck`), primitives, checked Nx reference compiler | done |
-| Stateful streams (`stream_scan`), recurrence analysis | in progress |
+| Stateful streams: recurrence analysis, `ii:`/`channels:`, Zynq timing model (`ExHdl.DSP.analyze_scan`) | done |
 | Nx-to-SystemVerilog, retiming, `accelerator` DSL | planned |
 | Google Highway CPU backend | planned |
 | openXC7 bitstream builder, Zynq runtime | planned |
