@@ -90,8 +90,8 @@ defmodule ExHdl.DVBT.Receiver do
   end
 
   @doc """
-  Fast receiver (`ExHdl.DVBT.Fast`): tensors on EXLA when available and the
-  native Viterbi kernel. `samples` start at a superframe boundary unless
+  Fast receiver: the front end compiled into one EXLA computation
+  (`ExHdl.DVBT.FastJit`) and the native Viterbi kernel. `samples` start at a superframe boundary unless
   `:start` (sample index) and `:freq_offset` (subcarrier spacings) are
   given, e.g. by `ExHdl.DVBT.Sync.acquire/2`. Same decisions and output as
   `receive/2`.
@@ -102,6 +102,7 @@ defmodule ExHdl.DVBT.Receiver do
     start = Keyword.get(opts, :start, 0)
     backend = if Code.ensure_loaded?(EXLA.Backend), do: EXLA.Backend, else: Nx.BinaryBackend
 
+    # the whole front end as one compiled computation (ExHdl.DVBT.FastJit)
     bits =
       Nx.with_default_backend(backend, fn ->
         x =
@@ -109,15 +110,7 @@ defmodule ExHdl.DVBT.Receiver do
           |> Nx.backend_transfer(backend)
           |> then(&Nx.slice(&1, [start], [Nx.size(&1) - start]))
 
-        n = div(Nx.size(x), 2112)
-
-        x
-        |> ExHdl.DVBT.Fast.carriers(n, Keyword.get(opts, :freq_offset, 0.0))
-        |> ExHdl.DVBT.Fast.equalise(0)
-        |> ExHdl.DVBT.Fast.demap(constellation)
-        |> ExHdl.DVBT.Fast.symbol_deinterleave(0)
-        |> ExHdl.DVBT.Fast.bit_deinterleave(constellation)
-        |> ExHdl.DVBT.Fast.unpack(constellation)
+        ExHdl.DVBT.FastJit.run(x, Keyword.get(opts, :freq_offset, 0.0), constellation)
       end)
 
     bits

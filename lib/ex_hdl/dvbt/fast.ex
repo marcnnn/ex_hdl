@@ -214,3 +214,185 @@ defmodule ExHdl.DVBT.Fast do
             b7>>
   end
 end
+
+defmodule ExHdl.DVBT.FastJit do
+  @moduledoc """
+  The 2k receiver front end as one `defn` (frequency correction, FFT,
+  carrier extraction, channel estimate, equalisation, hard decisions,
+  symbol and bit deinterleaving, bit unpacking), so `Nx.Defn.jit/2` with
+  EXLA compiles it into a single fused computation instead of one call per
+  tensor operation. Same results as the eager `ExHdl.DVBT.Fast` pipeline.
+
+  Input: `n` whole symbols starting at a superframe boundary. Output:
+  `u8[n * 1512 * v]` code bits for the Viterbi decoder.
+  """
+  import Nx.Defn
+  alias ExHdl.DVBT.{Fast, Inner, OFDM}
+
+  @fft 2048
+  @cp 64
+  @sym @fft + @cp
+  @pi :math.pi()
+
+  @doc "Compiled front end for `n` symbols (cached per `n` and constellation)."
+  def compiled(n, constellation) do
+    key = {__MODULE__, n, constellation}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        args = [Nx.template({n * @sym}, :c64), Nx.template({}, :f32), tables(constellation)]
+        compiler = if Code.ensure_loaded?(EXLA), do: EXLA, else: Nx.Defn.Evaluator
+
+        f =
+          Nx.Defn.compile(&front_end/4, args ++ [[constellation: constellation]],
+            compiler: compiler
+          )
+
+        :persistent_term.put(key, f)
+        f
+
+      f ->
+        f
+    end
+  end
+
+  @doc "Runs the compiled front end; returns the code bits as a binary."
+  def run(samples, freq_offset, constellation) do
+    n = div(Nx.size(samples), @sym)
+    x = Nx.slice(samples, [0], [n * @sym])
+    f = compiled(n, constellation)
+    f.(x, Nx.tensor(freq_offset, type: :f32), tables(constellation)) |> Nx.to_binary()
+  end
+
+  # Index and weight tables as tensors (passed as arguments, not constants).
+  defp tables(constellation) do
+    key = {__MODULE__, :tables, constellation}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        prbs = OFDM.prbs()
+        max_pilots = 0..3 |> Enum.map(&length(OFDM.pilots(&1))) |> Enum.max()
+
+        per_phase =
+          for p <- 0..3 do
+            pilots = OFDM.pilots(p)
+
+            {left, weight} =
+              for k <- 0..1704 do
+                j = (Enum.count(pilots, &(&1 <= k)) - 1) |> max(0) |> min(length(pilots) - 2)
+                {k0, k1} = {Enum.at(pilots, j), Enum.at(pilots, j + 1)}
+                {j, (k - k0) / (k1 - k0)}
+              end
+              |> Enum.unzip()
+
+            # pilot index padded to a common length (repeat the last pilot)
+            pad = max_pilots - length(pilots)
+
+            {Nx.tensor(pilots ++ List.duplicate(List.last(pilots), pad)),
+             Nx.tensor(
+               Enum.map(pilots, &OFDM.pilot_value(prbs, &1)) ++
+                 List.duplicate(OFDM.pilot_value(prbs, List.last(pilots)), pad),
+               type: :f32
+             ), Nx.tensor(left), Nx.tensor(weight, type: :f32), Nx.tensor(OFDM.data_carriers(p))}
+          end
+
+        h = Inner.symbol_permutation(:"2k") |> Tuple.to_list()
+        inverse = h |> Enum.with_index() |> Enum.sort() |> Enum.map(&elem(&1, 1))
+        v = Inner.bits_per_symbol(constellation)
+        demux = %{2 => [0, 1], 4 => [0, 2, 1, 3], 6 => [0, 2, 4, 1, 3, 5]}[v]
+        offsets = [0, 63, 105, 42, 21, 84]
+
+        bit_src =
+          for e <- demux do
+            Nx.tensor(for w <- 0..125, do: Integer.mod(w - Enum.at(offsets, e), 126))
+          end
+
+        t = %{
+          bins: Nx.tensor(for k <- 0..1704, do: Integer.mod(k + 172 - 1024, 2048)),
+          pilots: per_phase |> Enum.map(&elem(&1, 0)) |> Nx.stack(),
+          values: per_phase |> Enum.map(&elem(&1, 1)) |> Nx.stack(),
+          left: per_phase |> Enum.map(&elem(&1, 2)) |> Nx.stack(),
+          weight: per_phase |> Enum.map(&elem(&1, 3)) |> Nx.stack(),
+          data: per_phase |> Enum.map(&elem(&1, 4)) |> Nx.stack(),
+          symbol_h: Nx.tensor(h),
+          symbol_inverse: Nx.tensor(inverse),
+          bit_src: Nx.stack(bit_src)
+        }
+
+        :persistent_term.put(key, t)
+        t
+
+      t ->
+        t
+    end
+  end
+
+  defn front_end(x, freq_offset, t, opts \\ []) do
+    opts = keyword!(opts, [:constellation])
+    n = div(Nx.size(x), @sym)
+
+    phase = Nx.complex(0.0, -2 * @pi / @fft) * freq_offset * Nx.iota({n * @sym}, type: :f32)
+
+    carriers =
+      (x * Nx.exp(phase))
+      |> Nx.reshape({n, @sym})
+      |> Nx.slice_along_axis(@cp, @fft, axis: 1)
+      |> Nx.fft()
+      |> Nx.take(t.bins, axis: 1)
+
+    # all four scattered pilot phases for every symbol, selected per row
+    row_phase = Nx.remainder(Nx.iota({n, 1}), 4)
+
+    eq =
+      equalise_phase(carriers, t, 0) * (row_phase == 0) +
+        equalise_phase(carriers, t, 1) * (row_phase == 1) +
+        equalise_phase(carriers, t, 2) * (row_phase == 2) +
+        equalise_phase(carriers, t, 3) * (row_phase == 3)
+
+    words = demap(eq, opts[:constellation])
+
+    even = Nx.take(words, t.symbol_h, axis: 1)
+    odd = Nx.take(words, t.symbol_inverse, axis: 1)
+    is_even = Nx.broadcast(Nx.remainder(Nx.iota({n, 1}), 2) == 0, Nx.shape(even))
+    deint = Nx.select(is_even, even, odd)
+
+    bits_out(deint, t.bit_src, opts[:constellation])
+  end
+
+  deftransformp equalise_phase(carriers, t, p) do
+    pilots = t.pilots[p]
+    values = t.values[p]
+    gains = Nx.divide(Nx.take(carriers, pilots, axis: 1), values)
+    left = Nx.take(gains, t.left[p], axis: 1)
+    right = Nx.take(gains, Nx.add(t.left[p], 1), axis: 1)
+    h = Nx.add(left, Nx.multiply(Nx.subtract(right, left), t.weight[p]))
+    Nx.divide(Nx.take(carriers, t.data[p], axis: 1), Nx.take(h, t.data[p], axis: 1))
+  end
+
+  deftransformp demap(points, constellation), do: Fast.demap(points, constellation)
+
+  deftransformp bits_out(words, bit_src, constellation) do
+    v = Inner.bits_per_symbol(constellation)
+    demux = %{2 => [0, 1], 4 => [0, 2, 1, 3], 6 => [0, 2, 4, 1, 3, 5]}[v]
+    blocks = Nx.reshape(words, {:auto, 126})
+
+    deinterleaved =
+      demux
+      |> Enum.with_index()
+      |> Enum.reduce(Nx.broadcast(Nx.tensor(0, type: :u8), Nx.shape(blocks)), fn {e, i}, acc ->
+        bit =
+          blocks |> Nx.take(bit_src[i], axis: 1) |> Nx.right_shift(v - 1 - e) |> Nx.bitwise_and(1)
+
+        Nx.bitwise_or(acc, Nx.left_shift(bit, v - 1 - i))
+      end)
+
+    shifts = Nx.tensor(Enum.to_list((v - 1)..0//-1), type: :u8)
+
+    deinterleaved
+    |> Nx.reshape({:auto, 1})
+    |> Nx.right_shift(shifts)
+    |> Nx.bitwise_and(1)
+    |> Nx.as_type(:u8)
+    |> Nx.flatten()
+  end
+end

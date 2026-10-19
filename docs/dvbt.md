@@ -69,11 +69,17 @@ Same 2.3M samples (4 superframes), Neoverse-N1, one process each:
 | Receiver | Time | Throughput |
 |---|---|---|
 | gr-dtv (C++, VOLK) | 16.4 s | 0.14 Msamples/s |
-| ExHdl fast path (`Receiver.receive_sync/2`: EXLA tensors + native Viterbi) | 1.4-1.7 s | 1.4-1.6 Msamples/s |
+| ExHdl fast path (`Receiver.receive_sync/2`: front end as one jit-compiled EXLA computation + native Viterbi) | 1.1 s | 2.1 Msamples/s |
 | ExHdl list reference (`Receiver.receive/2`) | 81 s | 0.03 Msamples/s |
 
-Real time for 2k DVB-T is 9.14 Msamples/s; neither receiver reaches it on
-this machine. In ExHdl's fast path the native Viterbi decoder runs at
+Real time for 2k DVB-T is 9.14 Msamples/s (252 ms of signal here). The
+front end went from 486 ms (Nx operations called one by one on EXLA) to
+142 ms when compiled as one `defn` with `Nx.Defn.jit` (fused); the
+remaining time is the scalar Viterbi (344 ms), Reed-Solomon in Elixir
+(253 ms, decodes every packet) and Elixir deinterleaving/descrambling. The
+compiled front end differs from the eager one in 47 of 3.3M decisions on a
+noisy signal (float rounding order after fusion); decoded output and
+packet counts are unchanged. In ExHdl's fast path the native Viterbi decoder runs at
 about 5 Mbit/s (scalar C++); the fast path makes the same hard decisions
 and decodes to the same output as the reference.
 
