@@ -9,6 +9,7 @@ defmodule ExHdl.Test.SdrKernels do
     s = %NxFixed.Fixed{t: Nx.template({}, :s16), frac: 15}
     line = %NxFixed.Fixed{t: Nx.template({30}, :s16), frac: 15}
     phase = Nx.template({}, :u16)
+    lp = ExHdl.Test.BlockCases.lowpass(63)
 
     taps =
       Mix.Project.deps_paths()[:ex_sdr]
@@ -39,6 +40,14 @@ defmodule ExHdl.Test.SdrKernels do
         ii: :auto,
         param_names: ["alpha"]
       ],
+      block_kernel(
+        "fir_filter_fff_63_q15",
+        ExSdr.Filters.block(:fir_filter_fff, taps: lp, format: f)
+      ),
+      block_kernel(
+        "fir_filter_ccf_63_q15",
+        ExSdr.Filters.block(:fir_filter_ccf, taps: lp, format: f)
+      ),
       [
         name: "one_pole_q15_ch5",
         fun: &ExSdr.DSP.Blocks.one_pole/4,
@@ -47,6 +56,16 @@ defmodule ExHdl.Test.SdrKernels do
         channels: 5,
         param_names: ["alpha"]
       ]
+    ]
+  end
+
+  defp block_kernel(name, block) do
+    [
+      name: name,
+      fun: block.fun,
+      args: ExHdl.Block.args(block),
+      state: 1,
+      init: ExHdl.Block.init(block)
     ]
   end
 end

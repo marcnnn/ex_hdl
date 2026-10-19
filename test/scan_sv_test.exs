@@ -12,9 +12,10 @@ defmodule ExHdl.ScanSvTest do
       ExHdl.DSP.analyze_scan(&K.one_pole_step/3, [t(:s16), t(:s16), t(:s16)], [state: 1] ++ opts)
 
   test "unsupported operations are reported by name" do
-    {:ok, scan} = ExHdl.DSP.analyze_scan(&K.quotient_step/2, [t(:s16), t(:s16)], state: 1)
+    {:ok, scan} =
+      ExHdl.DSP.analyze_scan(&K.row_take_step/2, [t(:s16), t(:s16)], state: 1, ii: :auto)
 
-    assert_raise SV.UnsupportedError, ~r/Nx operation :quotient \(node \d+/, fn ->
+    assert_raise SV.UnsupportedError, ~r/Nx operation :take \(node \d+.*needs a 1-D table/, fn ->
       SV.generate(scan)
     end
   end

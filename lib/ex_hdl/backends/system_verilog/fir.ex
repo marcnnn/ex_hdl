@@ -37,8 +37,16 @@ defmodule ExHdl.Backends.SystemVerilog.Fir do
   @folded_latency 3
 
   @doc """
-  The FIR plan of a lowered context: `%{dot_id => %{latency:, elems: %{e => [group]}}}`
-  with groups `%{x0:, taps:, refs:, fold:}`.
+  The plan of a lowered context:
+
+    * `dot_id => %{latency:, elems: %{e => [group]}}` with groups
+      `%{x0:, taps:, refs:, fold:}`; `fold` is `nil`, `:sym`, `:anti` or
+      `:sum` (all taps equal: a running sum over a memory delay)
+    * `{:take, id} => %{x0:, a:, slope:, depth:}` - a take with a
+      data-dependent index from a delay line: `base[n - (a + slope * idx)]`,
+      read from a memory of the last `depth` values
+    * `{:out, name} => %{x0:, d:}` - an output that is the delay line's
+      value `d` samples back, read from a memory
   """
   def plan(c, scan) do
     if scan.channels != 1 do
@@ -48,22 +56,49 @@ defmodule ExHdl.Backends.SystemVerilog.Fir do
 
       {st, index} = index(st)
 
-      for id <- c.graph.order,
-          node = c.graph.nodes[id],
-          node.op == :dot,
-          not MapSet.member?(scan.recurrence, id),
-          {:ok, p} <- [node_plan(st, index, node)],
-          into: %{},
-          do: {id, p}
+      dots =
+        for id <- c.graph.order,
+            node = c.graph.nodes[id],
+            node.op == :dot,
+            not MapSet.member?(scan.recurrence, id),
+            {:ok, p} <- [node_plan(st, index, node)],
+            into: %{},
+            do: {id, p}
+
+      takes =
+        for id <- c.graph.order,
+            node = c.graph.nodes[id],
+            node.op == :take,
+            not MapSet.member?(scan.recurrence, id),
+            {:ok, p} <- [take_plan(st, node)],
+            into: %{},
+            do: {{:take, id}, p}
+
+      outs =
+        for id <- flatten_outputs(scan, c),
+            {:sig, name} <- c.elems[id] |> Tuple.to_list(),
+            match?({:state, _, _, _}, Map.get(c.defs, name)),
+            {:ok, p} <- [out_plan(st, index, name)],
+            into: %{},
+            do: {{:out, name}, p}
+
+      dots |> Map.merge(takes) |> Map.merge(outs)
     end
   end
 
   @doc "Schedule cost overrides for the planned dots."
-  def costs(plan), do: Map.new(plan, fn {id, p} -> {id, {:reg, p.latency, :dsp48_chain}} end)
+  def costs(plan),
+    do: for({id, p} <- plan, is_integer(id), into: %{}, do: {id, {:reg, p.latency, :dsp48_chain}})
 
   @doc "Cycles of a group's chain."
-  def chain_latency(%{fold: nil}), do: @plain_latency
+  def chain_latency(%{fold: f}) when f in [nil, :sum], do: @plain_latency
   def chain_latency(_), do: @folded_latency
+
+  # Delays of at least this many samples go to a memory when they are
+  # outputs.
+  @min_memory_delay 8
+  # Equal taps from this many on become a running sum.
+  @min_running_sum 4
 
   @doc """
   The chain positions of a group, `[{k, h, second}]` for k = 0.. where
@@ -224,9 +259,68 @@ defmodule ExHdl.Backends.SystemVerilog.Fir do
     center = if rem(d, 2) == 0, do: Enum.at(taps, div(d, 2)), else: 0
 
     cond do
+      length(taps) >= @min_running_sum and Enum.uniq(taps) |> length() == 1 -> :sum
       taps == rev -> :sym
       taps == Enum.map(rev, &(-&1)) and center == 0 -> :anti
       true -> nil
+    end
+  end
+
+  # -- delay line memories ----------------------------------------------------------------
+
+  defp take_plan(st, node) do
+    [table_id, idx_id] = node.inputs
+    c = st.c
+    table = c.graph.nodes[table_id]
+
+    with nil <- NxFixed.Dataflow.constant_tensor(c.graph, table_id),
+         {len} <- table.shape,
+         refs = Tuple.to_list(c.elems[table_id]),
+         keys = Enum.map(refs, &sig_key(st, &1)),
+         [{_, base}] <- keys |> Enum.map(&{:b, elem(&1 || {nil, nil}, 1)}) |> Enum.uniq(),
+         true <- base != nil and Enum.all?(keys, &match?({d, _} when is_integer(d), &1)),
+         delays = Enum.map(keys, &elem(&1, 0)),
+         {a, slope} when slope in [-1, 1] <- affine(delays),
+         x0 when x0 != nil <-
+           Enum.find_value(Enum.zip(delays, refs), fn {d, r} -> d == 0 && r end),
+         true <-
+           Enum.all?(Enum.zip(delays, refs), fn {d, r} -> d == 0 or eval0(c, r) == {:ok, 0} end),
+         {lo, hi} = NxFixed.IntSet.bounds(c.graph.nodes[idx_id].range),
+         true <- lo >= 0 and hi < len do
+      {:ok, %{x0: x0, a: a, slope: slope, depth: Enum.max(delays) + 1}}
+    else
+      _ -> :error
+    end
+  end
+
+  defp sig_key(st, {:sig, name}), do: st.keys[name]
+  defp sig_key(_st, _), do: nil
+
+  # `{a, slope}` with `delays[i] == a + slope * i`.
+  defp affine([d0, d1 | _] = delays) do
+    slope = d1 - d0
+
+    if delays |> Enum.with_index() |> Enum.all?(fn {d, i} -> d == d0 + slope * i end),
+      do: {d0, slope},
+      else: :error
+  end
+
+  defp affine(_), do: :error
+
+  defp out_plan(st, index, name) do
+    with {d, base} when is_integer(d) and d >= @min_memory_delay <- st.keys[name],
+         x0 when x0 != nil <- Map.get(index, {base, 0}),
+         true <- Enum.all?(1..d, &(zero_start(st, index, base, &1) == {:ok, 0})) do
+      {:ok, %{x0: x0, d: d}}
+    else
+      _ -> :error
+    end
+  end
+
+  defp flatten_outputs(scan, c) do
+    case c.layout.lanes do
+      nil -> flatten(scan.outputs)
+      _ -> [c.layout.count_id | c.layout.outputs |> Enum.map(& &1.index)]
     end
   end
 
@@ -367,6 +461,7 @@ defmodule ExHdl.Backends.SystemVerilog.Fir do
       {:add, [a, b]} -> {:ok, a + b}
       {:subtract, [a, b]} -> {:ok, a - b}
       {:remainder, [a, b]} when b != 0 -> {:ok, rem(a, b)}
+      {:quotient, [a, b]} when b != 0 -> {:ok, div(a, b)}
       {:multiply, [a, b]} -> {:ok, a * b}
       {:negate, [a]} -> {:ok, -a}
       {:abs, [a]} -> {:ok, abs(a)}

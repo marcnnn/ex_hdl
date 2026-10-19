@@ -75,9 +75,11 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
         `%{index:, type:, shape:, offset:, bits:}` (`bits` per element).
       * `params` - the parameter ports: `%{port:, index:, type:, shape:, bits:}`.
       * `in_width`, `out_width` - tdata widths.
+      * `lanes` - `nil`, or the most items one sample can give (variable rate).
     """
     defstruct [
       :name,
+      :lanes,
       :source,
       :latency,
       :ii,
@@ -92,7 +94,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     ]
   end
 
-  @elementwise ~w(add subtract multiply remainder negate abs min max clip select
+  @elementwise ~w(add subtract multiply remainder quotient negate abs min max clip select
                   right_shift left_shift bitwise_and bitwise_or bitwise_xor
                   equal not_equal less less_equal greater greater_equal
                   logical_and logical_or logical_not)a
@@ -106,6 +108,9 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     greater_equal: ">="
   }
 
+  # data-dependent takes from computed values up to this size become a multiplexer
+  @max_mux 1024
+
   @binary %{add: "+", subtract: "-", bitwise_and: "&", bitwise_or: "|", bitwise_xor: "^"}
 
   @doc """
@@ -117,6 +122,11 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       (tensors, `NxFixed.Fixed`, integers); default all zeros.
     * `:param_names` - port names for the parameter arguments in order
       (default `param<i>` for argument `i`); ports are prefixed with `p_`.
+    * `:lanes` - variable rate: the kernel returns `{values, count}` with
+      `lanes` items on the first axis of every value; the first `count`
+      are valid and leave through the output buffer one per beat.
+    * `:fir` - `:chain` (default) maps FIR dot products onto DSP chains,
+      `:tree` keeps multipliers and an adder tree.
 
   Returns a `%Design{}`; raises `UnsupportedError`.
   """
@@ -174,6 +184,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
     %Design{
       name: name,
+      lanes: layout.lanes,
       source: source,
       latency: latency + 1,
       ii: scan.ii,
@@ -202,6 +213,8 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       assigns: [],
       ffs: [],
       sample_ffs: [],
+      combs: [],
+      raw_decls: [],
       blocks: [],
       elems: %{},
       roms: %{},
@@ -266,11 +279,14 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
     {inputs, in_bits} = fields(sample)
 
+    lanes = Keyword.get(opts, :lanes)
+    {value_ids, count_id} = output_ids(scan, lanes)
+
     outputs =
-      scan.outputs
-      |> flatten()
-      |> Enum.map(fn id ->
-        %{index: id, type: scan.graph.nodes[id].type, shape: scan.graph.nodes[id].shape}
+      Enum.map(value_ids, fn id ->
+        shape = scan.graph.nodes[id].shape
+        shape = if lanes, do: Tuple.delete_at(shape, 0), else: shape
+        %{index: id, type: scan.graph.nodes[id].type, shape: shape}
       end)
 
     {outputs, out_bits} = fields(outputs)
@@ -301,6 +317,8 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       |> Enum.map(fn {leaf, k} -> Map.merge(leaf, %{leaf: k, init: Enum.at(init, k)}) end)
 
     %{
+      lanes: lanes,
+      count_id: count_id,
       inputs: inputs,
       outputs: outputs,
       params: params,
@@ -311,6 +329,35 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       in_width: byte_align(in_bits),
       out_width: byte_align(out_bits)
     }
+  end
+
+  # Variable rate (`lanes: max`): the kernel output is `{values, count}`,
+  # every value leaf with `max` items on its first axis.
+  defp output_ids(scan, nil), do: {flatten(scan.outputs), nil}
+
+  defp output_ids(scan, lanes) do
+    case scan.outputs do
+      {values, count} when is_integer(count) ->
+        ids = flatten(values)
+
+        bad =
+          Enum.reject(ids, fn id ->
+            shape = scan.graph.nodes[id].shape
+            tuple_size(shape) >= 1 and elem(shape, 0) == lanes
+          end)
+
+        if bad != [] or scan.graph.nodes[count].shape != {},
+          do:
+            raise(
+              UnsupportedError,
+              "scan: lanes: #{lanes} needs the output {values, count} with #{lanes} items on the first axis of every value and a scalar count"
+            )
+
+        {ids, count}
+
+      _ ->
+        raise UnsupportedError, "scan: lanes: #{lanes} needs the kernel output {values, count}"
+    end
   end
 
   defp fields(leaves) do
@@ -553,12 +600,101 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   end
 
   defp lower_op(:take, node, c) do
-    [table_id, idx_id] = node.inputs
+    [table_id, _idx_id] = node.inputs
     table = Dataflow.constant_tensor(c.graph, table_id)
 
-    unless table && tuple_size(table.shape) == 1,
-      do: unsupported!(c.graph, node, "needs a constant 1-D table")
+    cond do
+      table && tuple_size(table.shape) == 1 ->
+        rom_take(node, c, table)
 
+      tuple_size(c.graph.nodes[table_id].shape) != 1 ->
+        unsupported!(c.graph, node, "needs a 1-D table")
+
+      plan = c.fir[{:take, node.id}] ->
+        memory_take(node, c, plan)
+
+      size(c.graph.nodes[table_id].shape) > @max_mux ->
+        unsupported!(
+          c.graph,
+          node,
+          "with a data-dependent index into #{size(c.graph.nodes[table_id].shape)} values " <>
+            "is only supported up to #{@max_mux} values (a multiplexer) or as a delay line read"
+        )
+
+      true ->
+        mux_take(node, c)
+    end
+  end
+
+  defp lower_op(:dot, node, c) do
+    {_contract_a, batch_a, _contract_b, _batch_b} = node.attrs
+
+    if batch_a != [], do: unsupported!(c.graph, node, "with batch axes is not supported")
+
+    stage = exec_stage(c, node.id)
+    {:reg, k, _} = c.sched[node.id].cost
+    fmt = IntSet.bit_width(node.range)
+    id = node.id
+
+    0..(size(node.shape) - 1)
+    |> map_c(c, fn e, c ->
+      case c.fir do
+        %{^id => %{elems: %{^e => groups}}} ->
+          fir_chains(c, elem_name(node, e), groups, stage, k, fmt)
+
+        _ ->
+          reduce_products(c, elem_name(node, e), Fir.dot_pairs(c, node, e), stage, k, fmt)
+      end
+    end)
+  end
+
+  defp lower_op(:sum, node, c) do
+    [x] = node.inputs
+    in_shape = c.graph.nodes[x].shape
+    rank = tuple_size(in_shape)
+
+    axes =
+      (node.attrs[:axes] || Enum.to_list(0..(rank - 1)//1)) |> Enum.map(&rem(&1 + rank, rank))
+
+    keep? = node.attrs[:keep_axes] || false
+    stage = exec_stage(c, node.id)
+    fmt = IntSet.bit_width(node.range)
+
+    # input elements of every output element
+    groups =
+      indices(in_shape)
+      |> Enum.with_index()
+      |> Enum.group_by(
+        fn {i, _} ->
+          out =
+            for {k, axis} <- Enum.with_index(i),
+                keep? or axis not in axes,
+                do: if(axis in axes, do: 0, else: k)
+
+          flat(out, node.shape)
+        end,
+        fn {_, flat_in} -> elem(c.elems[x], flat_in) end
+      )
+
+    0..(size(node.shape) - 1)
+    |> map_c(c, fn e, c ->
+      terms = groups |> Map.fetch!(e) |> Enum.map(&{&1, ref_range(c, &1)})
+      name = elem_name(node, e)
+
+      case c.sched[node.id].cost do
+        {:reg, k, _} ->
+          adder_tree(c, name, terms, stage, k, fmt)
+
+        _ ->
+          {c, expr} = sum_expr(c, Enum.map(terms, &elem(&1, 0)), stage, fmt)
+          s = if Enum.all?(terms, &static?(c, elem(&1, 0))), do: :static, else: stage
+          {c |> new_sig(name, fmt, s, false) |> assign(name, expr), {:sig, name}}
+      end
+    end)
+  end
+
+  defp rom_take(node, c, table) do
+    [_table_id, idx_id] = node.inputs
     values = Nx.to_flat_list(table)
     stage = exec_stage(c, node.id)
     fmt = IntSet.bit_width(node.range)
@@ -601,52 +737,206 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     end)
   end
 
-  defp lower_op(:dot, node, c) do
-    {_contract_a, batch_a, _contract_b, _batch_b} = node.attrs
-
-    if batch_a != [], do: unsupported!(c.graph, node, "with batch axes is not supported")
-
+  # A data-dependent take from computed values: a multiplexer.
+  defp mux_take(node, c) do
+    [table_id, idx_id] = node.inputs
+    table = Tuple.to_list(c.elems[table_id])
     stage = exec_stage(c, node.id)
-    {:reg, k, _} = c.sched[node.id].cost
     fmt = IntSet.bit_width(node.range)
-    id = node.id
+    w = bits(fmt)
+    aw = max(1, ceil_log2(length(table)))
 
-    0..(size(node.shape) - 1)
-    |> map_c(c, fn e, c ->
-      case c.fir do
-        %{^id => %{elems: %{^e => groups}}} ->
-          fir_chains(c, elem_name(node, e), groups, stage, k, fmt)
+    c.elems[idx_id]
+    |> Tuple.to_list()
+    |> Enum.with_index()
+    |> map_c(c, fn
+      {{:lit, v}, _e}, c ->
+        {c, Enum.at(table, v)}
+
+      {ref, e}, c ->
+        name = elem_name(node, e)
+        {c, idx} = raw(c, ref, stage)
+
+        {c, cases} =
+          table
+          |> Enum.with_index()
+          |> map_c(c, fn {t, i}, c ->
+            {c, x, _} = operand(c, t, stage)
+            {c, "      #{aw}'d#{i}: #{name}_m = #{w}'(#{x});\n"}
+          end)
+
+        c =
+          c
+          |> new_sig("#{name}_m", fmt, stage, false)
+          |> comb([
+            "  always_comb begin\n",
+            "    case (#{aw}'(#{idx}))\n",
+            cases,
+            "      default: #{name}_m = '0;\n",
+            "    endcase\n",
+            "  end\n"
+          ])
+
+        delayed_result(c, name, "#{name}_m", fmt, stage, c.sched[node.id].cost)
+    end)
+  end
+
+  defp delayed_result(c, name, sig, fmt, stage, cost) do
+    k =
+      case cost do
+        {:reg, k, _} -> k
+        _ -> 0
+      end
+
+    {c, x} = at(c, sig, stage + k)
+    c = c |> new_sig(name, fmt, stage + k, k > 0) |> assign(name, x)
+    {c, {:sig, name}}
+  end
+
+  # A data-dependent take from a delay line (`Fir`): the line's input is
+  # written to a memory once per sample, the take reads
+  # `base[n - (a + slope * idx)]` from it (asynchronously for small lines,
+  # through a read register for block RAM).
+  defp memory_take(node, c, plan) do
+    [_table_id, idx_id] = node.inputs
+    stage = exec_stage(c, node.id)
+    fmt = IntSet.bit_width(node.range)
+    w = bits(fmt)
+    depth = pow2(plan.depth)
+    aw = max(1, ceil_log2(depth))
+    dw = aw + 1
+
+    c.elems[idx_id]
+    |> Tuple.to_list()
+    |> Enum.with_index()
+    |> map_c(c, fn {ref, e}, c ->
+      name = elem_name(node, e)
+      mem = "#{name}_mem"
+      {c, x, xw} = operand(c, plan.x0, stage)
+      {c, idx} = raw(c, ref, stage)
+      op = if plan.slope > 0, do: "+", else: "-"
+
+      c =
+        c
+        |> new_sig("#{name}_wp", {:u, aw}, :mem, true)
+        |> new_sig("#{name}_fill", {:u, dw}, :mem, true)
+        |> new_sig("#{name}_x", {:s, xw}, stage, false)
+        |> assign("#{name}_x", x)
+        |> new_sig("#{name}_dl", {:u, dw}, stage, false)
+        |> assign("#{name}_dl", "#{dw}'(#{dw}'d#{plan.a} #{op} #{dw}'(#{idx}))")
+        |> new_sig("#{name}_ok", {:u, 1}, stage, false)
+        |> assign("#{name}_ok", "#{name}_fill >= #{name}_dl")
+        |> new_sig("#{name}_z", {:u, 1}, stage, false)
+        |> assign("#{name}_z", "#{name}_dl == '0")
+        |> raw_decl("  logic signed [#{xw - 1}:0] #{mem} [#{depth}];\n")
+        |> comb([
+          "  // #{name}: delay line memory, read #{plan.a} #{op} index samples back\n",
+          "  always_ff @(posedge clk) begin\n",
+          "    if (!rst_n) begin\n",
+          "      #{name}_wp <= '0;\n",
+          "      #{name}_fill <= '0;\n",
+          "    end else if (ce && #{valid(stage)}) begin\n",
+          "      #{mem}[#{name}_wp] <= #{name}_x;\n",
+          "      #{name}_wp <= #{name}_wp + #{aw}'d1;\n",
+          "      if (#{name}_fill != #{dw}'d#{depth}) #{name}_fill <= #{name}_fill + #{dw}'d1;\n",
+          "    end\n",
+          "  end\n"
+        ])
+
+      addr = "#{aw}'(#{name}_wp - #{aw}'(#{name}_dl))"
+
+      case c.sched[node.id].cost do
+        {:reg, k, _} ->
+          # registered read, then the multiplexer one stage later
+          q = "#{name}_q"
+
+          {c, [z, ok, xd]} =
+            map_c(["#{name}_z", "#{name}_ok", "#{name}_x"], c, fn s, c -> at(c, s, stage + 1) end)
+
+          c =
+            c
+            |> new_sig(q, {:s, xw}, stage + 1, true)
+            |> ff(q, "#{mem}[#{addr}]")
+            |> new_sig("#{name}_r", fmt, stage + 1, false)
+            |> assign("#{name}_r", "#{w}'(#{z} ? #{xd} : (#{ok} ? #{q} : '0))")
+
+          delayed_result(c, name, "#{name}_r", fmt, stage + 1, {:reg, k - 1, :bram})
 
         _ ->
-          reduce_products(c, elem_name(node, e), Fir.dot_pairs(c, node, e), stage, k, fmt)
+          c =
+            c
+            |> new_sig(name, fmt, stage, false)
+            |> assign(
+              name,
+              "#{w}'(#{name}_z ? #{name}_x : (#{name}_ok ? #{mem}[#{addr}] : '0))"
+            )
+
+          {c, {:sig, name}}
       end
     end)
   end
 
-  defp lower_op(:sum, node, c) do
-    [x] = node.inputs
+  # `x0` delayed by `d` samples (constant) in stage `stage`, from a memory
+  # written once per sample. The value for the next sample is read ahead,
+  # so a block RAM read costs no latency; samples before the first `d`
+  # read zero (the delay line starts at zero).
+  defp delay_memory(c, name, x0, stage, d) do
+    {c, x, xw} = operand(c, x0, stage)
+    q = "#{name}_q"
 
-    if size(node.shape) != 1,
-      do: unsupported!(c.graph, node, "over some axes is not supported (only full reductions)")
+    if d == 1 do
+      c =
+        c
+        |> new_sig(q, {:s, xw}, stage, true)
+        |> comb([
+          "  always_ff @(posedge clk) begin\n",
+          "    if (!rst_n) #{q} <= '0;\n",
+          "    else if (ce && #{valid(stage)}) #{q} <= #{x};\n",
+          "  end\n"
+        ])
 
-    stage = exec_stage(c, node.id)
-    fmt = IntSet.bit_width(node.range)
-    terms = c.elems[x] |> Tuple.to_list() |> Enum.map(&{&1, ref_range(c, &1)})
-    name = elem_name(node, 0)
+      {c, {:sig, q}}
+    else
+      depth = pow2(d)
+      aw = max(1, ceil_log2(depth))
+      dw = bit_len(d)
+      mem = "#{name}_mem"
 
-    {c, ref} =
-      case c.sched[node.id].cost do
-        {:reg, k, _} ->
-          adder_tree(c, name, terms, stage, k, fmt)
+      c =
+        c
+        |> new_sig("#{name}_wp", {:u, aw}, :mem, true)
+        |> new_sig("#{name}_fill", {:u, dw}, :mem, true)
+        |> new_sig(q, {:s, xw}, :mem, true)
+        |> raw_decl("  logic signed [#{xw - 1}:0] #{mem} [#{depth}];\n")
+        |> comb([
+          "  // #{name}: #{d} samples delay in a memory, read one sample ahead\n",
+          "  always_ff @(posedge clk) begin\n",
+          "    if (!rst_n) begin\n",
+          "      #{name}_wp <= '0;\n",
+          "      #{name}_fill <= '0;\n",
+          "      #{q} <= '0;\n",
+          "    end else if (ce && #{valid(stage)}) begin\n",
+          "      #{mem}[#{name}_wp] <= #{x};\n",
+          "      #{name}_wp <= #{name}_wp + #{aw}'d1;\n",
+          "      #{q} <= #{mem}[#{aw}'(#{name}_wp + #{aw}'d#{band(1 - d, depth - 1)})];\n",
+          "      if (#{name}_fill != #{dw}'d#{d}) #{name}_fill <= #{name}_fill + #{dw}'d1;\n",
+          "    end\n",
+          "  end\n"
+        ])
+        |> new_sig(name, {:s, xw}, stage, false)
+        |> assign(name, "(#{name}_fill == #{dw}'d#{d}) ? #{q} : '0")
 
-        _ ->
-          {c, expr} = sum_expr(c, Enum.map(terms, &elem(&1, 0)), stage, fmt)
-          s = if Enum.all?(terms, &static?(c, elem(&1, 0))), do: :static, else: stage
-          {c |> new_sig(name, fmt, s, false) |> assign(name, expr), {:sig, name}}
-      end
-
-    {c, [ref]}
+      {c, {:sig, name}}
+    end
   end
+
+  defp delay_out(c, f, n, plan, latency) do
+    {c, ref} = delay_memory(c, "#{n}_dly", plan.x0, latency, plan.d)
+    {c, {f, ref}}
+  end
+
+  defp comb(c, text), do: %{c | combs: [text | c.combs]}
+  defp raw_decl(c, text), do: %{c | raw_decls: [text | c.raw_decls]}
 
   defp input_elems(c, node, k), do: c.elems[Enum.at(node.inputs, k)] |> Tuple.to_list()
 
@@ -714,40 +1004,95 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
   # -- outputs --------------------------------------------------------------------------------
 
-  defp outputs(c, scan) do
-    refs =
-      for id <- flatten(scan.outputs),
-          ref <- Tuple.to_list(c.elems[id]),
-          do: {id, ref}
+  # Output data per lane (one lane at fixed rate) and the count of valid
+  # lanes (nil at fixed rate), all taken in the output stage.
+  defp outputs(c, _scan) do
+    l = c.layout
+    lanes = l.lanes || 1
+
+    lane_refs =
+      for j <- 0..(lanes - 1) do
+        for f <- l.outputs, e <- 0..(size(f.shape) - 1)//1 do
+          {f, elem(c.elems[f.index], j * size(f.shape) + e)}
+        end
+      end
+
+    count_ref = if l.count_id, do: elem(c.elems[l.count_id], 0)
+
+    # long delays of the input are read from a memory (`Fir`)
+    timing_ref = fn
+      {:sig, n} = ref ->
+        case c.fir do
+          %{{:out, ^n} => plan} -> plan.x0
+          _ -> ref
+        end
+
+      ref ->
+        ref
+    end
 
     latency =
-      refs
-      |> Enum.reject(fn {_, ref} -> static?(c, ref) end)
-      |> Enum.map(fn {_, {:sig, n}} ->
+      [count_ref | Enum.flat_map(lane_refs, fn refs -> Enum.map(refs, &elem(&1, 1)) end)]
+      |> Enum.reject(&(&1 == nil))
+      |> Enum.map(timing_ref)
+      |> Enum.reject(&static?(c, &1))
+      |> Enum.map(fn {:sig, n} ->
         s = c.sigs[n]
         if s.reg, do: s.stage, else: s.stage + 1
       end)
       |> Enum.max(fn -> 1 end)
       |> max(1)
 
-    {c, parts} =
-      map_c(refs, c, fn {id, ref}, c ->
-        tb = type_bits(c.graph.nodes[id].type)
+    {c, lane_refs} =
+      map_c(lane_refs, c, fn refs, c ->
+        map_c(refs, c, fn
+          {f, {:sig, n} = ref}, c ->
+            case c.fir do
+              %{{:out, ^n} => plan} ->
+                if Map.has_key?(c.sigs, "#{n}_dly"),
+                  do: {c, {f, {:sig, "#{n}_dly"}}},
+                  else: delay_out(c, f, n, plan, latency)
 
-        case ref do
-          {:lit, v} ->
-            {c, lit(v, tb)}
+              _ ->
+                {c, {f, ref}}
+            end
 
-          _ ->
-            {c, x, _} = operand(c, ref, latency)
-            {c, "#{tb}'(#{x})"}
-        end
+          other, c ->
+            {c, other}
+        end)
       end)
 
-    used = Enum.reduce(refs, 0, fn {id, _}, acc -> acc + type_bits(c.graph.nodes[id].type) end)
-    pad = c.layout.out_width - used
-    parts = if pad > 0, do: ["#{pad}'d0" | Enum.reverse(parts)], else: Enum.reverse(parts)
-    {c, latency, "{" <> Enum.join(parts, ", ") <> "}"}
+    {c, exprs} =
+      map_c(lane_refs, c, fn refs, c ->
+        {c, parts} =
+          map_c(refs, c, fn {f, ref}, c ->
+            case ref do
+              {:lit, v} ->
+                {c, lit(v, f.bits)}
+
+              _ ->
+                {c, x, _} = operand(c, ref, latency)
+                {c, "#{f.bits}'(#{x})"}
+            end
+          end)
+
+        used = Enum.reduce(l.outputs, 0, fn f, acc -> acc + f.bits * size(f.shape) end)
+        pad = l.out_width - used
+        parts = if pad > 0, do: ["#{pad}'d0" | Enum.reverse(parts)], else: Enum.reverse(parts)
+        {c, "{" <> Enum.join(parts, ", ") <> "}"}
+      end)
+
+    {c, count} =
+      case count_ref do
+        nil ->
+          {c, nil}
+
+        ref ->
+          {c, x} = raw(c, ref, latency)
+          {c, x}
+      end
+
+    {c, latency, {exprs, count}}
   end
 
   # -- arithmetic ----------------------------------------------------------------------------
@@ -790,6 +1135,20 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
         else
           {c, [a, b], _} = operands(c, refs, stage, rsw)
           {c, "#{w}'(#{a} % #{b})"}
+        end
+
+      :quotient ->
+        # truncating division in both; a power of two divisor of a
+        # non-negative dividend is a shift
+        [x, y] = refs
+
+        if power_of_two?(y) and IntSet.bounds(ref_range(c, x)) |> elem(0) >= 0 do
+          {:lit, v} = y
+          {c, [a], _} = operands(c, [x], stage, rsw)
+          {c, "#{w}'(#{a} >>> #{ceil_log2(v)})"}
+        else
+          {c, [a, b], _} = operands(c, refs, stage, rsw)
+          {c, "#{w}'(#{a} / #{b})"}
         end
 
       :negate ->
@@ -985,6 +1344,37 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   # One transposed chain: `P_k <= m_k * h_k + P_k+1`, P registers advancing
   # once per sample (enabled with the sample leaving the multiply stage).
   # Returns `{c, {P_0 ref, range}}`.
+  # Equal taps: `acc[n] = acc[n - 1] + h * (x[n] - x[n - L])`, exact, with
+  # x[n - L] from a delay memory.
+  defp fir_chain(c, name, %{fold: :sum} = g, stage) do
+    h = hd(g.taps)
+    len = length(g.taps)
+    x_range = ref_range(c, g.x0)
+    {c, xd} = delay_memory(c, "#{name}_dl", g.x0, stage, len)
+    {c, [x, y], _} = operands(c, [g.x0, xd], stage, 1)
+    diff_range = IntSet.subtract(x_range, x_range)
+    dw = signed_bits(IntSet.bit_width(diff_range))
+    diff = "#{name}_df"
+
+    range =
+      IntSet.multiply(
+        x_range |> IntSet.bounds() |> then(fn {lo, hi} -> IntSet.range(lo, hi) end),
+        IntSet.singleton(h * len)
+      )
+
+    w = signed_bits(IntSet.bit_width(range))
+    acc = "#{name}_acc"
+
+    c =
+      c
+      |> new_sig(diff, {:s, dw}, stage + 1, true)
+      |> ff(diff, "#{dw}'(#{dw}'(#{x}) - #{dw}'(#{y}))")
+      |> new_sig(acc, {:s, w}, stage + 2, true)
+      |> sample_ff(stage + 1, acc, "#{w}'(#{acc}) + #{w}'(#{diff} * #{lit(h, lit_bits(h))})")
+
+    {c, {{:sig, acc}, range}}
+  end
+
   defp fir_chain(c, name, g, stage) do
     lg = Fir.chain_latency(g)
     p_stage = stage + lg
@@ -1397,8 +1787,10 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       state_decls,
       "  // datapath\n",
       decls,
+      Enum.reverse(c.raw_decls),
       Enum.reverse(c.assigns),
       ffs,
+      Enum.reverse(c.combs),
       "\n",
       state_logic,
       sample_logic,
@@ -1409,36 +1801,54 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     ])
   end
 
-  # Two-entry output buffer: the pipeline pushes its result with the clock
-  # enable, the stream pops; the pipeline runs while the buffer has room.
-  defp out_buffer(data, width, valid) do
+  # Output buffer: the pipeline pushes its result (up to `lanes` items, the
+  # valid ones first) with the clock enable, the stream pops one item per
+  # beat; the pipeline runs while the buffer has room for a full push.
+  defp out_buffer({lanes, count}, width, valid) do
+    n = length(lanes)
+    depth = pow2(max(2, 2 * n))
+    aw = ceil_log2(depth)
+    cw = bit_len(n)
+
+    writes =
+      lanes
+      |> Enum.with_index()
+      |> Enum.map(fn {x, j} ->
+        guard = if count, do: "if (ob_n > #{cw}'d#{j}) ", else: ""
+        "        #{guard}ob_mem[#{aw}'(ob_wp + #{aw}'d#{j})] <= #{x};\n"
+      end)
+
     [
-      "  // output buffer\n",
-      "  logic [#{width - 1}:0] ob_mem [2];\n",
-      "  logic ob_wp, ob_rp;\n",
-      "  logic [1:0] ob_count;\n",
+      "  // output buffer#{if count, do: " (#{n} lanes, count of valid ones)", else: ""}\n",
+      "  logic [#{width - 1}:0] ob_mem [#{depth}];\n",
+      "  logic [#{aw - 1}:0] ob_wp, ob_rp;\n",
+      "  logic [#{aw}:0] ob_count;\n",
+      "  logic [#{cw - 1}:0] ob_n;\n",
       "  logic ob_push, ob_pop;\n",
-      "  assign ob_room = ob_count != 2'd2;\n",
+      "  assign ob_room = ob_count <= #{aw + 1}'d#{depth - n};\n",
       "  assign ob_push = ce && #{valid};\n",
       "  assign ob_pop = m_axis_tvalid && m_axis_tready;\n",
+      "  assign ob_n = #{if count, do: "#{cw}'(#{count})", else: "#{cw}'d1"};\n",
       "  always_ff @(posedge clk) begin\n",
       "    if (!rst_n) begin\n",
-      "      ob_wp <= 1'b0;\n",
-      "      ob_rp <= 1'b0;\n",
-      "      ob_count <= 2'd0;\n",
+      "      ob_wp <= '0;\n",
+      "      ob_rp <= '0;\n",
+      "      ob_count <= '0;\n",
       "    end else begin\n",
       "      if (ob_push) begin\n",
-      "        ob_mem[ob_wp] <= #{data};\n",
-      "        ob_wp <= !ob_wp;\n",
+      writes,
+      "        ob_wp <= ob_wp + #{aw}'(ob_n);\n",
       "      end\n",
-      "      if (ob_pop) ob_rp <= !ob_rp;\n",
-      "      ob_count <= ob_count + 2'(ob_push) - 2'(ob_pop);\n",
+      "      if (ob_pop) ob_rp <= ob_rp + #{aw}'d1;\n",
+      "      ob_count <= ob_count + (ob_push ? #{aw + 1}'(ob_n) : #{aw + 1}'d0) - #{aw + 1}'(ob_pop);\n",
       "    end\n",
       "  end\n",
-      "  assign m_axis_tvalid = ob_count != 2'd0;\n",
+      "  assign m_axis_tvalid = ob_count != '0;\n",
       "  assign m_axis_tdata = ob_mem[ob_rp];\n"
     ]
   end
+
+  defp pow2(n), do: 1 <<< ceil_log2(n)
 
   # Parameter ports are captured on `p_load` and applied once the samples
   # accepted until then have left the pipeline; no sample is accepted in

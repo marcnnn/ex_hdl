@@ -15,6 +15,8 @@ defmodule ExHdl.Block do
     * `:bit`, `:byte`, `:symbol` - an unsigned 8-bit integer
     * `:none` - sources: an unused `u8` sample that paces the output
 
+  Variable-rate blocks (`rate: {:variable, max}`) generate with `max`
+  output lanes and a count (see `ExHdl.Backends.SystemVerilog.Scan`).
   Blocks without state (`init: nil`) get a `u8` zero as state, as in
   `NxFixed.Block.run/4`. Parameter ports are named `param0`, `param1`, ...
   unless `:param_names` is given. Float formats are rejected: hardware
@@ -71,6 +73,12 @@ defmodule ExHdl.Block do
       opts
       |> Keyword.put_new(:name, Atom.to_string(block.name))
       |> Keyword.put_new(:init, init(block))
+
+    opts =
+      case block.rate do
+        {:variable, max} -> Keyword.put_new(opts, :lanes, max)
+        _ -> opts
+      end
 
     ExHdl.DSP.scan_to_sv(block.fun, args(block), [state: 1] ++ opts)
   end

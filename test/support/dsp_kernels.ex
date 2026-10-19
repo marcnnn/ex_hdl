@@ -114,11 +114,20 @@ defmodule ExHdl.Test.DSP do
     {{total, diff, flag, mixed, grid, next}, next}
   end
 
-  # Integer division has no hardware mapping yet.
-  defn quotient_step(x, acc) do
-    q = Nx.quotient(Nx.as_type(x, :s32), 3)
-    next = saturate(Nx.as_type(acc, :s32) + q, :s16)
+  # A data-dependent take of rows from a computed matrix has no hardware mapping.
+  defn row_take_step(x, acc) do
+    m = Nx.stack([acc, x, x, acc]) |> Nx.as_type(:s32) |> Nx.reshape({2, 2})
+    row = Nx.take(m, Nx.bitwise_and(x, 1))
+    next = saturate(Nx.as_type(acc, :s32) + Nx.sum(row), :s16)
     {next, next}
+  end
+
+  # Sums over single axes, with and without keep_axes.
+  defn axis_sum_step(x, acc) do
+    m = Nx.stack([x, acc, x - acc, acc, x, x]) |> Nx.as_type(:s32) |> Nx.reshape({2, 3})
+    rows = Nx.sum(m, axes: [1])
+    cols = Nx.sum(m, axes: [0], keep_axes: true)
+    {{rows, cols}, saturate(Nx.as_type(acc, :s32) + rows[0] - cols[0][2], :s16)}
   end
 
   # Phase update exactly as written in the plan: relies on as_type to wrap.
