@@ -114,29 +114,28 @@ std::tuple<fine::Term, fine::Term, int64_t> ddc_q15_scalar(ErlNifEnv* env, ErlNi
 }
 FINE_NIF(ddc_q15_scalar, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
-// rx: one byte per received code bit position of the mother code, pairs
-// (x, y), values 0/1 or 2 for an erasure. Returns one byte (0/1) per pair.
-fine::Term viterbi_dvbt(ErlNifEnv* env, ErlNifBinary rx, bool start_unknown) {
-  if (rx.size % 2 != 0) throw std::invalid_argument("viterbi_dvbt: rx must hold (x, y) pairs");
+// rx: n bytes per step of the mother code (one per generator), values 0/1
+// or 2 for an erasure. Returns one byte (0/1) per step.
+fine::Term viterbi(ErlNifEnv* env, ErlNifBinary rx, int64_t k, std::vector<int64_t> polys, bool start_unknown, bool simd) {
+  if (k < 2 || k > 9 || polys.size() < 2 || polys.size() > 4)
+    throw std::invalid_argument("viterbi: needs constraint length 2..9 and 2..4 polynomials");
+  exhdl::ConvCode code{static_cast<unsigned>(k), static_cast<unsigned>(polys.size()), {0, 0, 0, 0}};
+  for (size_t j = 0; j < polys.size(); ++j) {
+    if (polys[j] <= 0 || polys[j] >= (int64_t{1} << k)) throw std::invalid_argument("viterbi: polynomial out of range");
+    code.polys[j] = static_cast<unsigned>(polys[j]);
+  }
+  if (rx.size % code.n != 0) throw std::invalid_argument("viterbi: rx must hold whole steps");
   for (size_t i = 0; i < rx.size; ++i)
-    if (rx.data[i] > 2) throw std::invalid_argument("viterbi_dvbt: values must be 0, 1 or 2");
-  const size_t n = rx.size / 2;
+    if (rx.data[i] > 2) throw std::invalid_argument("viterbi: values must be 0, 1 or 2");
+  const size_t n = rx.size / code.n;
   auto [out_term, out] = new_binary<uint8_t>(env, n);
-  exhdl::ViterbiDvbt(rx.data, n, start_unknown, out);
+  if (simd)
+    exhdl::ViterbiSimd(code, rx.data, n, start_unknown, out);
+  else
+    exhdl::Viterbi(code, rx.data, n, start_unknown, out);
   return out_term;
 }
-FINE_NIF(viterbi_dvbt, ERL_NIF_DIRTY_JOB_CPU_BOUND);
-
-fine::Term viterbi_dvbt_simd(ErlNifEnv* env, ErlNifBinary rx, bool start_unknown) {
-  if (rx.size % 2 != 0) throw std::invalid_argument("viterbi_dvbt_simd: rx must hold (x, y) pairs");
-  for (size_t i = 0; i < rx.size; ++i)
-    if (rx.data[i] > 2) throw std::invalid_argument("viterbi_dvbt_simd: values must be 0, 1 or 2");
-  const size_t n = rx.size / 2;
-  auto [out_term, out] = new_binary<uint8_t>(env, n);
-  exhdl::ViterbiDvbtSimd(rx.data, n, start_unknown, out);
-  return out_term;
-}
-FINE_NIF(viterbi_dvbt_simd, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+FINE_NIF(viterbi, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 fine::Term conv_interleave(ErlNifEnv* env, ErlNifBinary in, int64_t branches, int64_t depth, bool inverse) {
   if (branches < 1 || depth < 0) throw std::invalid_argument("conv_interleave: needs branches >= 1, depth >= 0");

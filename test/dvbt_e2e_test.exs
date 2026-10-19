@@ -97,8 +97,8 @@ defmodule ExHdl.DVBT.EndToEndTest do
       rx = noisy |> :binary.list_to_bin() |> Convolutional.depunctured_binary(rate)
       unknown = start == :unknown
 
-      simd = ExHdl.SIMD.NIF.viterbi_dvbt_simd(rx, unknown)
-      assert simd == ExHdl.SIMD.NIF.viterbi_dvbt(rx, unknown)
+      simd = ExHdl.SIMD.NIF.viterbi(rx, 7, [0o171, 0o133], unknown, true)
+      assert simd == ExHdl.SIMD.NIF.viterbi(rx, 7, [0o171, 0o133], unknown, false)
 
       assert :binary.bin_to_list(simd) ==
                Convolutional.decode_reference(noisy, rate, start: start)

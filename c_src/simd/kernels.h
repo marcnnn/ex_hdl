@@ -43,17 +43,26 @@ uint16_t DdcQ15Scalar(const int16_t* in_i, const int16_t* in_q, size_t n, int16_
 void FirQ15Scalar(const int16_t* ext, size_t n, const int32_t* taps, size_t n_taps, bool round,
                   int16_t* out);
 
-// Hard-decision Viterbi decoder for the DVB-T inner code (K = 7, G1 = 171,
-// G2 = 133 octal), bit-identical to ExHdl.DVBT.Convolutional's reference:
-// `rx` holds n (x, y) pairs as bytes 0/1, or 2 for an erasure (punctured);
-// ties keep the predecessor with the smaller state, the traceback starts at
-// the best final state (smallest on ties). `start_unknown` gives all states
-// metric 0, otherwise state 0 starts at 0 and the others at 1000000.
-void ViterbiDvbt(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits);
+// Rate 1/n convolutional code (ExHdl.Comm.Convolutional): constraint
+// length k (2..9), n generator polynomials (2..4), the current input as the
+// most significant register bit.
+struct ConvCode {
+  unsigned k, n;
+  unsigned polys[4];
+};
 
-// Same decoder with the add-compare-select step vectorised (Highway):
-// bit-identical results.
-void ViterbiDvbtSimd(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits);
+// Hard-decision Viterbi decoder, bit-identical to the Elixir reference:
+// `rx` holds n_steps groups of n bytes, 0/1 or 2 for an erasure; ties keep
+// the predecessor with the smaller state, the traceback starts at the best
+// final state (smallest on ties). `start_unknown` gives all states metric 0,
+// otherwise state 0 starts at 0 and the others far above. One output byte
+// (0/1) per step.
+void Viterbi(const ConvCode& code, const uint8_t* rx, size_t n_steps, bool start_unknown, uint8_t* bits);
+
+// Same decoder with the add-compare-select step vectorised (Highway),
+// bit-identical; falls back to Viterbi when 2^(k-2) is not a multiple of
+// the vector length.
+void ViterbiSimd(const ConvCode& code, const uint8_t* rx, size_t n_steps, bool start_unknown, uint8_t* bits);
 
 // Byte-level channel coding blocks of ExHdl.Comm, bit-identical to the
 // Elixir references:

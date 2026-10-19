@@ -108,61 +108,103 @@ void FirQ15Impl(const int16_t* HWY_RESTRICT ext, size_t n, const int32_t* HWY_RE
 // first 6 steps (at most 12), so 1000 gives the same decisions as the
 // reference's 1000000. `expected` holds, per state, the expected x and y bit
 // for predecessor lsb 0 and 1: [x0 | y0 | x1 | y1], 64 entries each.
-void ViterbiDvbtSimdImpl(const uint8_t* HWY_RESTRICT rx, size_t n, bool start_unknown, uint64_t* HWY_RESTRICT decisions,
-                         const uint16_t* HWY_RESTRICT expected, unsigned* final_state) {
+// Add-compare-select over all steps for a rate 1/n code with S states
+// (S / 2 a multiple of the lane count). expected[(c * n + j) * S + s] is
+// output j on the branch from predecessor choice c into state s. States s
+// and s + S/2 share the predecessors 2s and 2s + 1 (butterfly), so one
+// interleaved load gives both. Metrics are uint16, renormalised every 256
+// steps (spread stays below 1000 + 256 * n).
+// kS: the state count fixed at compile time (0: S at run time).
+template <unsigned n_out, unsigned kS>
+void ViterbiAcs(const uint8_t* HWY_RESTRICT rx, size_t n_steps, unsigned S_rt, bool start_unknown,
+                uint64_t* HWY_RESTRICT decisions, const uint16_t* HWY_RESTRICT expected, unsigned* final_state) {
+  const unsigned S = kS ? kS : S_rt;
   const hn::ScalableTag<uint16_t> d;
   const size_t lanes = hn::Lanes(d);
-  const uint16_t* x0 = expected;
-  const uint16_t* y0 = expected + 64;
-  const uint16_t* x1 = expected + 128;
-  const uint16_t* y1 = expected + 192;
+  const size_t half = S / 2, words = (S + 63) / 64;
   const uint64_t lane_mask = lanes >= 64 ? ~0ull : (1ull << lanes) - 1;
+  const uint16_t* e0 = expected;
+  const uint16_t* e1 = expected + n_out * S;
 
-  HWY_ALIGN uint16_t metric[64];
-  HWY_ALIGN uint16_t next[64];
-  for (int s = 0; s < 64; ++s) metric[s] = start_unknown || s == 0 ? 0 : 1000;
+  std::vector<uint16_t> metric_v(S), next_v(S);
+  uint16_t* metric = metric_v.data();
+  uint16_t* next = next_v.data();
+  for (unsigned s = 0; s < S; ++s) metric[s] = start_unknown || s == 0 ? 0 : 1000;
 
-  for (size_t i = 0; i < n; ++i) {
-    const uint16_t rx_x = rx[2 * i], rx_y = rx[2 * i + 1];
-    // distance per lane: (rx xor expected), zero for an erasure (2)
-    const auto vx = hn::Set(d, static_cast<uint16_t>(rx_x & 1)), vy = hn::Set(d, static_cast<uint16_t>(rx_y & 1));
-    const auto ex = hn::Set(d, static_cast<uint16_t>(rx_x != 2)), ey = hn::Set(d, static_cast<uint16_t>(rx_y != 2));
-    uint64_t decision = 0;
+  for (size_t i = 0; i < n_steps; ++i) {
+    const uint8_t* r = rx + n_out * i;
+    // per output: received bit, and 1 unless erased (2)
+    uint16_t bit[4] = {0, 0, 0, 0}, use[4] = {0, 0, 0, 0};
+    for (unsigned j = 0; j < n_out; ++j) {
+      bit[j] = r[j] & 1;
+      use[j] = r[j] != 2;
+    }
+    const auto b0 = hn::Set(d, bit[0]), b1 = hn::Set(d, bit[1]), b2 = hn::Set(d, bit[2]), b3 = hn::Set(d, bit[3]);
+    const auto u0 = hn::Set(d, use[0]), u1 = hn::Set(d, use[1]), u2 = hn::Set(d, use[2]), u3 = hn::Set(d, use[3]);
+    uint64_t acc[4] = {0, 0, 0, 0};
 
-    for (size_t j = 0; j < 32; j += lanes) {
+    for (size_t j = 0; j < half; j += lanes) {
       hn::Vec<decltype(d)> even, odd;
       hn::LoadInterleaved2(d, metric + 2 * j, even, odd);
 
-      for (size_t s = j; s < 64; s += 32) {
-        const auto d0 = hn::Add(hn::Mul(hn::Xor(vx, hn::LoadU(d, x0 + s)), ex), hn::Mul(hn::Xor(vy, hn::LoadU(d, y0 + s)), ey));
-        const auto d1 = hn::Add(hn::Mul(hn::Xor(vx, hn::LoadU(d, x1 + s)), ex), hn::Mul(hn::Xor(vy, hn::LoadU(d, y1 + s)), ey));
+      // butterfly: next states j (input 0) and j + S/2 (input 1)
+      for (size_t s = j, h = 0; h < 2; ++h, s += half) {
+        auto d0 = hn::Add(hn::And(hn::Xor(b0, hn::LoadU(d, e0 + s)), u0), hn::And(hn::Xor(b1, hn::LoadU(d, e0 + S + s)), u1));
+        auto d1 = hn::Add(hn::And(hn::Xor(b0, hn::LoadU(d, e1 + s)), u0), hn::And(hn::Xor(b1, hn::LoadU(d, e1 + S + s)), u1));
+        if constexpr (n_out > 2) {
+          d0 = hn::Add(d0, hn::And(hn::Xor(b2, hn::LoadU(d, e0 + 2 * S + s)), u2));
+          d1 = hn::Add(d1, hn::And(hn::Xor(b2, hn::LoadU(d, e1 + 2 * S + s)), u2));
+        }
+        if constexpr (n_out > 3) {
+          d0 = hn::Add(d0, hn::And(hn::Xor(b3, hn::LoadU(d, e0 + 3 * S + s)), u3));
+          d1 = hn::Add(d1, hn::And(hn::Xor(b3, hn::LoadU(d, e1 + 3 * S + s)), u3));
+        }
         const auto c0 = hn::Add(even, d0);
         const auto c1 = hn::Add(odd, d1);
         hn::StoreU(hn::Min(c0, c1), d, next + s);
 
         uint8_t packed[8] = {0};
         hn::StoreMaskBits(d, hn::Lt(c1, c0), packed);
-        uint64_t m = 0;
-        for (size_t k = 0; k < (lanes + 7) / 8; ++k) m |= static_cast<uint64_t>(packed[k]) << (8 * k);
-        decision |= (m & lane_mask) << s;
+        uint64_t m;
+        if (lanes <= 8) {
+          m = packed[0];
+        } else {
+          m = 0;
+          for (size_t k = 0; k < (lanes + 7) / 8; ++k) m |= static_cast<uint64_t>(packed[k]) << (8 * k);
+        }
+        acc[s / 64] |= (m & lane_mask) << (s % 64);
       }
     }
+    for (size_t w = 0; w < words; ++w) decisions[words * i + w] = acc[w];
 
-    decisions[i] = decision;
-    for (int s = 0; s < 64; ++s) metric[s] = next[s];
+    std::swap(metric, next);
 
     if ((i & 255) == 255) {
       uint16_t lo = metric[0];
-      for (int s = 1; s < 64; ++s) lo = metric[s] < lo ? metric[s] : lo;
-      for (int s = 0; s < 64; ++s) metric[s] = static_cast<uint16_t>(metric[s] - lo);
+      for (unsigned s = 1; s < S; ++s) lo = metric[s] < lo ? metric[s] : lo;
+      for (unsigned s = 0; s < S; ++s) metric[s] = static_cast<uint16_t>(metric[s] - lo);
     }
   }
 
   unsigned best = 0;
-  for (unsigned s = 1; s < 64; ++s)
+  for (unsigned s = 1; s < S; ++s)
     if (metric[s] < metric[best]) best = s;
   *final_state = best;
 }
+
+void ViterbiSimdImpl(const uint8_t* HWY_RESTRICT rx, size_t n_steps, unsigned n_out, unsigned S, bool start_unknown,
+                     uint64_t* HWY_RESTRICT decisions, const uint16_t* HWY_RESTRICT expected, unsigned* final_state) {
+  // K = 7 (64 states) is the common case: DVB, 802.11, CCSDS, ...
+  if (S == 64 && n_out == 2) return ViterbiAcs<2, 64>(rx, n_steps, S, start_unknown, decisions, expected, final_state);
+  if (S == 64 && n_out == 3) return ViterbiAcs<3, 64>(rx, n_steps, S, start_unknown, decisions, expected, final_state);
+  switch (n_out) {
+    case 2: return ViterbiAcs<2, 0>(rx, n_steps, S, start_unknown, decisions, expected, final_state);
+    case 3: return ViterbiAcs<3, 0>(rx, n_steps, S, start_unknown, decisions, expected, final_state);
+    default: return ViterbiAcs<4, 0>(rx, n_steps, S, start_unknown, decisions, expected, final_state);
+  }
+}
+
+size_t Uint16LanesImpl() { return hn::Lanes(hn::ScalableTag<uint16_t>()); }
 
 const char* SimdTargetImpl() { return hwy::TargetName(HWY_TARGET); }
 
@@ -176,7 +218,8 @@ namespace exhdl {
 HWY_EXPORT(DdcQ15Impl);
 HWY_EXPORT(FirQ15Impl);
 HWY_EXPORT(SimdTargetImpl);
-HWY_EXPORT(ViterbiDvbtSimdImpl);
+HWY_EXPORT(ViterbiSimdImpl);
+HWY_EXPORT(Uint16LanesImpl);
 
 uint16_t DdcQ15(const int16_t* in_i, const int16_t* in_q, size_t n, int16_t* out_i,
                 int16_t* out_q, const DdcParams& p) {
@@ -243,91 +286,94 @@ int16_t OnePoleQ15(const int16_t* x, size_t n, int16_t y0, int16_t alpha, bool r
   return static_cast<int16_t>(y);
 }
 
-// -- DVB-T Viterbi ----------------------------------------------------------
+// -- Viterbi decoding of rate 1/n convolutional codes ------------------------
 
 namespace {
-struct Trellis {
-  // for next state s and predecessor choice c (0: lsb 0, 1: lsb 1)
-  uint8_t prev[64][2];
-  uint8_t x[64][2];
-  uint8_t y[64][2];
+inline unsigned parity(unsigned v) { return static_cast<unsigned>(__builtin_popcount(v) & 1); }
 
-  Trellis() {
-    auto parity = [](unsigned v) { return static_cast<uint8_t>(__builtin_popcount(v) & 1); };
-    for (unsigned s = 0; s < 64; ++s) {
-      const unsigned b = s >> 5;
-      for (unsigned c = 0; c < 2; ++c) {
-        const unsigned p = ((s << 1) & 63) | c;
-        const unsigned reg = (b << 6) | p;
-        prev[s][c] = static_cast<uint8_t>(p);
-        x[s][c] = parity(reg & 0171);
-        y[s][c] = parity(reg & 0133);
-      }
-    }
+// Predecessor of next state s for choice c (its lowest bit), and the K-bit
+// encoder register on that branch.
+inline unsigned predecessor(unsigned s, unsigned c, unsigned S) { return ((s << 1) & (S - 1)) | c; }
+inline unsigned branch_reg(const ConvCode& code, unsigned s, unsigned c, unsigned S) {
+  return ((s >> (code.k - 2)) << (code.k - 1)) | predecessor(s, c, S);
+}
+
+void traceback(const ConvCode& code, const uint64_t* decisions, size_t n, unsigned best, uint8_t* bits) {
+  const unsigned S = 1u << (code.k - 1);
+  const size_t words = (S + 63) / 64;
+  unsigned s = best;
+  for (size_t i = n; i-- > 0;) {
+    const unsigned c = (decisions[words * i + s / 64] >> (s % 64)) & 1;
+    bits[i] = static_cast<uint8_t>(s >> (code.k - 2));
+    s = predecessor(s, c, S);
   }
-};
-const Trellis kTrellis;
-
-inline uint32_t dist(uint8_t r, uint8_t e) { return r == 2 ? 0 : (r != e); }
+}
 }  // namespace
 
-void ViterbiDvbt(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits) {
-  uint32_t metric[64], next[64];
-  for (int s = 0; s < 64; ++s) metric[s] = start_unknown || s == 0 ? 0 : 1000000;
-  std::vector<uint64_t> decisions(n);
+void Viterbi(const ConvCode& code, const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits) {
+  const unsigned S = 1u << (code.k - 1), n_out = code.n;
+  const size_t words = (S + 63) / 64;
+  // expected output pattern (bit j = output j) per state and choice
+  std::vector<uint8_t> pattern(2 * S);
+  for (unsigned s = 0; s < S; ++s)
+    for (unsigned c = 0; c < 2; ++c) {
+      unsigned p = 0;
+      for (unsigned j = 0; j < n_out; ++j) p |= parity(branch_reg(code, s, c, S) & code.polys[j]) << j;
+      pattern[2 * s + c] = static_cast<uint8_t>(p);
+    }
+
+  std::vector<uint32_t> metric(S), next(S), bm(1u << n_out);
+  for (unsigned s = 0; s < S; ++s) metric[s] = start_unknown || s == 0 ? 0 : 1000000;
+  std::vector<uint64_t> decisions(n * words, 0);
 
   for (size_t i = 0; i < n; ++i) {
-    const uint8_t rx_x = rx[2 * i], rx_y = rx[2 * i + 1];
-    // branch metric of each expected output pair (x, y)
-    const uint32_t bm[2][2] = {{dist(rx_x, 0) + dist(rx_y, 0), dist(rx_x, 0) + dist(rx_y, 1)},
-                               {dist(rx_x, 1) + dist(rx_y, 0), dist(rx_x, 1) + dist(rx_y, 1)}};
-    uint64_t mask = 0;
-    for (unsigned s = 0; s < 64; ++s) {
-      const uint32_t c0 = metric[kTrellis.prev[s][0]] + bm[kTrellis.x[s][0]][kTrellis.y[s][0]];
-      const uint32_t c1 = metric[kTrellis.prev[s][1]] + bm[kTrellis.x[s][1]][kTrellis.y[s][1]];
+    const uint8_t* r = rx + n_out * i;
+    for (unsigned p = 0; p < (1u << n_out); ++p) {
+      uint32_t m = 0;
+      for (unsigned j = 0; j < n_out; ++j) m += r[j] != 2 && r[j] != ((p >> j) & 1);
+      bm[p] = m;
+    }
+    uint64_t* dec = decisions.data() + words * i;
+    for (unsigned s = 0; s < S; ++s) {
+      const uint32_t c0 = metric[predecessor(s, 0, S)] + bm[pattern[2 * s]];
+      const uint32_t c1 = metric[predecessor(s, 1, S)] + bm[pattern[2 * s + 1]];
       const bool take1 = c1 < c0;
       next[s] = take1 ? c1 : c0;
-      mask |= static_cast<uint64_t>(take1) << s;
+      dec[s / 64] |= static_cast<uint64_t>(take1) << (s % 64);
     }
-    decisions[i] = mask;
     // Renormalise (subtracting the minimum keeps every comparison) so the
     // metrics stay small for arbitrarily long blocks.
     uint32_t lo = next[0];
-    for (int s = 1; s < 64; ++s) lo = next[s] < lo ? next[s] : lo;
-    for (int s = 0; s < 64; ++s) metric[s] = next[s] - lo;
+    for (unsigned s = 1; s < S; ++s) lo = next[s] < lo ? next[s] : lo;
+    for (unsigned s = 0; s < S; ++s) metric[s] = next[s] - lo;
   }
 
   unsigned best = 0;
-  for (unsigned s = 1; s < 64; ++s)
+  for (unsigned s = 1; s < S; ++s)
     if (metric[s] < metric[best]) best = s;
-
-  unsigned s = best;
-  for (size_t i = n; i-- > 0;) {
-    const unsigned lsb = (decisions[i] >> s) & 1;
-    bits[i] = static_cast<uint8_t>(s >> 5);
-    s = ((s << 1) & 63) | lsb;
-  }
+  traceback(code, decisions.data(), n, best, bits);
 }
 
-void ViterbiDvbtSimd(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits) {
+bool ViterbiSimdSupported(const ConvCode& code) {
+  const size_t half = size_t{1} << (code.k - 2);
+  const size_t lanes = HWY_DYNAMIC_DISPATCH(Uint16LanesImpl)();
+  return code.n <= 4 && lanes <= 64 && half % lanes == 0;
+}
+
+void ViterbiSimd(const ConvCode& code, const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits) {
   if (n == 0) return;
-  // expected (x, y) per next state and predecessor choice, as in Trellis
-  alignas(64) uint16_t expected[256];
-  for (unsigned s = 0; s < 64; ++s)
-    for (unsigned c = 0; c < 2; ++c) {
-      expected[128 * c + s] = kTrellis.x[s][c];
-      expected[128 * c + 64 + s] = kTrellis.y[s][c];
-    }
+  if (!ViterbiSimdSupported(code)) return Viterbi(code, rx, n, start_unknown, bits);
+  const unsigned S = 1u << (code.k - 1), n_out = code.n;
+  std::vector<uint16_t> expected(2 * n_out * S);
+  for (unsigned s = 0; s < S; ++s)
+    for (unsigned c = 0; c < 2; ++c)
+      for (unsigned j = 0; j < n_out; ++j)
+        expected[(c * n_out + j) * S + s] = static_cast<uint16_t>(parity(branch_reg(code, s, c, S) & code.polys[j]));
 
-  std::vector<uint64_t> decisions(n);
-  unsigned s = 0;
-  HWY_DYNAMIC_DISPATCH(ViterbiDvbtSimdImpl)(rx, n, start_unknown, decisions.data(), expected, &s);
-
-  for (size_t i = n; i-- > 0;) {
-    const unsigned lsb = (decisions[i] >> s) & 1;
-    bits[i] = static_cast<uint8_t>(s >> 5);
-    s = ((s << 1) & 63) | lsb;
-  }
+  std::vector<uint64_t> decisions(n * ((S + 63) / 64));
+  unsigned best = 0;
+  HWY_DYNAMIC_DISPATCH(ViterbiSimdImpl)(rx, n, n_out, S, start_unknown, decisions.data(), expected.data(), &best);
+  traceback(code, decisions.data(), n, best, bits);
 }
 
 // -- byte-level channel coding (ExHdl.Comm) ---------------------------------
