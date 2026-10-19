@@ -80,6 +80,47 @@ defmodule ExHdl.Test.DSP do
     {next, next}
   end
 
+  # The elementwise, reduction and view ops the SDR blocks do not use, with
+  # a small saturating state update. `k` is a u8 shift amount.
+  defn misc_ops_step(x, acc, k) do
+    {a, b} = x
+    a32 = Nx.as_type(a, :s32)
+    b32 = Nx.as_type(b, :s32)
+    sh = Nx.bitwise_and(k, 7)
+
+    v =
+      Nx.concatenate([
+        Nx.reshape(Nx.min(a32, b32), {1}),
+        Nx.reshape(Nx.max(a32, b32), {1}),
+        Nx.reshape(Nx.abs(a32), {1}),
+        Nx.reshape(Nx.negate(b32), {1})
+      ])
+
+    total = Nx.sum(v)
+    diff = Nx.select(Nx.greater(a32, b32), a32 - b32, b32 - a32)
+
+    flag =
+      Nx.logical_and(Nx.not_equal(a32, 0), Nx.less_equal(b32, 0))
+      |> Nx.logical_or(Nx.equal(a32, b32))
+      |> Nx.logical_not()
+
+    bits = Nx.bitwise_xor(Nx.bitwise_and(a32, 0xFF), Nx.bitwise_or(b32, 3))
+    mixed = bits + Nx.right_shift(a32, sh) + Nx.left_shift(b32, sh)
+    grid = v |> Nx.reshape({2, 2}) |> Nx.transpose() |> Nx.reshape({4})
+    grid = grid + Nx.broadcast(Nx.reshape(Nx.less(a32, 0), {1}), {4})
+
+    acc32 = Nx.as_type(acc, :s32)
+    next = saturate(acc32 + Nx.right_shift(diff, 4) - Nx.right_shift(acc32, 3), :s16)
+    {{total, diff, flag, mixed, grid, next}, next}
+  end
+
+  # Integer division has no hardware mapping yet.
+  defn quotient_step(x, acc) do
+    q = Nx.quotient(Nx.as_type(x, :s32), 3)
+    next = saturate(Nx.as_type(acc, :s32) + q, :s16)
+    {next, next}
+  end
+
   # Phase update exactly as written in the plan: relies on as_type to wrap.
   defn plan_phase_update(phase_acc, phase_inc) do
     Nx.add(phase_acc, phase_inc) |> Nx.as_type(:u16)

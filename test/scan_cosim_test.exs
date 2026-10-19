@@ -114,6 +114,65 @@ defmodule ExHdl.ScanCosimTest do
     end
   end
 
+  test "ddc with a 64-entry sine table (LUT ROM instead of block RAM)" do
+    [path] = Enum.filter(C.case_paths(), &String.ends_with?(&1, "ddc_rotator.json"))
+    k = C.kernel(C.read_case(path), NxFixed.Num.q(16, 15, rounding: :nearest, lut_bits: 6))
+    {_scan, sim} = build(k, "ddc_lut6", [])
+    assert sim.design.source =~ "function automatic"
+    refute sim.design.source =~ "initial begin"
+    expected = reference(k)
+
+    for traffic <- @traffic do
+      assert run(sim, k, k.samples, traffic).outputs == expected
+    end
+  end
+
+  test "min, max, abs, select, logic, variable shifts, sum, transpose against NxFixed.run_scan" do
+    t = &Nx.template({}, &1)
+    fun = &ExHdl.Test.DSP.misc_ops_step/3
+
+    {:ok, scan} =
+      ExHdl.DSP.analyze_scan(fun, [{t.(:s16), t.(:s16)}, t.(:s16), t.(:u8)], state: 1)
+
+    design = SV.generate(scan, name: "misc_ops", param_names: ["k"])
+    {:ok, sim} = Verilator.build_stream(design)
+
+    :rand.seed(:exsss, 7)
+    edge = [-32768, -32767, -1, 0, 1, 32767]
+
+    pairs =
+      for(a <- edge, b <- edge, do: {a, b}) ++
+        for _ <- 1..400, do: {:rand.uniform(65536) - 32769, :rand.uniform(65536) - 32769}
+
+    {as, bs} = Enum.unzip(pairs)
+
+    for k <- [0, 3, 13] do
+      samples =
+        Enum.map(pairs, fn {a, b} -> {Nx.tensor(a, type: :s16), Nx.tensor(b, type: :s16)} end)
+
+      kt = Nx.tensor(k, type: :u8)
+      {outs, _} = NxFixed.run_scan(fun, samples, Nx.tensor(0, type: :s16), [kt])
+
+      expected =
+        outs
+        |> Enum.map(&C.leaf_ints/1)
+        |> Enum.zip_with(&List.flatten/1)
+
+      for traffic <- @traffic do
+        {vp, rp, seed} = traffic
+
+        assert {:ok, res} =
+                 Verilator.run_stream(sim, [as, bs], [k],
+                   valid_pct: vp,
+                   ready_pct: rp,
+                   seed: seed
+                 )
+
+        assert res.outputs == expected, "k = #{k}, traffic #{inspect(traffic)}"
+      end
+    end
+  end
+
   # Samples are dealt round robin to n channels; each channel must match the
   # reference run on its own subsequence.
   defp assert_channels(k, sim, n) do
