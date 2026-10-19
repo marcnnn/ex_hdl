@@ -18,6 +18,7 @@ software and SystemVerilog hardware.
 | CPU: compiled block loop (EXLA) and Highway SIMD NIF for Q15 blocks, bit-identical; see `docs/cpu_backend.md` | done |
 | `ExHdl.SIMD.Compiler`: native code generated from integer `defn` graphs (Nx compiler, like EXLA) | done |
 | Quantized ML: int8 fully connected layer with TFLite semantics (`ExHdl.ML.Quantized`) | first block |
+| DVB-T transmitter and receiver, stage by stage and end to end against gr-dtv; see `docs/dvbt.md` | reference implementation |
 | DVB-T transmitter and receiver (2k), compared with GNU Radio gr-dtv stage by stage and end to end; see `docs/dvbt.md` | reference implementation |
 | openXC7 bitstream builder, Zynq runtime | planned |
 
@@ -28,6 +29,7 @@ mix test                      # unit and property tests; co-simulation if verila
 mix test --only verilator     # co-simulation only
 mix test --only elixir_types  # law suites against Elixir's type system, see test/types/README.md
 mix ex_hdl.gen.sv MyApp.Protocol --out hdl/generated
+mix test --only dvbt          # DVB-T against gr-dtv reference data
 mix test --only gnuradio_live # run the DSP cases against live GNU Radio (native or rootless podman)
 scripts/gnuradio_golden.sh    # regenerate test/fixtures/gnuradio/ after changing a case
 ```

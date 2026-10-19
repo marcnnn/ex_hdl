@@ -1,2 +1,4 @@
 test/fixtures/**/*.s16le binary
 test/fixtures/**/*.f32le binary
+test/fixtures/**/*.head binary
+test/fixtures/**/*.c64 binary
