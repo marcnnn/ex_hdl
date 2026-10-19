@@ -56,6 +56,10 @@ defmodule ExHdl.Test.BlockCases do
       {ExSdr.Math, :add_ff, []},
       {ExSdr.Math, :complex_to_mag_squared, []},
       {ExSdr.Math, :delay, [delay: 5]},
+      # memory: block RAM delay lines
+      {ExSdr.Math, :moving_average_ff, [length: 1024, scale: 1 / 1024],
+       label: "moving_average_ff_1024", samples: 2500},
+      {ExSdr.Math, :delay, [delay: 600], label: "delay_600", samples: 1500},
       # digital
       {ExSdr.Digital, :chunks_to_symbols_bf, [table: [-1.0, -0.33, 0.33, 1.0]], symbols: 4},
       {ExSdr.Digital, :chunks_to_symbols_bc,
@@ -63,7 +67,15 @@ defmodule ExHdl.Test.BlockCases do
       {ExSdr.Digital, :diff_encoder_bb, [modulus: 4], symbols: 4},
       {ExSdr.Digital, :diff_decoder_bb, [modulus: 4], symbols: 4},
       {ExSdr.Digital, :binary_slicer_fb, []},
-      {ExSdr.Digital, :constellation_decoder_cb, [constellation: :qpsk]}
+      {ExSdr.Digital, :constellation_decoder_cb, [constellation: :qpsk]},
+      # variable rate: output lanes and a count
+      {ExSdr.Timing, :mmse_resampler_ff, [resamp_ratio: 0.75]},
+      {ExSdr.Timing, :mmse_resampler_cc, [resamp_ratio: 1.6]},
+      {ExSdr.Timing, :clock_recovery_mm_ff, [omega: 2.0, gain_omega: 0.01, gain_mu: 0.05]},
+      {ExSdr.Timing, :clock_recovery_mm_cc, [omega: 2.0, gain_omega: 0.01, gain_mu: 0.05]},
+      {ExSdr.Timing, :symbol_sync_ff,
+       [sps: 2.0, loop_bw: 0.05, ted_type: :gardner, resampling_type: :mmse]},
+      {ExSdr.Timing, :pfb_arb_resampler_fff, [rate: 1.25, taps: lowpass(64)]}
     ]
     |> Enum.map(&normalize/1)
   end

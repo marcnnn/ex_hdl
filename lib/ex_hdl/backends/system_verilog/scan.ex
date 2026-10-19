@@ -145,7 +145,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     # on a first lowering, then schedule and lower again.
     fir =
       if Keyword.get(opts, :fir, :chain) == :chain,
-        do: Fir.plan(Enum.reduce(graph.order, c, &lower/2), scan),
+        do: Fir.plan(Enum.reduce(graph.order, %{c | planning: true}, &lower/2), scan),
         else: %{}
 
     c =
@@ -218,7 +218,8 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       blocks: [],
       elems: %{},
       roms: %{},
-      fir: fir
+      fir: fir,
+      planning: false
     }
   end
 
@@ -612,6 +613,15 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
       plan = c.fir[{:take, node.id}] ->
         memory_take(node, c, plan)
+
+      size(c.graph.nodes[table_id].shape) > @max_mux and c.planning ->
+        # the plan decides; a placeholder value meanwhile
+        map_c(0..(size(node.shape) - 1), c, fn e, c ->
+          name = elem_name(node, e)
+
+          {new_sig(c, name, IntSet.bit_width(node.range), exec_stage(c, node.id), false),
+           {:sig, name}}
+        end)
 
       size(c.graph.nodes[table_id].shape) > @max_mux ->
         unsupported!(
@@ -1356,11 +1366,8 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     dw = signed_bits(IntSet.bit_width(diff_range))
     diff = "#{name}_df"
 
-    range =
-      IntSet.multiply(
-        x_range |> IntSet.bounds() |> then(fn {lo, hi} -> IntSet.range(lo, hi) end),
-        IntSet.singleton(h * len)
-      )
+    # len values of x_range (an interval) times h
+    range = IntSet.multiply(x_range, IntSet.singleton(h * len))
 
     w = signed_bits(IntSet.bit_width(range))
     acc = "#{name}_acc"

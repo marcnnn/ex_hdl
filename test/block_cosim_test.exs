@@ -29,8 +29,14 @@ defmodule ExHdl.BlockCosimTest do
           {:ok, sim} = Verilator.build_stream(design)
 
           input = C.stimulus(block, c.samples, c.symbols, 11)
-          {expected, _} = NxFixed.Block.run(block, input)
-          expected = C.leaf_ints(expected)
+
+          expected =
+            case NxFixed.Block.run(block, input) do
+              # variable rate, no output item at all
+              {nil, _} -> Enum.map(design.outputs, fn _ -> [] end)
+              {out, _} -> C.leaf_ints(out)
+            end
+
           refute expected |> List.flatten() |> Enum.uniq() |> length() < 2, "constant output"
           params = C.leaf_ints(List.to_tuple(block.params))
 

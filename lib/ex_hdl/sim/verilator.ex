@@ -308,7 +308,8 @@ defmodule ExHdl.Sim.Verilator do
   tensor or list with the sample index as first axis. `params` has one
   value per parameter port (integer, list or tensor). Returns the outputs
   the same way, one flat integer list per output leaf (sample-major), and
-  the cycle count (including 64 idle drain cycles).
+  the cycle count (including 64 idle drain cycles, more for designs whose
+  ii or latency reach 64).
 
   `switch: {k, params2}` loads `params2` (`p_load`) in the cycle that
   accepts sample `k - 1`, so samples `k..` use the new values.
@@ -342,7 +343,7 @@ defmodule ExHdl.Sim.Verilator do
       args =
         [in_file, out_file, seed, valid_pct, ready_pct, max_cycles]
         |> Enum.map(&to_string/1)
-        |> Kernel.++([Integer.to_string(param_word, 16) | switch])
+        |> Kernel.++([Integer.to_string(param_word, 16), Integer.to_string(drain(d)) | switch])
 
       case System.cmd(sim.path, args, stderr_to_stdout: true) do
         {_, 0} -> {:ok, parse_stream(File.read!(out_file), d.outputs)}
@@ -353,6 +354,9 @@ defmodule ExHdl.Sim.Verilator do
       File.rm_rf!(tmp)
     end
   end
+
+  # Idle cycles before the run ends: outputs can be ii or latency cycles apart.
+  defp drain(d), do: 64 + if(max(d.ii, d.latency) >= 64, do: max(d.ii, d.latency), else: 0)
 
   defp param_word(d, params) do
     d.params

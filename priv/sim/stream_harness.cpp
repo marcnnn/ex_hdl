@@ -7,10 +7,11 @@
 // file of input words and records the output words.
 //
 // usage: sim <in_words> <out_words> <seed> <valid_pct> <ready_pct> <max_cycles> <params_hex>
-//            [<switch_at> <params2_hex>]
+//            <drain_cycles> [<switch_at> <params2_hex>]
 //
 // Word files contain one hex word (up to 256 bits) per line; params is a
-// hex word too. With switch_at = k, params2 is loaded (params_load) in the
+// hex word too. The run ends after drain_cycles cycles without output once
+// all input is accepted. With switch_at = k, params2 is loaded (params_load) in the
 // cycle that accepts input word k - 1. The output file ends with
 // "cycles <n>". Exit codes: 0 ok, 1 usage/io error, 2 cycle limit reached.
 //
@@ -55,8 +56,8 @@ static void print(std::FILE* out, const T& port) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 8 && argc != 10) {
-        std::fprintf(stderr, "usage: %s in out seed valid_pct ready_pct max_cycles params\n", argv[0]);
+    if (argc != 9 && argc != 11) {
+        std::fprintf(stderr, "usage: %s in out seed valid_pct ready_pct max_cycles params drain [switch_at params2]\n", argv[0]);
         return 1;
     }
 
@@ -75,8 +76,9 @@ int main(int argc, char** argv) {
     const int ready_pct = std::atoi(argv[5]);
     const uint64_t max_cycles = std::strtoull(argv[6], nullptr, 10);
     const Wide params = parse_hex(argv[7]);
-    const size_t switch_at = argc == 10 ? std::strtoull(argv[8], nullptr, 10) : 0;
-    const Wide params2 = argc == 10 ? parse_hex(argv[9]) : params;
+    const uint64_t drain_cycles = std::strtoull(argv[8], nullptr, 10);
+    const size_t switch_at = argc == 11 ? std::strtoull(argv[9], nullptr, 10) : 0;
+    const Wide params2 = argc == 11 ? parse_hex(argv[10]) : params;
     const Wide zero{};
     std::uniform_int_distribution<int> pct(0, 99);
 
@@ -103,7 +105,6 @@ int main(int argc, char** argv) {
     size_t idx = 0;
     bool offering = false;
     uint64_t cycle = 0, idle = 0;
-    const uint64_t drain_cycles = 64;
 
     while (true) {
         if (!offering && idx < words.size() && pct(rng) < valid_pct) offering = true;
