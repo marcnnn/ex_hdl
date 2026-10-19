@@ -35,7 +35,7 @@ defmodule ExHdl.ScanSvTest do
   test "channels: n keeps n states and accepts a sample every cycle" do
     {:ok, scan} = one_pole(channels: 6)
     d = SV.generate(scan, name: "op", init: Nx.tensor(-5, type: :s16))
-    assert d.source =~ "assign issue_ok = 1'b1;"
+    assert d.source =~ "assign gap_ok = 1'b1;"
     assert d.source =~ ~r/logic signed \[15:0\] n\d+_mem \[6\];/
     assert d.source =~ "<= 16'shFFFB;"
   end
@@ -49,7 +49,7 @@ defmodule ExHdl.ScanSvTest do
       )
 
     d = SV.generate(scan, param_names: ["phase_inc", "gain"])
-    assert d.latency == scan.pipeline_latency
+    assert d.latency == scan.pipeline_latency + 1
     assert d.in_width == 32 and d.out_width == 32
     assert [%{port: "p_phase_inc", bits: 16}, %{port: "p_gain", bits: 16}] = d.params
     # one shared table, read through two ports
@@ -76,6 +76,6 @@ defmodule ExHdl.ScanSvTest do
       assert File.read!(Path.join(dir, "#{name}.sv")) =~ "module #{name} ("
     end
 
-    assert_received {:mix_shell, :info, ["  latency 5, ii 5, channels 1, tdata 16 -> 16 bits"]}
+    assert_received {:mix_shell, :info, ["  latency 6, ii 5, channels 1, tdata 16 -> 16 bits"]}
   end
 end

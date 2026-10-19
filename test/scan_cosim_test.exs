@@ -173,6 +173,59 @@ defmodule ExHdl.ScanCosimTest do
     end
   end
 
+  describe "parameter loads (p_load) take effect between samples" do
+    for {file, change} <- [{"ddc_rotator.json", :ddc}, {"one_pole_a0p25.json", :one_pole}] do
+      @case_file file
+      @change change
+      test "#{file}", do: assert_switch(@case_file, @change)
+    end
+  end
+
+  defp assert_switch(file, change) do
+    [path] = Enum.filter(C.case_paths(), &String.ends_with?(&1, file))
+    k = C.kernel(C.read_case(path), NxFixed.Num.q(16, 15, rounding: :nearest))
+    {_scan, sim} = build(k, "switch_#{change}", ii: :auto)
+
+    params2 =
+      Enum.map(k.params, fn
+        %NxFixed.Fixed{} = p -> %{p | t: Nx.subtract(Nx.tensor(-1000, type: p.t.type), p.t)}
+        t -> Nx.add(t, 1234) |> Nx.as_type(t.type)
+      end)
+
+    total = [k.samples] |> Nx.Defn.Composite.flatten_list() |> hd() |> Nx.axis_size(0)
+    at = div(total, 3)
+    first = slice_samples(k.samples, 0, at)
+    rest = slice_samples(k.samples, at, total - at)
+
+    {out1, state} =
+      NxFixed.run_scan_stacked(k.fun, first, k.state, k.params, kernel_opts: k.kernel_opts)
+
+    {out2, _} =
+      NxFixed.run_scan_stacked(k.fun, rest, state, params2, kernel_opts: k.kernel_opts)
+
+    expected = Enum.zip_with(C.leaf_ints(out1), C.leaf_ints(out2), &(&1 ++ &2))
+    refute expected == reference(k), "the parameter change must be visible"
+
+    for {vp, rp, seed} <- @traffic do
+      assert {:ok, res} =
+               Verilator.run_stream(
+                 sim,
+                 C.leaf_ints(k.samples),
+                 C.leaf_ints(List.to_tuple(k.params)),
+                 valid_pct: vp,
+                 ready_pct: rp,
+                 seed: seed,
+                 switch: {at, C.leaf_ints(List.to_tuple(params2))}
+               )
+
+      assert res.outputs == expected
+    end
+  end
+
+  defp slice_samples(samples, start, len) do
+    Nx.Defn.Composite.traverse(samples, &Nx.slice_along_axis(&1, start, len, axis: 0))
+  end
+
   # Samples are dealt round robin to n channels; each channel must match the
   # reference run on its own subsequence.
   defp assert_channels(k, sim, n) do

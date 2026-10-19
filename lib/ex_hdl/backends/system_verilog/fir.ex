@@ -44,7 +44,7 @@ defmodule ExHdl.Backends.SystemVerilog.Fir do
     if scan.channels != 1 do
       %{}
     else
-      st = %{c: c, next: next_refs(c, scan), keys: %{}}
+      st = %{c: c, next: next_refs(c, scan), keys: %{}, bases: %{}}
 
       {st, index} = index(st)
 
@@ -271,7 +271,7 @@ defmodule ExHdl.Backends.SystemVerilog.Fir do
 
         case Map.get(st.c.defs, name) do
           {:in, index, e} ->
-            {st, {0, {:in, index, e}}}
+            intern(st, 0, {:in, index, e})
 
           {:state, index, e, _init} ->
             case Map.get(st.next, {index, e}) do
@@ -296,13 +296,26 @@ defmodule ExHdl.Backends.SystemVerilog.Fir do
             delays = for {d, _} <- ks, is_integer(d), uniq: true, do: d
 
             case delays do
-              [d] -> {st, {d, {op, Enum.map(ks, &base_of/1)}}}
+              [d] -> intern(st, d, {op, Enum.map(ks, &base_of/1)})
               _ -> {st, {0, {:sig, name}}}
             end
 
           _ ->
             {st, {0, {:sig, name}}}
         end
+    end
+  end
+
+  # Bases are numbered, so that keys stay small on graphs with shared
+  # subexpressions.
+  defp intern(st, d, structure) do
+    case st.bases do
+      %{^structure => id} ->
+        {st, {d, {:base, id}}}
+
+      bases ->
+        id = map_size(bases)
+        {%{st | bases: Map.put(bases, structure, id)}, {d, {:base, id}}}
     end
   end
 

@@ -263,6 +263,8 @@ defmodule ExHdl.Sim.Verilator do
         {"    .#{p.port}(params[#{off} +: #{w}]),\n", off + w}
       end)
 
+    params = if d.params == [], do: params, else: params ++ ["    .p_load(params_load),\n"]
+
     pad =
       if d.out_width < @wide,
         do: "  assign m_axis_tdata[#{@wide - 1}:#{d.out_width}] = '0;\n",
@@ -275,6 +277,7 @@ defmodule ExHdl.Sim.Verilator do
       input  logic clk,
       input  logic rst_n,
       input  logic [#{@wide - 1}:0] params,
+      input  logic params_load,
       input  logic [#{@wide - 1}:0] s_axis_tdata,
       input  logic s_axis_tvalid,
       output logic s_axis_tready,
@@ -306,6 +309,9 @@ defmodule ExHdl.Sim.Verilator do
   value per parameter port (integer, list or tensor). Returns the outputs
   the same way, one flat integer list per output leaf (sample-major), and
   the cycle count (including 64 idle drain cycles).
+
+  `switch: {k, params2}` loads `params2` (`p_load`) in the cycle that
+  accepts sample `k - 1`, so samples `k..` use the new values.
   """
   @spec run_stream(StreamSim.t(), [Nx.Tensor.t() | list()], list(), run_opts()) ::
           {:ok, %{outputs: [[integer()]], cycles: pos_integer()}} | {:error, term()}
@@ -317,13 +323,13 @@ defmodule ExHdl.Sim.Verilator do
     ready_pct = Keyword.get(opts, :ready_pct, 100)
     max_cycles = Keyword.get(opts, :max_cycles, 1000 + n * 200)
 
-    param_word =
-      d.params
-      |> Enum.zip(params)
-      |> Enum.reduce({0, 0}, fn {p, v}, {acc, off} ->
-        {acc ||| pack_elems(p, ints(v)) <<< off, off + p.bits * shape_size(p.shape)}
-      end)
-      |> elem(0)
+    param_word = param_word(d, params)
+
+    switch =
+      case Keyword.get(opts, :switch) do
+        nil -> []
+        {k, params2} -> [Integer.to_string(k), Integer.to_string(param_word(d, params2), 16)]
+      end
 
     tmp = Path.join(System.tmp_dir!(), "ex_hdl_stream_#{System.unique_integer([:positive])}")
     File.mkdir_p!(tmp)
@@ -336,7 +342,7 @@ defmodule ExHdl.Sim.Verilator do
       args =
         [in_file, out_file, seed, valid_pct, ready_pct, max_cycles]
         |> Enum.map(&to_string/1)
-        |> Kernel.++([Integer.to_string(param_word, 16)])
+        |> Kernel.++([Integer.to_string(param_word, 16) | switch])
 
       case System.cmd(sim.path, args, stderr_to_stdout: true) do
         {_, 0} -> {:ok, parse_stream(File.read!(out_file), d.outputs)}
@@ -346,6 +352,15 @@ defmodule ExHdl.Sim.Verilator do
     after
       File.rm_rf!(tmp)
     end
+  end
+
+  defp param_word(d, params) do
+    d.params
+    |> Enum.zip(params)
+    |> Enum.reduce({0, 0}, fn {p, v}, {acc, off} ->
+      {acc ||| pack_elems(p, ints(v)) <<< off, off + p.bits * shape_size(p.shape)}
+    end)
+    |> elem(0)
   end
 
   defp pack_samples(fields, inputs) do

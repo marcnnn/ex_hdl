@@ -11,10 +11,18 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     * `m_axis_*` - one output per beat, packed the same way.
     * `p_<name>` - one input port per tensor leaf of the remaining
       arguments (gains, phase increments, ...), elements packed like
-      `tdata`. They are read continuously, so change them only while the
-      stream is idle.
+      `tdata`, and `p_load`. A cycle with `p_load` high captures all
+      parameter ports into shadow registers; the kernel then accepts no
+      further sample until the samples accepted so far (including one
+      accepted in the `p_load` cycle) have left the pipeline, applies the
+      new values and continues. So every sample sees one consistent
+      parameter set, and the change takes effect at a known sample.
 
-  `rst_n` (synchronous, active low) loads the initial state (`:init`).
+  `rst_n` (synchronous, active low) loads the initial state (`:init`) and
+  the parameter ports directly.
+
+  No ready path is combinational: `s_axis_tready` depends only on
+  registers, `m_axis_tready` only on the two-entry output buffer.
 
   ## Structure
 
@@ -25,9 +33,10 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   stage of every node; values crossing stages go through pipeline
   registers. Multiplies use the DSP48E1 register pattern (input, product
   and output registers), large tables become block RAM with a registered
-  read, small ones LUT ROM. All pipeline registers share one clock enable
-  `ce`, which stops the whole pipeline while the output is stalled, so
-  backpressure costs no extra buffering.
+  read, small ones LUT ROM. Dot products of constant taps with a delay
+  line become transposed DSP chains (`ExHdl.Backends.SystemVerilog.Fir`).
+  All pipeline registers share one clock enable `ce`: the pipeline
+  advances while the two-entry output buffer has room.
 
   The state is read in stage `S`, where everything the state update needs
   from outside the loop is available, and written back at the end of the
@@ -58,7 +67,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
       * `source` - the SystemVerilog text of module `name`.
       * `latency` - cycles from accepting a sample to presenting its output
-        (without stalls).
+        (without stalls), including the output buffer.
       * `ii`, `channels` - as in `ExHdl.IR.Scan`.
       * `state_stage`, `write_stage` - pipeline stages reading and writing
         the state.
@@ -166,7 +175,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     %Design{
       name: name,
       source: source,
-      latency: latency,
+      latency: latency + 1,
       ii: scan.ii,
       channels: scan.channels,
       state_stage: state_stage,
@@ -428,7 +437,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
         map_c(0..(size(node.shape) - 1), c, fn e, c ->
           name = elem_name(node, e)
           c = new_sig(c, name, fmt, :static, false)
-          {assign(c, name, "#{port.port}[#{e * port.bits} +: #{bits(fmt)}]"), {:sig, name}}
+          {assign(c, name, "#{port.port}_q[#{e * port.bits} +: #{bits(fmt)}]"), {:sig, name}}
         end)
 
       state = l.states_by_index[index] ->
@@ -1255,7 +1264,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     params =
       Enum.map(l.params, fn p ->
         "  input  logic [#{p.bits * size(p.shape) - 1}:0] #{p.port},\n"
-      end)
+      end) ++ if(l.params == [], do: [], else: ["  input  logic p_load,\n"])
 
     decls =
       c.decls
@@ -1272,12 +1281,17 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
         else: "{vld[#{depth - 1}:1], vld_0}"
 
     control = [
-      "  // control: one clock enable for the whole pipeline\n",
+      "  // control: one clock enable for the whole pipeline, from registers\n",
+      "  // only (the output buffer's free space), so no ready path is combinational\n",
       "  logic ce;\n",
       "  logic issue_ok;\n",
+      "  logic gap_ok;\n",
       "  logic vld_0;\n",
       "  logic [#{depth}:1] vld;  // vld[k]: stage k holds a sample\n",
-      "  assign ce = !#{valid(d.latency)} || m_axis_tready;\n",
+      "  logic ob_room;\n",
+      if(l.params == [], do: [], else: "  logic p_pending;\n"),
+      "  assign ce = ob_room;\n",
+      "  assign issue_ok = gap_ok#{if l.params == [], do: "", else: " && !p_pending"};\n",
       "  assign s_axis_tready = ce && issue_ok;\n",
       "  assign vld_0 = s_axis_tvalid && issue_ok;\n",
       "  always_ff @(posedge clk) begin\n",
@@ -1288,7 +1302,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
     throttle =
       if n > 1 or scan.ii == 1 do
-        "  assign issue_ok = 1'b1;\n"
+        "  assign gap_ok = 1'b1;\n"
       else
         cw = max(1, bit_len(scan.ii - 1))
         last = "#{cw}'d#{scan.ii - 1}"
@@ -1296,10 +1310,10 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
         [
           "  // one sample every #{scan.ii} enabled cycles\n",
           "  logic [#{cw - 1}:0] gap;\n",
-          "  assign issue_ok = (gap == #{last});\n",
+          "  assign gap_ok = (gap == #{last});\n",
           "  always_ff @(posedge clk) begin\n",
           "    if (!rst_n) gap <= #{last};\n",
-          "    else if (ce) gap <= vld_0 ? #{cw}'d0 : (issue_ok ? gap : gap + #{cw}'d1);\n",
+          "    else if (ce) gap <= vld_0 ? #{cw}'d0 : (gap_ok ? gap : gap + #{cw}'d1);\n",
           "  end\n"
         ]
       end
@@ -1345,7 +1359,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
     IO.iodata_to_binary([
       "// Generated by ExHdl from a stream kernel. Do not edit.\n",
-      "// #{d.name}: latency #{d.latency}, ii #{scan.ii}, channels #{n}\n",
+      "// #{d.name}: latency #{d.latency + 1}, ii #{scan.ii}, channels #{n}\n",
       "// s_axis_tdata: #{describe_fields(l.inputs)}\n",
       "// m_axis_tdata: #{describe_fields(l.outputs)}\n",
       "/* verilator lint_off UNUSEDSIGNAL */\n",
@@ -1363,6 +1377,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       control,
       throttle,
       channel,
+      param_logic(l.params),
       "\n",
       Enum.reverse(c.blocks),
       state_decls,
@@ -1374,11 +1389,68 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       state_logic,
       sample_logic,
       "\n",
-      "  assign m_axis_tvalid = #{valid(d.latency)};\n",
-      "  assign m_axis_tdata = #{d.out_expr};\n",
+      out_buffer(d.out_expr, l.out_width, valid(d.latency)),
       "endmodule\n",
       "/* verilator lint_on UNUSEDSIGNAL */\n"
     ])
+  end
+
+  # Two-entry output buffer: the pipeline pushes its result with the clock
+  # enable, the stream pops; the pipeline runs while the buffer has room.
+  defp out_buffer(data, width, valid) do
+    [
+      "  // output buffer\n",
+      "  logic [#{width - 1}:0] ob_mem [2];\n",
+      "  logic ob_wp, ob_rp;\n",
+      "  logic [1:0] ob_count;\n",
+      "  logic ob_push, ob_pop;\n",
+      "  assign ob_room = ob_count != 2'd2;\n",
+      "  assign ob_push = ce && #{valid};\n",
+      "  assign ob_pop = m_axis_tvalid && m_axis_tready;\n",
+      "  always_ff @(posedge clk) begin\n",
+      "    if (!rst_n) begin\n",
+      "      ob_wp <= 1'b0;\n",
+      "      ob_rp <= 1'b0;\n",
+      "      ob_count <= 2'd0;\n",
+      "    end else begin\n",
+      "      if (ob_push) begin\n",
+      "        ob_mem[ob_wp] <= #{data};\n",
+      "        ob_wp <= !ob_wp;\n",
+      "      end\n",
+      "      if (ob_pop) ob_rp <= !ob_rp;\n",
+      "      ob_count <= ob_count + 2'(ob_push) - 2'(ob_pop);\n",
+      "    end\n",
+      "  end\n",
+      "  assign m_axis_tvalid = ob_count != 2'd0;\n",
+      "  assign m_axis_tdata = ob_mem[ob_rp];\n"
+    ]
+  end
+
+  # Parameter ports are captured on `p_load` and applied once the samples
+  # accepted until then have left the pipeline; no sample is accepted in
+  # between. Reset loads the ports directly.
+  defp param_logic([]), do: []
+
+  defp param_logic(params) do
+    decl = fn p, suffix -> "  logic [#{p.bits * size(p.shape) - 1}:0] #{p.port}#{suffix};\n" end
+
+    [
+      "  // parameters: p_load captures the ports, they apply between samples\n",
+      Enum.map(params, &decl.(&1, "_q")),
+      Enum.map(params, &decl.(&1, "_s")),
+      "  always_ff @(posedge clk) begin\n",
+      "    if (!rst_n) begin\n",
+      Enum.map(params, &"      #{&1.port}_q <= #{&1.port};\n"),
+      "      p_pending <= 1'b0;\n",
+      "    end else if (p_load) begin\n",
+      Enum.map(params, &"      #{&1.port}_s <= #{&1.port};\n"),
+      "      p_pending <= 1'b1;\n",
+      "    end else if (p_pending && vld == '0) begin\n",
+      Enum.map(params, &"      #{&1.port}_q <= #{&1.port}_s;\n"),
+      "      p_pending <= 1'b0;\n",
+      "    end\n",
+      "  end\n"
+    ]
   end
 
   defp state_logic([], _n, _s, _w), do: {[], []}
