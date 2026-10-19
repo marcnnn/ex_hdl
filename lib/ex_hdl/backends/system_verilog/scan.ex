@@ -92,7 +92,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     ]
   end
 
-  @elementwise ~w(add subtract multiply negate abs min max clip select
+  @elementwise ~w(add subtract multiply remainder negate abs min max clip select
                   right_shift left_shift bitwise_and bitwise_or bitwise_xor
                   equal not_equal less less_equal greater greater_equal
                   logical_and logical_or logical_not)a
@@ -776,6 +776,20 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
             other = Enum.at(refs, 1 - i)
             {c, [x], _} = operands(c, [other], stage, rsw)
             {c, "#{w}'(#{x} <<< #{ceil_log2(v)})"}
+        end
+
+      :remainder ->
+        # Nx and SystemVerilog both truncate (the sign follows the dividend);
+        # a non-negative dividend and a power of two divisor need only a mask
+        [x, y] = refs
+
+        if power_of_two?(y) and IntSet.bounds(ref_range(c, x)) |> elem(0) >= 0 do
+          {:lit, v} = y
+          {c, [a, m], _} = operands(c, [x, {:lit, v - 1}], stage, rsw)
+          {c, "#{w}'(#{a} & #{m})"}
+        else
+          {c, [a, b], _} = operands(c, refs, stage, rsw)
+          {c, "#{w}'(#{a} % #{b})"}
         end
 
       :negate ->

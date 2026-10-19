@@ -366,6 +366,7 @@ defmodule ExHdl.Backends.SystemVerilog.Fir do
     case {op, args} do
       {:add, [a, b]} -> {:ok, a + b}
       {:subtract, [a, b]} -> {:ok, a - b}
+      {:remainder, [a, b]} when b != 0 -> {:ok, rem(a, b)}
       {:multiply, [a, b]} -> {:ok, a * b}
       {:negate, [a]} -> {:ok, -a}
       {:abs, [a]} -> {:ok, abs(a)}
