@@ -25,6 +25,10 @@ defmodule ExHdl.SIMD.NIF do
   def one_pole_q15(_x, _y0, _alpha, _round), do: :erlang.nif_error(:not_loaded)
   def simd_target, do: :erlang.nif_error(:not_loaded)
   def viterbi_dvbt(_rx, _start_unknown), do: :erlang.nif_error(:not_loaded)
+  def viterbi_dvbt_simd(_rx, _start_unknown), do: :erlang.nif_error(:not_loaded)
+  def forney_deinterleave(_bytes), do: :erlang.nif_error(:not_loaded)
+  def rs_decode_packets(_bytes), do: :erlang.nif_error(:not_loaded)
+  def descramble(_bytes), do: :erlang.nif_error(:not_loaded)
   def kernel_load(_path), do: :erlang.nif_error(:not_loaded)
   def kernel_run(_kernel, _inputs, _output_bytes), do: :erlang.nif_error(:not_loaded)
 end

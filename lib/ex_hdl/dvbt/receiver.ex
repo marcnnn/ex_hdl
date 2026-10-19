@@ -133,27 +133,36 @@ defmodule ExHdl.DVBT.Receiver do
     end
   end
 
-  # Forney deinterleaver, RS decoding and descrambling of decoded bytes.
+  # Forney deinterleaver, RS decoding and descrambling of decoded bytes:
+  # native kernels when the NIF is loaded, else the Elixir references (same
+  # results).
   defp outer(bytes) do
-    deinterleaved = OuterInterleaver.deinterleave(bytes)
-    # the first 11 packets are FIFO fill
-    payload =
-      binary_part(
-        deinterleaved,
-        OuterInterleaver.delay(),
-        byte_size(deinterleaved) - OuterInterleaver.delay()
-      )
+    native? = ExHdl.SIMD.available?()
 
-    {packets, corrected, failed} =
-      for <<cw::binary-size(204) <- payload>>, reduce: {[], 0, 0} do
-        {acc, c, f} ->
-          case ReedSolomon.decode(cw) do
-            {:ok, p, n} -> {[p | acc], c + n, f}
-            {:error, :uncorrectable, p} -> {[p | acc], c, f + 1}
+    deinterleaved =
+      if native?,
+        do: ExHdl.SIMD.NIF.forney_deinterleave(bytes),
+        else: OuterInterleaver.deinterleave(bytes)
+
+    delay = OuterInterleaver.delay()
+    payload = binary_part(deinterleaved, delay, byte_size(deinterleaved) - delay)
+    payload = binary_part(payload, 0, div(byte_size(payload), 204) * 204)
+
+    {rs_out, corrected, failed} =
+      if native? do
+        ExHdl.SIMD.NIF.rs_decode_packets(payload)
+      else
+        {packets, c, f} =
+          for <<cw::binary-size(204) <- payload>>, reduce: {[], 0, 0} do
+            {acc, c, f} ->
+              case ReedSolomon.decode(cw) do
+                {:ok, p, n} -> {[p | acc], c + n, f}
+                {:error, :uncorrectable, p} -> {[p | acc], c, f + 1}
+              end
           end
-      end
 
-    rs_out = packets |> Enum.reverse() |> IO.iodata_to_binary()
+        {packets |> Enum.reverse() |> IO.iodata_to_binary(), c, f}
+      end
 
     # align on the first inverted sync byte, then whole groups of 8
     start =
@@ -162,8 +171,10 @@ defmodule ExHdl.DVBT.Receiver do
     aligned =
       if start, do: binary_part(rs_out, start * 188, byte_size(rs_out) - start * 188), else: <<>>
 
-    groups = div(byte_size(aligned), 1504) * 1504
-    ts = EnergyDispersal.descramble(binary_part(aligned, 0, groups))
+    groups = binary_part(aligned, 0, div(byte_size(aligned), 1504) * 1504)
+
+    ts =
+      if native?, do: ExHdl.SIMD.NIF.descramble(groups), else: EnergyDispersal.descramble(groups)
 
     %{
       ts: ts,

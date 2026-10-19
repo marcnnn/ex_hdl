@@ -80,6 +80,72 @@ defmodule ExHdl.DVBT.EndToEndTest do
   end
 
   @tag :dvbt
+  property "SIMD Viterbi is bit-identical to the scalar kernel and the Elixir reference" do
+    check all rate <- member_of([{1, 2}, {2, 3}, {3, 4}, {5, 6}, {7, 8}]),
+              start <- member_of([:zero, :unknown]),
+              len <- integer(1..1500),
+              seed <- integer(1..10_000),
+              max_runs: 40 do
+      :rand.seed(:exsss, {seed, 2, 3})
+      bits = for _ <- 1..len, do: :rand.uniform(2) - 1
+      # a few percent bit errors; partial puncturing periods at the end
+      noisy =
+        bits
+        |> Convolutional.encode(rate)
+        |> Enum.map(fn b -> if :rand.uniform() < 0.04, do: 1 - b, else: b end)
+
+      rx = noisy |> :binary.list_to_bin() |> Convolutional.depunctured_binary(rate)
+      unknown = start == :unknown
+
+      simd = ExHdl.SIMD.NIF.viterbi_dvbt_simd(rx, unknown)
+      assert simd == ExHdl.SIMD.NIF.viterbi_dvbt(rx, unknown)
+
+      assert :binary.bin_to_list(simd) ==
+               Convolutional.decode_reference(noisy, rate, start: start)
+    end
+  end
+
+  @tag :dvbt
+  test "native Forney deinterleaver, RS decoder and descrambler equal the Elixir references" do
+    alias ExHdl.DVBT.{EnergyDispersal, OuterInterleaver, ReedSolomon}
+    :rand.seed(:exsss, {5, 6, 7})
+
+    data = :crypto.strong_rand_bytes(204 * 40)
+    assert ExHdl.SIMD.NIF.forney_deinterleave(data) == OuterInterleaver.deinterleave(data)
+
+    # 0..12 byte errors per codeword: corrected, and failed ones
+    codewords =
+      for _ <- 1..200 do
+        cw = ReedSolomon.encode(:crypto.strong_rand_bytes(188))
+
+        Enum.reduce(Enum.take_random(0..203, :rand.uniform(13) - 1), cw, fn p, acc ->
+          <<a::binary-size(p), b, c::binary>> = acc
+          <<a::binary, Bitwise.bxor(b, :rand.uniform(255)), c::binary>>
+        end)
+      end
+
+    {ref, corrected, failed} =
+      Enum.reduce(codewords, {[], 0, 0}, fn cw, {o, c, f} ->
+        case ReedSolomon.decode(cw) do
+          {:ok, p, n} -> {[p | o], c + n, f}
+          {:error, _, p} -> {[p | o], c, f + 1}
+        end
+      end)
+
+    assert failed > 0 and corrected > 0
+
+    assert ExHdl.SIMD.NIF.rs_decode_packets(IO.iodata_to_binary(codewords)) ==
+             {ref |> Enum.reverse() |> IO.iodata_to_binary(), corrected, failed}
+
+    scrambled =
+      EnergyDispersal.scramble(
+        for _ <- 1..24, into: <<>>, do: <<0x47>> <> :crypto.strong_rand_bytes(187)
+      )
+
+    assert ExHdl.SIMD.NIF.descramble(scrambled) == EnergyDispersal.descramble(scrambled)
+  end
+
+  @tag :dvbt
   test "noise-free: receiver decodes the source TS from the first superframe", %{
     ts: ts,
     clean: clean

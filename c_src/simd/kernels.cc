@@ -9,6 +9,7 @@
 #include "hwy/highway.h"
 #include "kernels.h"
 
+#include <cstring>
 #include <vector>
 
 HWY_BEFORE_NAMESPACE();
@@ -98,6 +99,71 @@ void FirQ15Impl(const int16_t* HWY_RESTRICT ext, size_t n, const int32_t* HWY_RE
   if (j < n) FirQ15Scalar(ext + j, n - j, taps, n_taps, round, out + j);
 }
 
+// Viterbi add-compare-select over the 64 states, vectorised. Next states s
+// and s + 32 (s < 32) both come from predecessors 2s (lsb 0) and 2s + 1
+// (lsb 1); LoadInterleaved2 splits the metrics into those two vectors.
+// Metrics are uint16 and renormalised every 256 steps by subtracting the
+// minimum (a uniform shift never changes a comparison). The initial metric
+// of unreachable states only needs to exceed every real path metric of the
+// first 6 steps (at most 12), so 1000 gives the same decisions as the
+// reference's 1000000. `expected` holds, per state, the expected x and y bit
+// for predecessor lsb 0 and 1: [x0 | y0 | x1 | y1], 64 entries each.
+void ViterbiDvbtSimdImpl(const uint8_t* HWY_RESTRICT rx, size_t n, bool start_unknown, uint64_t* HWY_RESTRICT decisions,
+                         const uint16_t* HWY_RESTRICT expected, unsigned* final_state) {
+  const hn::ScalableTag<uint16_t> d;
+  const size_t lanes = hn::Lanes(d);
+  const uint16_t* x0 = expected;
+  const uint16_t* y0 = expected + 64;
+  const uint16_t* x1 = expected + 128;
+  const uint16_t* y1 = expected + 192;
+  const uint64_t lane_mask = lanes >= 64 ? ~0ull : (1ull << lanes) - 1;
+
+  HWY_ALIGN uint16_t metric[64];
+  HWY_ALIGN uint16_t next[64];
+  for (int s = 0; s < 64; ++s) metric[s] = start_unknown || s == 0 ? 0 : 1000;
+
+  for (size_t i = 0; i < n; ++i) {
+    const uint16_t rx_x = rx[2 * i], rx_y = rx[2 * i + 1];
+    // distance per lane: (rx xor expected), zero for an erasure (2)
+    const auto vx = hn::Set(d, static_cast<uint16_t>(rx_x & 1)), vy = hn::Set(d, static_cast<uint16_t>(rx_y & 1));
+    const auto ex = hn::Set(d, static_cast<uint16_t>(rx_x != 2)), ey = hn::Set(d, static_cast<uint16_t>(rx_y != 2));
+    uint64_t decision = 0;
+
+    for (size_t j = 0; j < 32; j += lanes) {
+      hn::Vec<decltype(d)> even, odd;
+      hn::LoadInterleaved2(d, metric + 2 * j, even, odd);
+
+      for (size_t s = j; s < 64; s += 32) {
+        const auto d0 = hn::Add(hn::Mul(hn::Xor(vx, hn::LoadU(d, x0 + s)), ex), hn::Mul(hn::Xor(vy, hn::LoadU(d, y0 + s)), ey));
+        const auto d1 = hn::Add(hn::Mul(hn::Xor(vx, hn::LoadU(d, x1 + s)), ex), hn::Mul(hn::Xor(vy, hn::LoadU(d, y1 + s)), ey));
+        const auto c0 = hn::Add(even, d0);
+        const auto c1 = hn::Add(odd, d1);
+        hn::StoreU(hn::Min(c0, c1), d, next + s);
+
+        uint8_t packed[8] = {0};
+        hn::StoreMaskBits(d, hn::Lt(c1, c0), packed);
+        uint64_t m = 0;
+        for (size_t k = 0; k < (lanes + 7) / 8; ++k) m |= static_cast<uint64_t>(packed[k]) << (8 * k);
+        decision |= (m & lane_mask) << s;
+      }
+    }
+
+    decisions[i] = decision;
+    for (int s = 0; s < 64; ++s) metric[s] = next[s];
+
+    if ((i & 255) == 255) {
+      uint16_t lo = metric[0];
+      for (int s = 1; s < 64; ++s) lo = metric[s] < lo ? metric[s] : lo;
+      for (int s = 0; s < 64; ++s) metric[s] = static_cast<uint16_t>(metric[s] - lo);
+    }
+  }
+
+  unsigned best = 0;
+  for (unsigned s = 1; s < 64; ++s)
+    if (metric[s] < metric[best]) best = s;
+  *final_state = best;
+}
+
 const char* SimdTargetImpl() { return hwy::TargetName(HWY_TARGET); }
 
 }  // namespace HWY_NAMESPACE
@@ -110,6 +176,7 @@ namespace exhdl {
 HWY_EXPORT(DdcQ15Impl);
 HWY_EXPORT(FirQ15Impl);
 HWY_EXPORT(SimdTargetImpl);
+HWY_EXPORT(ViterbiDvbtSimdImpl);
 
 uint16_t DdcQ15(const int16_t* in_i, const int16_t* in_q, size_t n, int16_t* out_i,
                 int16_t* out_q, const DdcParams& p) {
@@ -239,6 +306,192 @@ void ViterbiDvbt(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits)
     const unsigned lsb = (decisions[i] >> s) & 1;
     bits[i] = static_cast<uint8_t>(s >> 5);
     s = ((s << 1) & 63) | lsb;
+  }
+}
+
+void ViterbiDvbtSimd(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits) {
+  if (n == 0) return;
+  // expected (x, y) per next state and predecessor choice, as in Trellis
+  alignas(64) uint16_t expected[256];
+  for (unsigned s = 0; s < 64; ++s)
+    for (unsigned c = 0; c < 2; ++c) {
+      expected[128 * c + s] = kTrellis.x[s][c];
+      expected[128 * c + 64 + s] = kTrellis.y[s][c];
+    }
+
+  std::vector<uint64_t> decisions(n);
+  unsigned s = 0;
+  HWY_DYNAMIC_DISPATCH(ViterbiDvbtSimdImpl)(rx, n, start_unknown, decisions.data(), expected, &s);
+
+  for (size_t i = n; i-- > 0;) {
+    const unsigned lsb = (decisions[i] >> s) & 1;
+    bits[i] = static_cast<uint8_t>(s >> 5);
+    s = ((s << 1) & 63) | lsb;
+  }
+}
+
+// -- DVB-T outer stages ------------------------------------------------------
+
+void ForneyDeinterleave(const uint8_t* in, size_t n, uint8_t* out) {
+  constexpr int I = 12, M = 17;
+  // branch j: FIFO of (I - 1 - j) * M bytes, as a ring buffer
+  std::vector<uint8_t> fifo[I];
+  size_t pos[I] = {0};
+  for (int j = 0; j < I; ++j) fifo[j].assign((I - 1 - j) * M, 0);
+  for (size_t k = 0; k < n; ++k) {
+    const int j = static_cast<int>(k % I);
+    if (fifo[j].empty()) {
+      out[k] = in[k];
+      continue;
+    }
+    out[k] = fifo[j][pos[j]];
+    fifo[j][pos[j]] = in[k];
+    pos[j] = (pos[j] + 1) % fifo[j].size();
+  }
+}
+
+namespace {
+struct GF {
+  uint8_t exp[512];
+  uint8_t log[256];
+  GF() {
+    unsigned x = 1;
+    for (int i = 0; i < 255; ++i) {
+      exp[i] = static_cast<uint8_t>(x);
+      log[x] = static_cast<uint8_t>(i);
+      x <<= 1;
+      if (x & 0x100) x ^= 0x11D;
+    }
+    for (int i = 255; i < 512; ++i) exp[i] = exp[i - 255];
+    log[0] = 0;
+  }
+  uint8_t mul(uint8_t a, uint8_t b) const { return (a && b) ? exp[log[a] + log[b]] : 0; }
+  uint8_t div(uint8_t a, uint8_t b) const { return a ? exp[log[a] + 255 - log[b]] : 0; }
+  uint8_t pow(int i) const { return exp[((i % 255) + 255) % 255]; }
+};
+const GF kGF;
+
+// Evaluation, coefficients lowest degree first.
+uint8_t eval_low(const uint8_t* p, int len, uint8_t x) {
+  uint8_t acc = 0;
+  for (int i = len - 1; i >= 0; --i) acc = kGF.mul(acc, x) ^ p[i];
+  return acc;
+}
+
+// Same algorithm and failure rules as ExHdl.DVBT.ReedSolomon.decode/1.
+// Returns -1 on failure, else the number of corrected bytes.
+int rs_decode(const uint8_t* cw, uint8_t* packet) {
+  constexpr int N = 255, PARITY = 16, SHORT = 51;
+  uint8_t r[N] = {0};
+  std::memcpy(r + SHORT, cw, 204);
+
+  uint8_t syn[PARITY];
+  bool zero = true;
+  for (int i = 0; i < PARITY; ++i) {
+    const uint8_t x = kGF.pow(i);
+    uint8_t acc = 0;
+    for (int k = 0; k < N; ++k) acc = kGF.mul(acc, x) ^ r[k];
+    syn[i] = acc;
+    zero = zero && acc == 0;
+  }
+  std::memcpy(packet, cw, 188);
+  if (zero) return 0;
+
+  // Berlekamp-Massey (lowest degree first)
+  uint8_t c[PARITY + 1] = {1}, b[PARITY + 1] = {1}, t[PARITY + 1];
+  int l = 0, m = 1;
+  uint8_t bb = 1;
+  for (int rr = 0; rr < PARITY; ++rr) {
+    uint8_t dd = 0;
+    for (int i = 0; i <= l; ++i) dd ^= kGF.mul(c[i], syn[rr - i]);
+    if (dd == 0) {
+      ++m;
+      continue;
+    }
+    const uint8_t coef = kGF.div(dd, bb);
+    std::memcpy(t, c, sizeof c);
+    for (int i = 0; i + m <= PARITY; ++i) c[i + m] ^= kGF.mul(coef, b[i]);
+    if (2 * l <= rr) {
+      l = rr + 1 - l;
+      std::memcpy(b, t, sizeof b);
+      bb = dd;
+      m = 1;
+    } else {
+      ++m;
+    }
+  }
+  int deg = PARITY;
+  while (deg > 0 && c[deg] == 0) --deg;
+
+  int roots[PARITY];
+  int nroots = 0;
+  for (int p = 0; p < N && nroots <= PARITY; ++p)
+    if (eval_low(c, deg + 1, kGF.pow(-p)) == 0) {
+      if (nroots < PARITY) roots[nroots] = p;
+      ++nroots;
+    }
+  if (nroots != deg || deg > PARITY / 2) return -1;
+  for (int i = 0; i < nroots; ++i)
+    if (roots[i] >= N - SHORT) return -1;
+
+  // Omega = (S * Lambda) mod x^16, Lambda' (odd terms)
+  uint8_t omega[PARITY] = {0};
+  for (int k = 0; k < PARITY; ++k)
+    for (int i = 0; i <= k && i <= deg; ++i) omega[k] ^= kGF.mul(c[i], syn[k - i]);
+  uint8_t deriv[PARITY] = {0};
+  for (int i = 1; i <= deg; ++i)
+    if (i % 2 == 1) deriv[i - 1] = c[i];
+
+  for (int i = 0; i < nroots; ++i) {
+    const int p = roots[i];
+    const uint8_t xinv = kGF.pow(-p);
+    const uint8_t mag = kGF.mul(kGF.pow(p), kGF.div(eval_low(omega, PARITY, xinv), eval_low(deriv, deg, xinv)));
+    r[N - 1 - p] ^= mag;
+  }
+  std::memcpy(packet, r + SHORT, 188);
+  return deg;
+}
+
+// PRBS 1 + x^14 + x^15 from 100101010000000, as bytes for one group of 8
+// packets: 187 bytes, then 1 (sync, generator running but unused), ...
+struct Prbs {
+  uint8_t bytes[8 * 188];
+  Prbs() {
+    unsigned reg = 0x4A80;  // 0b100101010000000
+    for (int i = 0; i < 8 * 188; ++i) {
+      uint8_t byte = 0;
+      for (int k = 0; k < 8; ++k) {
+        const unsigned out = ((reg >> 1) ^ reg) & 1;
+        byte = static_cast<uint8_t>((byte << 1) | out);
+        reg = (reg >> 1) | (out << 14);
+      }
+      bytes[i] = byte;
+    }
+  }
+};
+const Prbs kPrbs;
+}  // namespace
+
+void RsDecodePackets(const uint8_t* in, size_t n_packets, uint8_t* out, size_t* corrected, size_t* failed) {
+  *corrected = 0;
+  *failed = 0;
+  for (size_t i = 0; i < n_packets; ++i) {
+    const int r = rs_decode(in + 204 * i, out + 188 * i);
+    if (r < 0) ++*failed; else *corrected += static_cast<size_t>(r);
+  }
+}
+
+void Descramble(const uint8_t* in, size_t n_groups, uint8_t* out) {
+  for (size_t g = 0; g < n_groups; ++g) {
+    const uint8_t* src = in + g * 1504;
+    uint8_t* dst = out + g * 1504;
+    // PRBS byte index: payload of packet p starts after p sync bytes
+    size_t prbs = 0;
+    for (int p = 0; p < 8; ++p) {
+      dst[188 * p] = 0x47;
+      if (p > 0) ++prbs;  // the generator runs through sync bytes 2..8
+      for (int k = 1; k < 188; ++k) dst[188 * p + k] = src[188 * p + k] ^ kPrbs.bytes[prbs++];
+    }
   }
 }
 

@@ -116,29 +116,46 @@ defmodule ExHdl.DVBT.Convolutional do
   as `decode/3`.
   """
   def decode_binary(bits, rate \\ {1, 2}, opts \\ []) do
+    rx = depunctured_binary(bits, rate)
+    unknown = Keyword.get(opts, :start, :zero) == :unknown
+
+    if Keyword.get(opts, :simd, true),
+      do: ExHdl.SIMD.NIF.viterbi_dvbt_simd(rx, unknown),
+      else: ExHdl.SIMD.NIF.viterbi_dvbt(rx, unknown)
+  end
+
+  @doc "Received code bits (0/1 bytes) as mother-code pairs with erasures (2) inserted."
+  def depunctured_binary(bits, rate) do
     {xp, yp} = @puncture[rate]
     per_period = Enum.sum(xp) + Enum.sum(yp)
     slots = Enum.zip(xp, yp) |> Enum.flat_map(fn {x, y} -> [x, y] end)
 
-    rx =
-      if rate == {1, 2} do
-        binary_part(bits, 0, div(byte_size(bits), 2) * 2)
-      else
-        # a whole number of puncturing periods, erasures (2) in the gaps
-        whole = div(byte_size(bits), per_period) * per_period
+    if rate == {1, 2} do
+      # as depuncture/2: a trailing single bit gets an erased partner
+      if rem(byte_size(bits), 2) == 1, do: bits <> <<2>>, else: bits
+    else
+      whole = div(byte_size(bits), per_period) * per_period
+      <<body::binary-size(whole), tail::binary>> = bits
 
-        for <<chunk::binary-size(per_period) <- binary_part(bits, 0, whole)>>, into: <<>> do
-          {out, _} =
-            Enum.map_reduce(slots, chunk, fn
-              1, <<b, rest::binary>> -> {b, rest}
-              0, rest -> {2, rest}
-            end)
-
-          :binary.list_to_bin(out)
+      full =
+        for <<chunk::binary-size(per_period) <- body>>, into: <<>> do
+          fill(slots, chunk)
         end
-      end
 
-    ExHdl.SIMD.NIF.viterbi_dvbt(rx, Keyword.get(opts, :start, :zero) == :unknown)
+      # an incomplete last period: received bits in order, erasures after
+      if tail == <<>>, do: full, else: full <> fill(slots, tail)
+    end
+  end
+
+  defp fill(slots, chunk) do
+    {out, _} =
+      Enum.map_reduce(slots, chunk, fn
+        1, <<b, rest::binary>> -> {b, rest}
+        1, <<>> -> {2, <<>>}
+        0, rest -> {2, rest}
+      end)
+
+    :binary.list_to_bin(out)
   end
 
   defp code(:e), do: 2

@@ -223,8 +223,8 @@ defmodule ExHdl.DVBT.FastJit do
   EXLA compiles it into a single fused computation instead of one call per
   tensor operation. Same results as the eager `ExHdl.DVBT.Fast` pipeline.
 
-  Input: `n` whole symbols starting at a superframe boundary. Output:
-  `u8[n * 1512 * v]` code bits for the Viterbi decoder.
+  Input: symbols starting at a superframe boundary (whole groups of 4 are
+  used). Output: `u8[n * 1512 * v]` code bits for the Viterbi decoder.
   """
   import Nx.Defn
   alias ExHdl.DVBT.{Fast, Inner, OFDM}
@@ -258,7 +258,8 @@ defmodule ExHdl.DVBT.FastJit do
 
   @doc "Runs the compiled front end; returns the code bits as a binary."
   def run(samples, freq_offset, constellation) do
-    n = div(Nx.size(samples), @sym)
+    # whole groups of 4 symbols (scattered pilot phases)
+    n = div(div(Nx.size(samples), @sym), 4) * 4
     x = Nx.slice(samples, [0], [n * @sym])
     f = compiled(n, constellation)
     f.(x, Nx.tensor(freq_offset, type: :f32), tables(constellation)) |> Nx.to_binary()
@@ -340,14 +341,16 @@ defmodule ExHdl.DVBT.FastJit do
       |> Nx.fft()
       |> Nx.take(t.bins, axis: 1)
 
-    # all four scattered pilot phases for every symbol, selected per row
-    row_phase = Nx.remainder(Nx.iota({n, 1}), 4)
+    # symbol i has scattered pilot phase i mod 4: group the symbols by
+    # phase with a reshape (n is a multiple of 4) and equalise each group
+    # with its own pilot pattern, then interleave the groups back
+    grouped = Nx.reshape(carriers, {div(n, 4), 4, 1705})
 
     eq =
-      equalise_phase(carriers, t, 0) * (row_phase == 0) +
-        equalise_phase(carriers, t, 1) * (row_phase == 1) +
-        equalise_phase(carriers, t, 2) * (row_phase == 2) +
-        equalise_phase(carriers, t, 3) * (row_phase == 3)
+      [0, 1, 2, 3]
+      |> phase_groups(grouped, t)
+      |> Nx.stack(axis: 1)
+      |> Nx.reshape({n, 1512})
 
     words = demap(eq, opts[:constellation])
 
@@ -357,6 +360,10 @@ defmodule ExHdl.DVBT.FastJit do
     deint = Nx.select(is_even, even, odd)
 
     bits_out(deint, t.bit_src, opts[:constellation])
+  end
+
+  deftransformp phase_groups(phases, grouped, t) do
+    for p <- phases, do: equalise_phase(grouped[[.., p, ..]], t, p)
   end
 
   deftransformp equalise_phase(carriers, t, p) do

@@ -64,24 +64,40 @@ observation above); not separated yet.
 
 ## Speed
 
-Same 2.3M samples (4 superframes), Neoverse-N1, one process each:
+Same 2.3M samples (4 superframes = 252 ms of signal at 9.14 Msamples/s),
+Neoverse-N1, one core for the decoding stages (`MIX_ENV=test mix run scripts/dvbt_realtime.exs`):
 
-| Receiver | Time | Throughput |
+| Receiver | Time for 252 ms of signal |
+|---|---|
+| gr-dtv (C++, VOLK) | 16.4 s |
+| ExHdl list reference (`Receiver.receive/2`) | 81 s |
+| ExHdl fast path, first version (eager EXLA + scalar Viterbi + Elixir outer stages) | 1.4-1.7 s |
+| **ExHdl fast path (`Receiver.receive_sync/2`)** | **about 220-250 ms: real time** |
+
+Per stage in the fast path (medians, the host is shared, +-20 %):
+
+| Stage | Time | How |
 |---|---|---|
-| gr-dtv (C++, VOLK) | 16.4 s | 0.14 Msamples/s |
-| ExHdl fast path (`Receiver.receive_sync/2`: front end as one jit-compiled EXLA computation + native Viterbi) | 1.1 s | 2.1 Msamples/s |
-| ExHdl list reference (`Receiver.receive/2`) | 81 s | 0.03 Msamples/s |
+| Acquisition | ~100 ms | once per stream (timing, frequency offset, superframe start) |
+| Front end | ~90 ms | one `defn` compiled by EXLA; symbols grouped by pilot phase with a reshape |
+| Viterbi | ~65-80 ms | Highway SIMD add-compare-select (scalar kernel: 344 ms) |
+| Reed-Solomon | ~17 ms | native; syndromes first, full decoding only for packets with errors |
+| Forney deinterleaver, descrambler, packing | ~10 ms | native / binaries |
 
-Real time for 2k DVB-T is 9.14 Msamples/s (252 ms of signal here). The
-front end went from 486 ms (Nx operations called one by one on EXLA) to
-142 ms when compiled as one `defn` with `Nx.Defn.jit` (fused); the
-remaining time is the scalar Viterbi (344 ms), Reed-Solomon in Elixir
-(253 ms, decodes every packet) and Elixir deinterleaving/descrambling. The
-compiled front end differs from the eager one in 47 of 3.3M decisions on a
-noisy signal (float rounding order after fusion); decoded output and
-packet counts are unchanged. In ExHdl's fast path the native Viterbi decoder runs at
-about 5 Mbit/s (scalar C++); the fast path makes the same hard decisions
-and decodes to the same output as the reference.
+Every kernel is bit-identical to its Elixir reference (property tests in
+`test/dvbt_e2e_test.exs`); the compiled front end differs from the eager
+one only in a few float rounding cases at decision boundaries, with the
+same decoded output.
+
+Real time is reached on one core with little margin. A streaming receiver
+could overlap the front end (EXLA) and the decoding stages on two cores;
+that needs Viterbi and deinterleaver state carried across blocks, which is
+not implemented (blocks are decoded independently here).
+
+The DVB-T stick chips (e.g. RTL2832U) do all of this in a small dedicated
+demodulator circuit; their SDR mode streams at most about 3 Msamples/s,
+too little for an 8 MHz DVB-T channel, so software DVB-T is not possible
+with them. ExHdl's FPGA path is the analogous hardware route.
 
 ## Not done yet
 

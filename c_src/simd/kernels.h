@@ -51,6 +51,22 @@ void FirQ15Scalar(const int16_t* ext, size_t n, const int32_t* taps, size_t n_ta
 // metric 0, otherwise state 0 starts at 0 and the others at 1000000.
 void ViterbiDvbt(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits);
 
+// Same decoder with the add-compare-select step vectorised (Highway):
+// bit-identical results.
+void ViterbiDvbtSimd(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits);
+
+// DVB-T outer receiver stages (EN 300 744 4.3.1-4.3.3), bit-identical to the
+// Elixir references in ExHdl.DVBT:
+// Forney deinterleaver (I = 12, M = 17), FIFOs starting at zero.
+void ForneyDeinterleave(const uint8_t* in, size_t n, uint8_t* out);
+// RS(204, 188) decoding of n_packets codewords into 188-byte packets; on
+// failure the uncorrected payload is copied. Returns corrected bytes and
+// failed packets.
+void RsDecodePackets(const uint8_t* in, size_t n_packets, uint8_t* out, size_t* corrected, size_t* failed);
+// Energy dispersal descrambling of whole groups of 8 packets (first sync
+// byte 0xB8 restored to 0x47).
+void Descramble(const uint8_t* in, size_t n_groups, uint8_t* out);
+
 // Name of the SIMD target chosen at runtime (e.g. "NEON", "SVE2", "AVX2").
 const char* SimdTarget();
 
