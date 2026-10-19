@@ -43,7 +43,7 @@ defmodule ExHdl.Passes.Recurrence do
   computed ahead and arrive at cycle 0).
 
     * `L == 1`: one sample per cycle.
-    * `ii: n` (n >= L): one sample every n cycles.
+    * `ii: n` (n >= L): one sample every n cycles; `ii: :auto` takes n = L.
     * `channels: n` (n >= L): n independent streams take turns; the loop
       holds one state per channel, and the whole kernel accepts one sample
       per cycle.
@@ -103,6 +103,9 @@ defmodule ExHdl.Passes.Recurrence do
 
   defp decide(%Scan{loop_latency: l} = scan, sched, opts) do
     case {Keyword.get(opts, :ii), Keyword.get(opts, :channels)} do
+      {:auto, nil} ->
+        {:ok, %{scan | ii: l, channels: 1, throughput: 1 / l}}
+
       {nil, nil} when l == 1 ->
         {:ok, %{scan | ii: 1, channels: 1, throughput: 1.0}}
 
