@@ -27,7 +27,7 @@ defmodule ExHdl.DVBT.Transmitter do
     |> Convolutional.encode(rate)
     |> Inner.group_bits(constellation)
     |> Inner.bit_interleave(constellation)
-    |> Enum.chunk_every(tuple_size(h), tuple_size(h), :discard)
+    |> Enum.chunk_every(ExHdl.Comm.Permutation.size(h), ExHdl.Comm.Permutation.size(h), :discard)
     |> Enum.with_index()
     |> Enum.map(fn {words, j} ->
       l = rem(j, @symbols_per_frame)

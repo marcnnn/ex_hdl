@@ -10,7 +10,7 @@ defmodule ExHdl.DVBT.EndToEndTest do
   use ExUnit.Case, async: false
   use ExUnitProperties
 
-  alias ExHdl.DVBT.{Channel, Convolutional, Fast, Inner, OFDM, Receiver, TestSignal, Transmitter}
+  alias ExHdl.DVBT.{Channel, Convolutional, Inner, OFDM, Receiver, TestSignal, Transmitter}
 
   @moduletag timeout: 900_000
 
@@ -47,11 +47,20 @@ defmodule ExHdl.DVBT.EndToEndTest do
       |> OFDM.demodulate(0)
       |> Enum.flat_map(fn {d, _} -> Enum.map(d, &Inner.demap_symbol(&1, :qpsk)) end)
 
+    generic = OFDM.ofdm()
+    constellation = Inner.constellation(:qpsk)
+
     fast =
-      symbols
-      |> Fast.carriers(68, sync.freq_offset)
-      |> Fast.equalise(0)
-      |> Fast.demap(:qpsk)
+      generic
+      |> ExHdl.Comm.OFDM.carriers(symbols, 68, sync.freq_offset)
+      |> then(&ExHdl.Comm.OFDM.equalise(generic, &1, 0))
+      |> then(
+        &ExHdl.Comm.Constellation.demap_tensor(
+          constellation,
+          &1,
+          ExHdl.Comm.Constellation.tensor_tables(constellation)
+        )
+      )
       |> Nx.to_flat_list()
 
     # the frequency correction starts at a different sample, which only

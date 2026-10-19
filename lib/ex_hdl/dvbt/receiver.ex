@@ -51,7 +51,7 @@ defmodule ExHdl.DVBT.Receiver do
     rate = Keyword.fetch!(opts, :code_rate)
     mode = Keyword.get(opts, :mode, :"2k")
     h = Inner.symbol_permutation(mode)
-    carriers = tuple_size(h)
+    carriers = ExHdl.Comm.Permutation.size(h)
 
     symbol_deint =
       words
@@ -90,10 +90,11 @@ defmodule ExHdl.DVBT.Receiver do
   end
 
   @doc """
-  Fast receiver: the front end compiled into one EXLA computation
-  (`ExHdl.DVBT.FastJit`) and the native Viterbi kernel. `samples` start at a superframe boundary unless
-  `:start` (sample index) and `:freq_offset` (subcarrier spacings) are
-  given, e.g. by `ExHdl.DVBT.Sync.acquire/2`. Same decisions and output as
+  Fast receiver: the generic OFDM front end compiled into one computation
+  (`ExHdl.Comm.OFDM.FrontEnd` with `front_end_spec/1`) and the native
+  Viterbi kernel. `samples` start at a superframe boundary unless `:start`
+  (sample index) and `:freq_offset` (subcarrier spacings) are given, e.g.
+  by `ExHdl.DVBT.Sync.acquire/2`. Same decisions and output as
   `receive/2`.
   """
   def receive_fast(samples, opts) do
@@ -102,7 +103,6 @@ defmodule ExHdl.DVBT.Receiver do
     start = Keyword.get(opts, :start, 0)
     backend = if Code.ensure_loaded?(EXLA.Backend), do: EXLA.Backend, else: Nx.BinaryBackend
 
-    # the whole front end as one compiled computation (ExHdl.DVBT.FastJit)
     bits =
       Nx.with_default_backend(backend, fn ->
         x =
@@ -110,13 +110,27 @@ defmodule ExHdl.DVBT.Receiver do
           |> Nx.backend_transfer(backend)
           |> then(&Nx.slice(&1, [start], [Nx.size(&1) - start]))
 
-        ExHdl.DVBT.FastJit.run(x, Keyword.get(opts, :freq_offset, 0.0), constellation)
+        ExHdl.Comm.OFDM.FrontEnd.run(
+          x,
+          Keyword.get(opts, :freq_offset, 0.0),
+          front_end_spec(constellation)
+        )
       end)
 
     bits
     |> Convolutional.decode_binary(rate, start: :unknown)
-    |> ExHdl.DVBT.Fast.pack()
+    |> ExHdl.Comm.Bits.pack()
     |> outer()
+  end
+
+  @doc "The DVB-T receiver front end as generic blocks: OFDM, mapping, deinterleavers."
+  def front_end_spec(constellation) do
+    %{
+      ofdm: ExHdl.DVBT.OFDM.ofdm(),
+      constellation: Inner.constellation(constellation),
+      cells: ExHdl.Comm.Permutation.inverse(Inner.symbol_permutation(:"2k")),
+      bits: ExHdl.Comm.Permutation.inverse(Inner.bit_interleaver(constellation))
+    }
   end
 
   @doc """

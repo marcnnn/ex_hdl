@@ -10,8 +10,9 @@ defmodule ExHdl.DVBT.OFDM do
   carriers carry data. Pilots are BPSK with amplitude 4/3 and sign from
   the PRBS `x^11 + x^2 + 1` (all ones at carrier 0).
 
-  `demodulate/3` is the float reference front end: FFT, channel estimate
-  at the pilots, linear interpolation across frequency, equalisation.
+  The frame structure is an `ExHdl.Comm.OFDM` configuration (`ofdm/0`,
+  pilot classes = scattered pilot phases); `modulate/2` adds the TPS
+  carriers and `demodulate/3` is the generic float reference front end.
   """
 
   @fft 2048
@@ -98,23 +99,55 @@ defmodule ExHdl.DVBT.OFDM do
   @doc "Transmitted pilot value (real) at carrier k: 4/3 * 2 * (1/2 - w_k)."
   def pilot_value(prbs, k), do: 4 / 3 * 2 * (0.5 - elem(prbs, k))
 
+  @doc "The generic OFDM configuration of the 2k mode."
+  def ofdm do
+    key = {__MODULE__, :ofdm}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        prbs = prbs()
+
+        classes =
+          for p <- 0..3 do
+            %{
+              pilots: Enum.map(pilots(p), &{&1, {pilot_value(prbs, &1), 0.0}}),
+              data: data_carriers(p)
+            }
+          end
+
+        o =
+          ExHdl.Comm.OFDM.new(
+            fft: @fft,
+            cp: @cp,
+            bins: ExHdl.Comm.OFDM.centered_bins(@fft, @offset - div(@fft, 2), @active),
+            classes: classes,
+            # gr-dtv scales the unnormalised IFFT by 1 / sqrt(27 * 1512)
+            scale: @fft / :math.sqrt(27 * 1512)
+          )
+
+        :persistent_term.put(key, o)
+        o
+
+      o ->
+        o
+    end
+  end
+
   @doc """
   Modulates OFDM symbols (float reference transmitter, as gr-dtv's
   `reference_signals` + cyclic prefixer): `symbols` is a list of
   `{data, l, frame}` with `data` the 1512 mapped data points `{re, im}` of
   symbol `l` (0..67) in frame `frame` (0..3). Continual and scattered
   pilots get amplitude 4/3, TPS carriers are DBPSK (amplitude 1) starting
-  from the PRBS reference in symbol 0. The unnormalised IFFT output is
-  scaled by `1 / sqrt(27 * 1512)` as in gr-dtv. Returns a complex tensor
-  of `length(symbols) * 2112` samples.
+  from the PRBS reference in symbol 0. Returns a complex tensor of
+  `length(symbols) * 2112` samples.
   """
   def modulate(symbols, tps_opts) do
     prbs = prbs()
-
     tps_bits = Map.new(0..3, &{&1, ExHdl.DVBT.TPS.bits(&1, tps_opts) |> List.to_tuple()})
 
     # DBPSK state per TPS carrier, carried across frames
-    {spectra, _} =
+    {generic, _} =
       Enum.map_reduce(symbols, nil, fn {data, l, frame}, tps_state ->
         tps_state =
           if l == 0 or tps_state == nil,
@@ -124,32 +157,11 @@ defmodule ExHdl.DVBT.OFDM do
                 {k, if(elem(tps_bits[frame], l) == 1, do: -v, else: v)}
               end)
 
-        carriers =
-          Map.new(Enum.zip(data_carriers(l), data))
-          |> Map.merge(Map.new(pilots(l), &{&1, {pilot_value(prbs, &1), 0.0}}))
-          |> Map.merge(Map.new(tps_state, fn {k, v} -> {k, {v, 0.0}} end))
-
-        bins =
-          for b <- 0..(@fft - 1) do
-            k = Integer.mod(b - @offset + div(@fft, 2), @fft)
-            {re, im} = Map.get(carriers, k, {0.0, 0.0})
-            if k < @active, do: Complex.new(re, im), else: Complex.new(0.0, 0.0)
-          end
-
-        {bins, tps_state}
+        extra = for {k, v} <- tps_state, do: {k, {v, 0.0}}
+        {{rem(l, 4), data, extra}, tps_state}
       end)
 
-    n = length(symbols)
-    scale = @fft / :math.sqrt(27 * 1512)
-
-    spectra
-    |> Nx.tensor(type: :c64)
-    |> Nx.ifft()
-    |> Nx.multiply(scale)
-    |> then(fn t ->
-      Nx.concatenate([Nx.slice_along_axis(t, @fft - @cp, @cp, axis: 1), t], axis: 1)
-    end)
-    |> Nx.reshape({n * (@fft + @cp)})
+    ExHdl.Comm.OFDM.modulate(ofdm(), generic)
   end
 
   @doc """
@@ -159,67 +171,6 @@ defmodule ExHdl.DVBT.OFDM do
   list of `{data, channel}` per symbol: `data` the 1512 equalised data
   carriers as `{re, im}` floats, ascending carrier order.
   """
-  def demodulate(samples, first_symbol, opts \\ []) do
-    prbs = Keyword.get_lazy(opts, :prbs, &prbs/0)
-    n = div(Nx.size(samples), @fft + @cp)
-
-    symbols =
-      samples
-      |> Nx.reshape({n, @fft + @cp})
-      |> Nx.slice_along_axis(@cp, @fft, axis: 1)
-      |> Nx.fft()
-      # FFT bin b holds carrier k with b = (k - 852) mod 2048
-      |> Nx.to_list()
-
-    symbols
-    |> Enum.with_index(first_symbol)
-    |> Enum.map(fn {bins, l} ->
-      bins = List.to_tuple(bins)
-
-      carrier = fn k ->
-        bins |> elem(Integer.mod(k + @offset - div(@fft, 2), @fft)) |> to_pair()
-      end
-
-      equalise(carrier, rem(l, 68), prbs)
-    end)
-  end
-
-  defp to_pair(%Complex{re: re, im: im}), do: {re, im}
-  defp to_pair(x) when is_number(x), do: {x * 1.0, 0.0}
-
-  # Channel estimate at the pilots, linear interpolation in between,
-  # data carriers divided by the estimate.
-  defp equalise(carrier, l, prbs) do
-    pilot_gains =
-      for k <- pilots(l) do
-        {re, im} = carrier.(k)
-        p = pilot_value(prbs, k)
-        {k, {re / p, im / p}}
-      end
-
-    channel = interpolate(pilot_gains)
-
-    data =
-      for k <- data_carriers(l) do
-        {hr, hi} = Map.fetch!(channel, k)
-        {re, im} = carrier.(k)
-        d = hr * hr + hi * hi
-        {(re * hr + im * hi) / d, (im * hr - re * hi) / d}
-      end
-
-    {data, channel}
-  end
-
-  defp interpolate(pilot_gains) do
-    pilot_gains
-    |> Enum.chunk_every(2, 1, :discard)
-    |> Enum.flat_map(fn [{k0, {r0, i0}}, {k1, {r1, i1}}] ->
-      for k <- k0..(k1 - 1) do
-        t = (k - k0) / (k1 - k0)
-        {k, {r0 + (r1 - r0) * t, i0 + (i1 - i0) * t}}
-      end
-    end)
-    |> Map.new()
-    |> Map.put(elem(List.last(pilot_gains), 0), elem(List.last(pilot_gains), 1))
-  end
+  def demodulate(samples, first_symbol, _opts \\ []),
+    do: ExHdl.Comm.OFDM.demodulate(ofdm(), samples, rem(first_symbol, 4))
 end

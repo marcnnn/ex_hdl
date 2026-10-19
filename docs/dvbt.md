@@ -8,16 +8,22 @@ Debian image (`test/gnuradio/debian/Containerfile`).
 
 Configuration: 2k, QPSK, code rate 1/2, guard interval 1/32, cell id 0.
 
-| Module | Stage |
-|---|---|
-| `ExHdl.DVBT.EnergyDispersal` | PRBS randomisation (scramble/descramble) |
-| `ExHdl.DVBT.ReedSolomon` | RS(204, 188, t = 8) encode/decode (Berlekamp-Massey, Chien, Forney) |
-| `ExHdl.DVBT.OuterInterleaver` | Forney interleaver I = 12, M = 17 |
-| `ExHdl.DVBT.Convolutional` | K = 7 code, all puncturing rates, hard-decision Viterbi |
-| `ExHdl.DVBT.Inner` | bit/symbol interleaving, Gray mapping, hard demapping |
-| `ExHdl.DVBT.TPS` | TPS bits incl. BCH(67, 53) parity |
-| `ExHdl.DVBT.OFDM` | pilots, TPS DBPSK, IFFT modulation; FFT, channel estimate, equalisation |
-| `ExHdl.DVBT.Transmitter`, `ExHdl.DVBT.Receiver` | complete chains |
+DVB-T is a configuration of the generic blocks in `ExHdl.Comm`
+(`docs/comm.md`); the `ExHdl.DVBT` modules hold the standard's parameters
+and tables and only the parts that exist in DVB-T alone (TPS, superframe
+sync).
+
+| Module | Stage | Generic block |
+|---|---|---|
+| `ExHdl.DVBT.EnergyDispersal` | PRBS randomisation (scramble/descramble) | `LFSR`, `Scrambler` |
+| `ExHdl.DVBT.ReedSolomon` | RS(204, 188, t = 8) | `ReedSolomon` |
+| `ExHdl.DVBT.OuterInterleaver` | Forney interleaver I = 12, M = 17 | `ConvInterleaver` |
+| `ExHdl.DVBT.Convolutional` | K = 7 code, all puncturing rates, hard-decision Viterbi | `Convolutional` |
+| `ExHdl.DVBT.Inner` | bit/symbol interleaving, Gray mapping, hard demapping | `Permutation`, `Constellation` |
+| `ExHdl.DVBT.TPS` | TPS bits incl. BCH(67, 53) parity | DVB-T only |
+| `ExHdl.DVBT.OFDM` | pilot classes, TPS DBPSK | `OFDM`, `OFDM.FrontEnd` |
+| `ExHdl.DVBT.Sync` | timing, frequency offset, superframe start from TPS | `OFDM.Sync` + DVB-T TPS sync |
+| `ExHdl.DVBT.Transmitter`, `ExHdl.DVBT.Receiver` | complete chains | |
 
 ## Stage by stage
 
@@ -79,13 +85,13 @@ Per stage in the fast path (medians, the host is shared, +-20 %):
 | Stage | Time | How |
 |---|---|---|
 | Acquisition | ~100 ms | once per stream (timing, frequency offset, superframe start) |
-| Front end | ~90 ms | one `defn` compiled by EXLA; symbols grouped by pilot phase with a reshape |
+| Front end | ~90-100 ms | `ExHdl.Comm.OFDM.FrontEnd`: one `defn` compiled by EXLA; symbols grouped by pilot class with a reshape |
 | Viterbi | ~65-80 ms | Highway SIMD add-compare-select (scalar kernel: 344 ms) |
-| Reed-Solomon | ~17 ms | native; syndromes first, full decoding only for packets with errors |
+| Reed-Solomon | ~12-17 ms | native; syndromes first, full decoding only for packets with errors |
 | Forney deinterleaver, descrambler, packing | ~10 ms | native / binaries |
 
 Every kernel is bit-identical to its Elixir reference (property tests in
-`test/dvbt_e2e_test.exs`); the compiled front end differs from the eager
+`test/comm/` and `test/dvbt_e2e_test.exs`); the compiled front end differs from the eager
 one only in a few float rounding cases at decision boundaries, with the
 same decoded output.
 
@@ -103,7 +109,7 @@ with them. ExHdl's FPGA path is the analogous hardware route.
 
 - Soft-decision Viterbi.
 - Fixed-point front end (integer FFT, conjugate-multiply equalisation) and
-  its SIMD/FPGA paths; a SIMD Viterbi.
+  its SIMD/FPGA paths.
 - 16/64-QAM, other code rates and 8k mode are implemented in the building
   blocks but not yet compared against gr-dtv.
 

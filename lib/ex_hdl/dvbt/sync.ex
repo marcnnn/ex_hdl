@@ -4,10 +4,9 @@ defmodule ExHdl.DVBT.Sync do
   the first superframe start in a stream of baseband samples.
 
     1. Symbol timing and fractional frequency offset from the cyclic
-       prefix correlation (van de Beek, Sandell, Boerjesson 1997), summed
-       over many symbols.
+       prefix correlation (`ExHdl.Comm.OFDM.Sync.timing/3`).
     2. Integer frequency offset from the energy of the continual pilots
-       (boosted to 4/3) over candidate bin shifts.
+       (boosted to 4/3, `ExHdl.Comm.OFDM.Sync.integer_offset/7`).
     3. Frame position from TPS: DBPSK bits from consecutive symbols, the
        16-bit synchronisation word (inverted in frames 2 and 4), and the
        frame number (TPS bits 23-24).
@@ -16,7 +15,7 @@ defmodule ExHdl.DVBT.Sync do
   check.
   """
   import Bitwise
-  alias ExHdl.DVBT.{Fast, OFDM}
+  alias ExHdl.DVBT.OFDM
 
   @fft 2048
   @cp 64
@@ -46,13 +45,26 @@ defmodule ExHdl.DVBT.Sync do
     if total < (m + 1) * @sym + 2 * 272 * @sym do
       {:error, :too_short}
     else
-      {theta, frac} = timing(x, m)
-      int = integer_offset(x, theta, frac, Keyword.get(opts, :max_integer_offset, 16))
+      o = OFDM.ofdm()
+      {theta, frac} = ExHdl.Comm.OFDM.Sync.timing(o, x, m)
+
+      int =
+        ExHdl.Comm.OFDM.Sync.integer_offset(
+          o,
+          x,
+          theta,
+          frac,
+          Keyword.get(opts, :max_integer_offset, 16),
+          OFDM.continual_pilots()
+        )
+
       offset = frac + int
 
       # enough symbols to see a frame start and the frame number
       n = min(div(total - theta, @sym), 272 + 2 * 68)
-      carriers = x |> Nx.slice([theta], [n * @sym]) |> Fast.carriers(n, offset)
+
+      carriers =
+        ExHdl.Comm.OFDM.carriers(OFDM.ofdm(), Nx.slice(x, [theta], [n * @sym]), n, offset)
 
       with {:ok, frame_start, frame} <- frame_position(carriers) do
         # first superframe start at or after frame_start
@@ -68,58 +80,6 @@ defmodule ExHdl.DVBT.Sync do
          }}
       end
     end
-  end
-
-  # Correlation of each sample with the one 2048 later, summed over the
-  # 64-sample cyclic prefix window at every offset theta, and over m symbols.
-  defp timing(x, m) do
-    len = (m + 1) * @sym
-    a = Nx.slice(x, [0], [len])
-    b = Nx.slice(x, [@fft], [len])
-    p = Nx.multiply(a, Nx.conjugate(b))
-    c = Nx.cumulative_sum(Nx.concatenate([Nx.tensor([Complex.new(0.0, 0.0)], type: :c64), p]))
-    window = Nx.subtract(Nx.slice(c, [@cp], [len - @cp + 1]), Nx.slice(c, [0], [len - @cp + 1]))
-    gamma = window |> Nx.slice([0], [m * @sym]) |> Nx.reshape({m, @sym}) |> Nx.sum(axes: [0])
-    theta = gamma |> Nx.abs() |> Nx.argmax() |> Nx.to_number()
-    g = gamma[theta] |> Nx.to_number()
-    # r[k] r*[k + N] = |s|^2 exp(-j 2 pi eps) for an offset of eps subcarriers
-    {theta, -:math.atan2(Complex.imag(g), Complex.real(g)) / (2 * :math.pi())}
-  end
-
-  # Continual pilot energy for each candidate bin shift (fractional offset
-  # already removed), over a few symbols.
-  defp integer_offset(x, theta, frac, max_shift) do
-    n = 8
-
-    spectra =
-      x
-      |> Nx.slice([theta], [n * @sym])
-      |> Nx.multiply(
-        Nx.exp(
-          Nx.multiply(
-            Nx.complex(0.0, -2 * :math.pi() * frac / @fft),
-            Nx.iota({n * @sym}, type: :f32)
-          )
-        )
-      )
-      |> Nx.reshape({n, @sym})
-      |> Nx.slice_along_axis(@cp, @fft, axis: 1)
-      |> Nx.fft()
-
-    power =
-      spectra
-      |> Nx.abs()
-      |> Nx.pow(2)
-      |> Nx.sum(axes: [0])
-      |> Nx.to_flat_list()
-      |> List.to_tuple()
-
-    -max_shift..max_shift
-    |> Enum.max_by(fn d ->
-      Enum.reduce(OFDM.continual_pilots(), 0.0, fn k, acc ->
-        acc + elem(power, Integer.mod(k + 172 - div(@fft, 2) + d, @fft))
-      end)
-    end)
   end
 
   # TPS bit l of a frame = phase flip on the TPS carriers between symbols
