@@ -11,6 +11,10 @@ defmodule ExHdl.IR.Scan do
     * `channels` - independent streams interleaved through the loop.
     * `throughput` - samples per cycle over all channels.
     * `pipeline_latency` - cycles from a sample to its output.
+    * `timing` - the `ExHdl.Target.Timing` model the schedule was made for.
+    * `args` - the kernel's arguments in order, each
+      `%{arg: i, role: :sample | :state | :param | :opts, leaves: [%{index:, type:, shape:}]}`
+      where `index` is the Nx parameter index of the tensor leaf.
   """
   defstruct [
     :graph,
@@ -23,7 +27,9 @@ defmodule ExHdl.IR.Scan do
     :ii,
     :channels,
     :throughput,
-    :pipeline_latency
+    :pipeline_latency,
+    :timing,
+    args: []
   ]
 end
 
@@ -80,7 +86,8 @@ defmodule ExHdl.Passes.Recurrence do
       critical_path:
         if(worst && Map.has_key?(sched, worst), do: path(graph, sched, worst), else: []),
       loop_latency: loop_latency,
-      pipeline_latency: pipeline_latency
+      pipeline_latency: pipeline_latency,
+      timing: timing
     }
 
     decide(scan, sched, opts)

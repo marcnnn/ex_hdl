@@ -39,13 +39,44 @@ defmodule ExHdl.DSP do
       with :ok <- check_state_types(args, state_arg, graph, next_ids),
            {:ok, scan} <-
              ExHdl.Passes.Recurrence.run(graph, state_params, out_ids, next_ids, opts) do
-        {:ok, scan}
+        {:ok, %{scan | args: arg_layout(args, state_arg)}}
       else
         {:error, message} when is_binary(message) -> {:error, %ScheduleError{message: message}}
         {:error, %ScheduleError{}} = error -> error
       end
     end
   end
+
+  # Role and tensor leaves of every argument: argument 0 is the sample,
+  # `state_arg` the state, keyword lists are kernel options, the rest params.
+  defp arg_layout(args, state_arg) do
+    {layout, _} =
+      args
+      |> Enum.with_index()
+      |> Enum.map_reduce(0, fn {arg, i}, next ->
+        role =
+          cond do
+            is_list(arg) -> :opts
+            i == 0 -> :sample
+            i == state_arg -> :state
+            true -> :param
+          end
+
+        templates = if role == :opts, do: [], else: arg |> leaves() |> Enum.map(&template/1)
+
+        leaves =
+          templates
+          |> Enum.with_index(next)
+          |> Enum.map(fn {t, index} -> %{index: index, type: t.type, shape: t.shape} end)
+
+        {%{arg: i, role: role, leaves: leaves}, next + length(leaves)}
+      end)
+
+    layout
+  end
+
+  defp template(n) when is_number(n), do: n |> Nx.tensor() |> Nx.to_template()
+  defp template(t), do: Nx.to_template(t)
 
   defp check_scan_shape({_output, _next_state}), do: :ok
 
