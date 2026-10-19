@@ -47,6 +47,21 @@ defmodule ExHdl.DSP do
     end
   end
 
+  @doc """
+  Analyses a stream kernel (`analyze_scan/3`) and generates its
+  SystemVerilog module (`ExHdl.Backends.SystemVerilog.Scan.generate/2`).
+  `opts` go to both (`:state`, `:ii`/`:channels`, timing, `:name`,
+  `:init`, `:param_names`).
+
+  Returns `{:ok, %ExHdl.Backends.SystemVerilog.Scan.Design{}}` or the
+  analysis error; raises `ExHdl.Backends.SystemVerilog.Scan.UnsupportedError`.
+  """
+  def scan_to_sv(fun, args, opts) do
+    with {:ok, scan} <- analyze_scan(fun, args, opts) do
+      {:ok, ExHdl.Backends.SystemVerilog.Scan.generate(scan, opts)}
+    end
+  end
+
   # Role and tensor leaves of every argument: argument 0 is the sample,
   # `state_arg` the state, keyword lists are kernel options, the rest params.
   defp arg_layout(args, state_arg) do

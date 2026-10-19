@@ -64,4 +64,18 @@ defmodule ExHdl.ScanSvTest do
       SV.generate(scan, init: Nx.tensor([1, 2], type: :s16))
     end
   end
+
+  @tag :tmp_dir
+  test "mix ex_hdl.gen.sv writes the kernels of a module", %{tmp_dir: dir} do
+    Mix.shell(Mix.Shell.Process)
+    on_exit(fn -> Mix.shell(Mix.Shell.IO) end)
+
+    Mix.Tasks.ExHdl.Gen.Sv.run(["ExHdl.Test.SdrKernels", "--out", dir])
+
+    for name <- ~w(ddc_q15 fir_complex_q15 one_pole_q15 one_pole_q15_ch5) do
+      assert File.read!(Path.join(dir, "#{name}.sv")) =~ "module #{name} ("
+    end
+
+    assert_received {:mix_shell, :info, ["  latency 5, ii 5, channels 1, tdata 16 -> 16 bits"]}
+  end
 end
