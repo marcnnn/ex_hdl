@@ -34,7 +34,7 @@ CXXFLAGS += -march=armv7-a -mfpu=neon -mfloat-abi=hard -DHWY_BROKEN_ARM7_WITHOUT
 endif
 endif
 CPPFLAGS += -I$(HWY_DIR) -I$(ERTS_INCLUDE_DIR) -I$(FINE_INCLUDE_DIR) -Ic_src/simd
-LDFLAGS  += -shared
+LDFLAGS  += -shared -ldl
 
 all: $(NIF)
 

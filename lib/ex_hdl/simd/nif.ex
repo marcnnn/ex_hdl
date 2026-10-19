@@ -24,4 +24,6 @@ defmodule ExHdl.SIMD.NIF do
   def fir_q15(_history, _x, _taps, _round), do: :erlang.nif_error(:not_loaded)
   def one_pole_q15(_x, _y0, _alpha, _round), do: :erlang.nif_error(:not_loaded)
   def simd_target, do: :erlang.nif_error(:not_loaded)
+  def kernel_load(_path), do: :erlang.nif_error(:not_loaded)
+  def kernel_run(_kernel, _inputs, _output_bytes), do: :erlang.nif_error(:not_loaded)
 end

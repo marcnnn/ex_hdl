@@ -16,6 +16,8 @@ software and SystemVerilog hardware.
 | GNU Radio 3.10 comparison: float instance vs GNU Radio, fixed-point variants vs float instance | done |
 | Nx-to-SystemVerilog, retiming, `accelerator` DSL | planned |
 | CPU: compiled block loop (EXLA) and Highway SIMD NIF for Q15 blocks, bit-identical; see `docs/cpu_backend.md` | done |
+| `ExHdl.SIMD.Compiler`: native code generated from integer `defn` graphs (Nx compiler, like EXLA) | done |
+| Quantized ML: int8 fully connected layer with TFLite semantics (`ExHdl.ML.Quantized`) | first block |
 | openXC7 bitstream builder, Zynq runtime | planned |
 
 ## Development
@@ -50,4 +52,5 @@ fetches Google Highway on first build), and Verilator 5 for co-simulation.
 
 ```sh
 MIX_ENV=test mix run scripts/bench_cpu.exs   # CPU throughput per implementation
+MIX_ENV=test mix run scripts/bench_ml.exs    # int8 dense layer: generated code vs EXLA
 ```

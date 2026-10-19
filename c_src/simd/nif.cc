@@ -2,11 +2,13 @@
 // Inputs are read zero-copy from binaries; outputs are written directly
 // into new binaries. All functions run on dirty CPU schedulers.
 
+#include <dlfcn.h>
 #include <erl_nif.h>
 
 #include <cstring>
 #include <fine.hpp>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -111,6 +113,57 @@ std::tuple<fine::Term, fine::Term, int64_t> ddc_q15_scalar(ErlNifEnv* env, ErlNi
   return {out_i_term, out_q_term, last};
 }
 FINE_NIF(ddc_q15_scalar, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
+// -- generated kernels (ExHdl.SIMD.Compiler) --------------------------------
+// A generated shared library exports
+//   extern "C" void exhdl_kernel(const void* const* in, void* const* out);
+// with all shapes and types compiled in.
+
+using KernelFn = void (*)(const void* const*, void* const*);
+
+struct Kernel {
+  void* handle = nullptr;
+  KernelFn fn = nullptr;
+
+  explicit Kernel(const std::string& path) {
+    handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) throw std::runtime_error(std::string("kernel_load: ") + dlerror());
+    fn = reinterpret_cast<KernelFn>(dlsym(handle, "exhdl_kernel"));
+    if (fn == nullptr) throw std::runtime_error("kernel_load: exhdl_kernel not found");
+  }
+
+  void destructor(ErlNifEnv*) {
+    if (handle != nullptr) dlclose(handle);
+    handle = nullptr;
+  }
+};
+FINE_RESOURCE(Kernel);
+
+fine::ResourcePtr<Kernel> kernel_load(ErlNifEnv*, std::string path) { return fine::make_resource<Kernel>(path); }
+FINE_NIF(kernel_load, ERL_NIF_DIRTY_JOB_IO_BOUND);
+
+// Inputs are read in place; outputs are allocated as binaries of the given
+// byte sizes and filled by the kernel.
+std::vector<fine::Term> kernel_run(ErlNifEnv* env, fine::ResourcePtr<Kernel> kernel, std::vector<ErlNifBinary> inputs,
+                                   std::vector<int64_t> output_bytes) {
+  std::vector<const void*> in;
+  in.reserve(inputs.size());
+  for (const auto& bin : inputs) in.push_back(bin.data);
+
+  std::vector<fine::Term> terms;
+  std::vector<void*> out;
+  for (int64_t bytes : output_bytes) {
+    ERL_NIF_TERM term;
+    auto* data = enif_make_new_binary(env, static_cast<size_t>(bytes), &term);
+    if (data == nullptr) throw std::runtime_error("kernel_run: cannot allocate output");
+    terms.push_back(fine::Term(term));
+    out.push_back(data);
+  }
+
+  kernel->fn(in.data(), out.data());
+  return terms;
+}
+FINE_NIF(kernel_run, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 std::string simd_target(ErlNifEnv*) { return exhdl::SimdTarget(); }
 FINE_NIF(simd_target, 0);

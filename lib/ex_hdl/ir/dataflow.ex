@@ -26,7 +26,7 @@ defmodule ExHdl.IR.Dataflow do
 
   # Ops whose tensor arguments are all data inputs and whose remaining
   # arguments do not matter for value ranges.
-  @elementwise ~w(add subtract multiply negate abs min max clip select
+  @elementwise ~w(add subtract multiply quotient remainder negate abs min max clip select
                   right_shift left_shift bitwise_and bitwise_or bitwise_xor
                   equal not_equal less less_equal greater greater_equal
                   logical_and logical_or logical_not)a
@@ -62,6 +62,31 @@ defmodule ExHdl.IR.Dataflow do
       %{op: :constant, attrs: v} -> [v]
       %{op: op, inputs: [x]} when op in [:as_type, :reshape] -> constant_values(graph, x)
       _ -> nil
+    end
+  end
+
+  @doc """
+  The constant tensor behind a node (looking through `as_type` and
+  `reshape`), shaped like the node, or `nil`.
+  """
+  def constant_tensor(%__MODULE__{} = graph, id) do
+    node = graph.nodes[id]
+
+    case node do
+      %{op: :tensor, attrs: t} ->
+        t
+
+      %{op: :constant, attrs: v} ->
+        Nx.broadcast(Nx.tensor(v), node.shape)
+
+      %{op: op, inputs: [x]} when op in [:as_type, :reshape] ->
+        case constant_tensor(graph, x) do
+          nil -> nil
+          t -> Nx.reshape(t, node.shape)
+        end
+
+      _ ->
+        nil
     end
   end
 
@@ -133,6 +158,15 @@ defmodule ExHdl.IR.Dataflow do
     add(state, key, :dot, [a_id, b_id], {contract_a, batch_a, contract_b, batch_b}, t)
   end
 
+  # View operations keep their axis arguments for index remapping.
+  defp convert_op(:broadcast, [x, _shape, axes], t, key, state),
+    do: view(:broadcast, x, axes, t, key, state)
+
+  defp convert_op(:transpose, [x, axes], t, key, state),
+    do: view(:transpose, x, axes, t, key, state)
+
+  defp convert_op(:squeeze, [x, axes], t, key, state), do: view(:squeeze, x, axes, t, key, state)
+
   defp convert_op(:sum, [x, opts], t, key, state) do
     {id, state} = convert(x, state)
     add(state, key, :sum, [id], opts, t)
@@ -185,6 +219,11 @@ defmodule ExHdl.IR.Dataflow do
   defp convert_op(op, _args, t, _key, _state) do
     raise ArgumentError,
           "ExHdl does not support Nx operation #{inspect(op)} (#{inspect(t.type)}#{inspect(t.shape)}) yet"
+  end
+
+  defp view(op, x, attrs, t, key, state) do
+    {id, state} = convert(x, state)
+    add(state, key, op, [id], attrs, t)
   end
 
   defp unary(op, x, t, key, state) do

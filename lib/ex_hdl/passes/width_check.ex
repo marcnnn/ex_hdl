@@ -155,15 +155,45 @@ defmodule ExHdl.Passes.WidthCheck do
     IntSet.range(n * lo, n * hi)
   end
 
-  # With a constant operand c (e.g. FIR taps): sum over i of x * c_i, so the
-  # bound is exact per coefficient. Otherwise n times the product hull.
-  defp transfer(%{op: :dot, inputs: [a_id, b_id], attrs: {contract_a, _, _, _}}, [a, b], graph, _) do
-    case {Dataflow.constant_values(graph, a_id), Dataflow.constant_values(graph, b_id)} do
-      {_, coeffs} when is_list(coeffs) ->
-        weighted_sum(a, coeffs)
+  # Truncating integer division (C semantics). Corners are exact when the
+  # divisor range excludes 0; the remainder is bounded by the divisor.
+  defp transfer(%{op: :quotient} = node, [x, d], _graph, _) do
+    if IntSet.member?(d, 0) do
+      IntSet.of_type(node.type)
+    else
+      {xl, xh} = IntSet.bounds(x)
+      {dl, dh} = IntSet.bounds(d)
+      values = for a <- [xl, xh], b <- [dl, dh], do: div(a, b)
+      IntSet.range(Enum.min(values), Enum.max(values))
+    end
+  end
 
-      {coeffs, _} when is_list(coeffs) ->
-        weighted_sum(b, coeffs)
+  defp transfer(%{op: :remainder} = node, [x, d], _graph, _) do
+    if IntSet.member?(d, 0) do
+      IntSet.of_type(node.type)
+    else
+      {dl, dh} = IntSet.bounds(d)
+      {xl, xh} = IntSet.bounds(x)
+      m = max(abs(dl), abs(dh)) - 1
+      IntSet.range(if(xl < 0, do: -m, else: 0), if(xh > 0, do: m, else: 0))
+    end
+  end
+
+  # With a constant operand (FIR taps, a weight matrix): for every output,
+  # sum over k of x * c_k, so the bound is exact per coefficient vector; the
+  # result is the union over all outputs. Otherwise n times the product hull.
+  defp transfer(
+         %{op: :dot, inputs: [a_id, b_id], attrs: {contract_a, _, contract_b, _}},
+         [a, b],
+         graph,
+         _
+       ) do
+    case {Dataflow.constant_tensor(graph, a_id), Dataflow.constant_tensor(graph, b_id)} do
+      {_, %Nx.Tensor{} = c} ->
+        per_output_weighted_sum(a, c, hd(contract_b))
+
+      {%Nx.Tensor{} = c, _} ->
+        per_output_weighted_sum(b, c, hd(contract_a))
 
       _ ->
         shape = graph.nodes[a_id].shape
@@ -187,6 +217,22 @@ defmodule ExHdl.Passes.WidthCheck do
         |> IntSet.from_list()
         |> IntSet.widen(),
       else: table
+  end
+
+  # One coefficient vector per output (the constant's free indices), each
+  # summed exactly; the union of the per-output ranges.
+  defp per_output_weighted_sum(x, c, axis) do
+    rank = tuple_size(c.shape)
+    k = elem(c.shape, axis)
+    others = for d <- 0..(rank - 1)//1, d != axis, do: d
+
+    c
+    |> Nx.transpose(axes: others ++ [axis])
+    |> Nx.reshape({div(Nx.size(c), k), k})
+    |> Nx.to_list()
+    |> Enum.map(&weighted_sum(x, &1))
+    |> Enum.reduce(&IntSet.union/2)
+    |> IntSet.widen()
   end
 
   defp weighted_sum(x, coeffs) do
