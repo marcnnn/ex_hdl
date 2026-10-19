@@ -41,6 +41,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
   import Bitwise
 
+  alias ExHdl.Backends.SystemVerilog.Fir
   alias ExHdl.IR.Scan
   alias ExHdl.Passes.Schedule
   alias ExHdl.Target.Timing
@@ -119,22 +120,22 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
     layout = layout(scan, opts)
     {state_stage, sched} = schedule(scan, timing, layout)
+    c = context(scan, timing, layout, state_stage, sched, %{})
 
-    c = %{
-      graph: graph,
-      timing: timing,
-      sched: sched,
-      layout: layout,
-      state_stage: state_stage,
-      channels: scan.channels,
-      sigs: %{},
-      decls: [],
-      assigns: [],
-      ffs: [],
-      blocks: [],
-      elems: %{},
-      roms: %{}
-    }
+    # FIR dot products become DSP chains with their own latency: plan them
+    # on a first lowering, then schedule and lower again.
+    fir =
+      if Keyword.get(opts, :fir, :chain) == :chain,
+        do: Fir.plan(Enum.reduce(graph.order, c, &lower/2), scan),
+        else: %{}
+
+    c =
+      if fir == %{} do
+        c
+      else
+        {state_stage, sched} = schedule(scan, timing, layout, Fir.costs(fir))
+        context(scan, timing, layout, state_stage, sched, fir)
+      end
 
     c = Enum.reduce(graph.order, c, &lower/2)
     {c, write_stage, state_writes} = state_writes(c, scan)
@@ -175,6 +176,27 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       params: layout.params,
       in_width: layout.in_width,
       out_width: layout.out_width
+    }
+  end
+
+  defp context(scan, timing, layout, state_stage, sched, fir) do
+    %{
+      graph: scan.graph,
+      timing: timing,
+      sched: sched,
+      layout: layout,
+      state_stage: state_stage,
+      channels: scan.channels,
+      sigs: %{},
+      defs: %{},
+      decls: [],
+      assigns: [],
+      ffs: [],
+      sample_ffs: [],
+      blocks: [],
+      elems: %{},
+      roms: %{},
+      fir: fir
     }
   end
 
@@ -313,9 +335,9 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   # Static values (parameter ports, constants and what is computed only from
   # them) need no pipeline registers. The state is read in the stage where
   # every non-static value entering the loop is available.
-  defp schedule(scan, timing, layout) do
+  defp schedule(scan, timing, layout, costs \\ %{}) do
     graph = scan.graph
-    base = Schedule.asap(graph, graph.order, timing)
+    base = Schedule.asap(graph, graph.order, timing, %{}, costs)
     static = static_nodes(graph, layout)
 
     next_ids = flatten(scan.next_state)
@@ -336,7 +358,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       |> Enum.max(fn -> 0 end)
 
     seeds = Map.new(scan.state_params, &{&1, {stage, 0.0}})
-    {stage, Schedule.asap(graph, graph.order, timing, seeds)}
+    {stage, Schedule.asap(graph, graph.order, timing, seeds, costs)}
   end
 
   defp available({c, t}) when t == 0, do: c
@@ -397,7 +419,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       field = l.inputs_by_index[index] ->
         map_c(0..(size(node.shape) - 1), c, fn e, c ->
           name = elem_name(node, e)
-          c = new_sig(c, name, fmt, 0, false)
+          c = c |> new_sig(name, fmt, 0, false) |> define(name, {:in, index, e})
           lo = field.offset + e * field.bits
           {assign(c, name, "s_axis_tdata[#{lo} +: #{bits(fmt)}]"), {:sig, name}}
         end)
@@ -506,6 +528,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       i = multi(e, node.shape)
       refs = Enum.map(operands, fn {shape, src} -> elem(src, broadcast_index(i, shape)) end)
       name = elem_name(node, e)
+      c = define(c, name, {:op, op, refs})
 
       if op == :multiply and match?({:reg, _, _}, c.sched[node.id].cost) and
            not Enum.all?(refs, &static?(c, &1)) do
@@ -570,34 +593,24 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   end
 
   defp lower_op(:dot, node, c) do
-    [a, b] = node.inputs
-    {contract_a, batch_a, contract_b, _batch_b} = node.attrs
+    {_contract_a, batch_a, _contract_b, _batch_b} = node.attrs
 
     if batch_a != [], do: unsupported!(c.graph, node, "with batch axes is not supported")
 
-    a_shape = c.graph.nodes[a].shape
-    b_shape = c.graph.nodes[b].shape
-    free_a = Enum.reject(0..(tuple_size(a_shape) - 1)//1, &(&1 in contract_a))
-    free_b = Enum.reject(0..(tuple_size(b_shape) - 1)//1, &(&1 in contract_b))
-    contract_shape = contract_a |> Enum.map(&elem(a_shape, &1)) |> List.to_tuple()
-    n_free_a = length(free_a)
     stage = exec_stage(c, node.id)
     {:reg, k, _} = c.sched[node.id].cost
     fmt = IntSet.bit_width(node.range)
+    id = node.id
 
     0..(size(node.shape) - 1)
     |> map_c(c, fn e, c ->
-      i = multi(e, node.shape)
-      {ia, ib} = Enum.split(i, n_free_a)
+      case c.fir do
+        %{^id => %{elems: %{^e => groups}}} ->
+          fir_chains(c, elem_name(node, e), groups, stage, k, fmt)
 
-      pairs =
-        for j <- indices(contract_shape) do
-          ai = place(tuple_size(a_shape), Enum.zip(free_a, ia) ++ Enum.zip(contract_a, j))
-          bi = place(tuple_size(b_shape), Enum.zip(free_b, ib) ++ Enum.zip(contract_b, j))
-          {elem(c.elems[a], flat(ai, a_shape)), elem(c.elems[b], flat(bi, b_shape))}
-        end
-
-      reduce_products(c, elem_name(node, e), pairs, stage, k, fmt)
+        _ ->
+          reduce_products(c, elem_name(node, e), Fir.dot_pairs(c, node, e), stage, k, fmt)
+      end
     end)
   end
 
@@ -630,12 +643,13 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
   # -- state -------------------------------------------------------------------------------
 
-  defp state_read(c, node, _state) do
+  defp state_read(c, node, state) do
     fmt = IntSet.bit_width(node.range)
     s = c.state_stage
 
     map_c(0..(size(node.shape) - 1), c, fn e, c ->
       name = elem_name(node, e)
+      c = define(c, name, {:state, state.index, e, Enum.at(state.init, e)})
 
       if c.channels == 1 do
         {new_sig(c, name, fmt, s, true), {:sig, name}}
@@ -933,6 +947,116 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     adder_tree(c, name, Enum.reverse(terms), stage + dl, k - dl, fmt)
   end
 
+  # FIR groups of one dot element (`Fir`) as transposed DSP chains from
+  # `stage`, summed by an adder tree when there are several.
+  defp fir_chains(c, name, groups, stage, k, fmt) do
+    {c, terms} =
+      groups
+      |> Enum.with_index()
+      |> map_c(c, fn {g, gi}, c -> fir_chain(c, "#{name}_f#{gi}", g, stage) end)
+
+    lg = groups |> Enum.map(&Fir.chain_latency/1) |> Enum.max()
+    adder_tree(c, name, terms, stage + lg, k - lg, fmt)
+  end
+
+  # One transposed chain: `P_k <= m_k * h_k + P_k+1`, P registers advancing
+  # once per sample (enabled with the sample leaving the multiply stage).
+  # Returns `{c, {P_0 ref, range}}`.
+  defp fir_chain(c, name, g, stage) do
+    lg = Fir.chain_latency(g)
+    p_stage = stage + lg
+    {c, x, xw} = operand(c, g.x0, stage)
+    x_range = ref_range(c, g.x0)
+
+    {c, acc} =
+      g
+      |> Fir.terms()
+      |> Enum.reverse()
+      |> Enum.reduce({c, nil}, fn {k, h, second}, {c, next} ->
+        if h == 0 and next == nil do
+          {c, nil}
+        else
+          {c, product, range} =
+            if h == 0 do
+              {c, nil, IntSet.singleton(0)}
+            else
+              fir_product(c, "#{name}_#{k}", g, {x, xw, x_range}, h, second, stage)
+            end
+
+          range = if next, do: IntSet.add(range, elem(next, 1)), else: range
+          p = "#{name}_p#{k}"
+          w = signed_bits(IntSet.bit_width(range))
+
+          sum =
+            [product, next && elem(next, 0)]
+            |> Enum.reject(&is_nil/1)
+            |> Enum.map_join(" + ", &"#{w}'(#{&1})")
+
+          c = c |> new_sig(p, {:s, w}, p_stage, true) |> sample_ff(p_stage - 1, p, sum)
+
+          {c, {p, range}}
+        end
+      end)
+
+    case acc do
+      nil -> {c, {{:lit, 0}, IntSet.singleton(0)}}
+      {p, range} -> {c, {{:sig, p}, range}}
+    end
+  end
+
+  # Input registers (and pre-adder register) of one tap; returns the
+  # product expression `m * h` and its range.
+  defp fir_product(c, name, g, {x, xw, x_range}, h, second, stage) do
+    xr = "#{name}_x"
+    c = c |> new_sig(xr, {:s, xw}, stage + 1, true) |> ff(xr, x)
+
+    {c, m, m_range} =
+      case {g.fold, second} do
+        {nil, _} ->
+          {c, xr, x_range}
+
+        {_, nil} ->
+          ad = "#{name}_ad"
+          c = c |> new_sig(ad, {:s, xw}, stage + 2, true) |> ff(ad, xr)
+          {c, ad, x_range}
+
+        {_, {sign, ref}} ->
+          {c, y, yw} = operand(c, ref, stage)
+          yr = "#{name}_y"
+          c = c |> new_sig(yr, {:s, yw}, stage + 1, true) |> ff(yr, y)
+
+          range =
+            if sign == :add,
+              do: IntSet.add(x_range, ref_range(c, ref)),
+              else: IntSet.subtract(x_range, ref_range(c, ref))
+
+          aw = signed_bits(IntSet.bit_width(range))
+          ad = "#{name}_ad"
+          op = if sign == :add, do: "+", else: "-"
+
+          c =
+            c
+            |> new_sig(ad, {:s, aw}, stage + 2, true)
+            |> ff(ad, "#{aw}'(#{aw}'(#{xr}) #{op} #{aw}'(#{yr}))")
+
+          {c, ad, range}
+      end
+
+    {c, "#{m} * #{tap(h)}", IntSet.multiply(m_range, IntSet.singleton(h))}
+  end
+
+  # A tap constant for a DSP multiplier input. Synthesis drops the constant
+  # zero LSBs of an even tap, and Yosys then no longer packs the post-adder
+  # into the DSP; `tap_lsb` (high only in reset, when the partial sums are
+  # held at zero anyway) keeps the LSB a signal.
+  defp tap(h) do
+    w = lit_bits(h)
+    if band(h, 1) == 1, do: lit(h, w), else: "$signed(#{lit(h, w)} | #{w}'(tap_lsb))"
+  end
+
+  defp sample_ff(c, stage, name, expr),
+    do: %{c | sample_ffs: [{stage, name, expr} | c.sample_ffs]}
+
   # Registered binary adder tree from `stage`; the result is delayed to
   # `stage + k` and cut to `fmt`.
   defp adder_tree(c, name, terms, stage, k, fmt) do
@@ -1072,6 +1196,9 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     %{c | sigs: Map.put(c.sigs, name, sig), decls: [name | c.decls]}
   end
 
+  # What a signal computes, for `Fir.plan/2`.
+  defp define(c, name, def), do: %{c | defs: Map.put(c.defs, name, def)}
+
   defp assign(c, name, expr), do: %{c | assigns: ["  assign #{name} = #{expr};\n" | c.assigns]}
   defp ff(c, name, expr), do: %{c | ffs: ["      #{name} <= #{expr};\n" | c.ffs]}
 
@@ -1201,6 +1328,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       end
 
     {state_decls, state_logic} = state_logic(d.state_writes, n, s, w)
+    sample_logic = sample_logic(c)
 
     ffs =
       case c.ffs do
@@ -1244,6 +1372,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       ffs,
       "\n",
       state_logic,
+      sample_logic,
       "\n",
       "  assign m_axis_tvalid = #{valid(d.latency)};\n",
       "  assign m_axis_tdata = #{d.out_expr};\n",
@@ -1288,6 +1417,36 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
         "  end\n"
       ]
     }
+  end
+
+  # Registers that advance once per sample (FIR partial sums): written with
+  # the sample leaving their input stage, reset to zero.
+  defp sample_logic(%{sample_ffs: []}), do: []
+
+  defp sample_logic(c) do
+    blocks =
+      c.sample_ffs
+      |> Enum.reverse()
+      |> Enum.group_by(&elem(&1, 0))
+      |> Enum.sort()
+      |> Enum.map(fn {stage, ffs} ->
+        [
+          "  always_ff @(posedge clk) begin\n",
+          "    if (!rst_n) begin\n",
+          Enum.map(ffs, fn {_, name, _} -> "      #{name} <= '0;\n" end),
+          "    end else if (ce && #{valid(stage)}) begin\n",
+          Enum.map(ffs, fn {_, name, expr} -> "      #{name} <= #{expr};\n" end),
+          "    end\n",
+          "  end\n"
+        ]
+      end)
+
+    [
+      "\n  // FIR partial sums: advance once per sample\n",
+      "  logic tap_lsb;\n",
+      "  assign tap_lsb = !rst_n;\n",
+      blocks
+    ]
   end
 
   defp valid(0), do: "vld_0"
@@ -1367,11 +1526,6 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
           do: if(elem(shape, k) == 1, do: 0, else: Enum.at(i, k + offset))
 
     flat(idx, shape)
-  end
-
-  defp place(rank, pairs) do
-    m = Map.new(pairs)
-    for k <- 0..(rank - 1)//1, do: Map.fetch!(m, k)
   end
 
   defp swap({a, b}), do: {b, a}

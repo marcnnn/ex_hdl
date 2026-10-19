@@ -15,11 +15,13 @@ defmodule ExHdl.Passes.Schedule do
 
   @doc """
   Schedules the nodes in `ids` (topological order). Inputs outside `ids`
-  are taken from `seeds` or arrive at `{0, 0.0}`.
+  are taken from `seeds` or arrive at `{0, 0.0}`. `costs` overrides the
+  timing model's cost of single nodes (`%{id => cost}`), e.g. for a dot
+  product the generator maps onto a DSP cascade.
 
   Returns `%{id => %{at: arrival, cost: cost, from: critical_input | nil}}`.
   """
-  def asap(graph, ids, %Timing{} = timing, seeds \\ %{}) do
+  def asap(graph, ids, %Timing{} = timing, seeds \\ %{}, costs \\ %{}) do
     period = Timing.period_ns(timing)
 
     Enum.reduce(ids, %{}, fn id, sched ->
@@ -30,7 +32,7 @@ defmodule ExHdl.Passes.Schedule do
         |> Enum.map(fn input -> {arrival(sched, seeds, input), input} end)
         |> Enum.max_by(fn {at, _} -> at end, fn -> {Map.get(seeds, id, {0, 0.0}), nil} end)
 
-      cost = Timing.cost(node, graph, timing)
+      cost = Map.get_lazy(costs, id, fn -> Timing.cost(node, graph, timing) end)
       Map.put(sched, id, %{at: advance(start, cost, period), cost: cost, from: from})
     end)
   end
