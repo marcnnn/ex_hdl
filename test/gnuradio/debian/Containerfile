@@ -1,0 +1,6 @@
+# GNU Radio with gr-dtv (DVB-T), which Fedora's package does not build.
+# Used to generate DVB-T reference data; not needed to run the tests.
+FROM docker.io/library/debian:trixie
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gnuradio python3-numpy \
+ && rm -rf /var/lib/apt/lists/*

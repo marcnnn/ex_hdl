@@ -18,6 +18,7 @@ software and SystemVerilog hardware.
 | CPU: compiled block loop (EXLA) and Highway SIMD NIF for Q15 blocks, bit-identical; see `docs/cpu_backend.md` | done |
 | `ExHdl.SIMD.Compiler`: native code generated from integer `defn` graphs (Nx compiler, like EXLA) | done |
 | Quantized ML: int8 fully connected layer with TFLite semantics (`ExHdl.ML.Quantized`) | first block |
+| DVB-T transmitter and receiver (2k), compared with GNU Radio gr-dtv stage by stage and end to end; see `docs/dvbt.md` | reference implementation |
 | openXC7 bitstream builder, Zynq runtime | planned |
 
 ## Development
