@@ -9,6 +9,8 @@
 #include "hwy/highway.h"
 #include "kernels.h"
 
+#include <vector>
+
 HWY_BEFORE_NAMESPACE();
 namespace exhdl {
 namespace HWY_NAMESPACE {
@@ -172,6 +174,72 @@ int16_t OnePoleQ15(const int16_t* x, size_t n, int16_t y0, int16_t alpha, bool r
     out[j] = static_cast<int16_t>(y);
   }
   return static_cast<int16_t>(y);
+}
+
+// -- DVB-T Viterbi ----------------------------------------------------------
+
+namespace {
+struct Trellis {
+  // for next state s and predecessor choice c (0: lsb 0, 1: lsb 1)
+  uint8_t prev[64][2];
+  uint8_t x[64][2];
+  uint8_t y[64][2];
+
+  Trellis() {
+    auto parity = [](unsigned v) { return static_cast<uint8_t>(__builtin_popcount(v) & 1); };
+    for (unsigned s = 0; s < 64; ++s) {
+      const unsigned b = s >> 5;
+      for (unsigned c = 0; c < 2; ++c) {
+        const unsigned p = ((s << 1) & 63) | c;
+        const unsigned reg = (b << 6) | p;
+        prev[s][c] = static_cast<uint8_t>(p);
+        x[s][c] = parity(reg & 0171);
+        y[s][c] = parity(reg & 0133);
+      }
+    }
+  }
+};
+const Trellis kTrellis;
+
+inline uint32_t dist(uint8_t r, uint8_t e) { return r == 2 ? 0 : (r != e); }
+}  // namespace
+
+void ViterbiDvbt(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits) {
+  uint32_t metric[64], next[64];
+  for (int s = 0; s < 64; ++s) metric[s] = start_unknown || s == 0 ? 0 : 1000000;
+  std::vector<uint64_t> decisions(n);
+
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t rx_x = rx[2 * i], rx_y = rx[2 * i + 1];
+    // branch metric of each expected output pair (x, y)
+    const uint32_t bm[2][2] = {{dist(rx_x, 0) + dist(rx_y, 0), dist(rx_x, 0) + dist(rx_y, 1)},
+                               {dist(rx_x, 1) + dist(rx_y, 0), dist(rx_x, 1) + dist(rx_y, 1)}};
+    uint64_t mask = 0;
+    for (unsigned s = 0; s < 64; ++s) {
+      const uint32_t c0 = metric[kTrellis.prev[s][0]] + bm[kTrellis.x[s][0]][kTrellis.y[s][0]];
+      const uint32_t c1 = metric[kTrellis.prev[s][1]] + bm[kTrellis.x[s][1]][kTrellis.y[s][1]];
+      const bool take1 = c1 < c0;
+      next[s] = take1 ? c1 : c0;
+      mask |= static_cast<uint64_t>(take1) << s;
+    }
+    decisions[i] = mask;
+    // Renormalise (subtracting the minimum keeps every comparison) so the
+    // metrics stay small for arbitrarily long blocks.
+    uint32_t lo = next[0];
+    for (int s = 1; s < 64; ++s) lo = next[s] < lo ? next[s] : lo;
+    for (int s = 0; s < 64; ++s) metric[s] = next[s] - lo;
+  }
+
+  unsigned best = 0;
+  for (unsigned s = 1; s < 64; ++s)
+    if (metric[s] < metric[best]) best = s;
+
+  unsigned s = best;
+  for (size_t i = n; i-- > 0;) {
+    const unsigned lsb = (decisions[i] >> s) & 1;
+    bits[i] = static_cast<uint8_t>(s >> 5);
+    s = ((s << 1) & 63) | lsb;
+  }
 }
 
 }  // namespace exhdl

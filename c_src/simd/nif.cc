@@ -114,6 +114,19 @@ std::tuple<fine::Term, fine::Term, int64_t> ddc_q15_scalar(ErlNifEnv* env, ErlNi
 }
 FINE_NIF(ddc_q15_scalar, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
+// rx: one byte per received code bit position of the mother code, pairs
+// (x, y), values 0/1 or 2 for an erasure. Returns one byte (0/1) per pair.
+fine::Term viterbi_dvbt(ErlNifEnv* env, ErlNifBinary rx, bool start_unknown) {
+  if (rx.size % 2 != 0) throw std::invalid_argument("viterbi_dvbt: rx must hold (x, y) pairs");
+  for (size_t i = 0; i < rx.size; ++i)
+    if (rx.data[i] > 2) throw std::invalid_argument("viterbi_dvbt: values must be 0, 1 or 2");
+  const size_t n = rx.size / 2;
+  auto [out_term, out] = new_binary<uint8_t>(env, n);
+  exhdl::ViterbiDvbt(rx.data, n, start_unknown, out);
+  return out_term;
+}
+FINE_NIF(viterbi_dvbt, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+
 // -- generated kernels (ExHdl.SIMD.Compiler) --------------------------------
 // A generated shared library exports
 //   extern "C" void exhdl_kernel(const void* const* in, void* const* out);

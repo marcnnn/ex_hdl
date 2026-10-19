@@ -67,4 +67,27 @@ defmodule ExHdl.DVBT.Channel do
     {im, _} = Nx.Random.normal(key, 0.0, sigma, shape: Nx.shape(samples), type: :f32)
     Nx.add(samples, Nx.complex(re, im))
   end
+
+  @doc "Carrier frequency offset of `subcarriers` subcarrier spacings (2k: 4464 Hz each)."
+  def frequency_offset(samples, subcarriers) do
+    n = Nx.size(samples)
+
+    Nx.multiply(
+      samples,
+      Nx.exp(
+        Nx.multiply(
+          Nx.complex(0.0, 2 * :math.pi() * subcarriers / 2048),
+          Nx.iota({n}, type: :f32)
+        )
+      )
+    )
+  end
+
+  @doc "Prepends `n` samples of low-level noise: the receiver does not know where the signal starts."
+  def delay(samples, 0, _seed), do: samples
+
+  def delay(samples, n, seed) do
+    {noise, _} = Nx.Random.normal(Nx.Random.key(seed), 0.0, 0.05, shape: {n, 2}, type: :f32)
+    Nx.concatenate([Nx.complex(noise[[.., 0]], noise[[.., 1]]), samples])
+  end
 end

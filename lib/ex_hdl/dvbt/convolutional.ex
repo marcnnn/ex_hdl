@@ -97,6 +97,55 @@ defmodule ExHdl.DVBT.Convolutional do
   the best end state (smallest number on ties).
   """
   def decode(bits, rate \\ {1, 2}, opts \\ []) do
+    if ExHdl.SIMD.available?() and Keyword.get(opts, :native, true) do
+      # native kernel, bit-identical to decode_reference/3
+      rx =
+        for {x, y} <- depuncture(bits, rate), into: <<>>, do: <<code(x), code(y)>>
+
+      rx
+      |> ExHdl.SIMD.NIF.viterbi_dvbt(Keyword.get(opts, :start, :zero) == :unknown)
+      |> :binary.bin_to_list()
+    else
+      decode_reference(bits, rate, opts)
+    end
+  end
+
+  @doc """
+  Native decoding of received code bits given as a binary of 0/1 bytes
+  (punctured stream); returns the decoded bits as 0/1 bytes. Same result
+  as `decode/3`.
+  """
+  def decode_binary(bits, rate \\ {1, 2}, opts \\ []) do
+    {xp, yp} = @puncture[rate]
+    per_period = Enum.sum(xp) + Enum.sum(yp)
+    slots = Enum.zip(xp, yp) |> Enum.flat_map(fn {x, y} -> [x, y] end)
+
+    rx =
+      if rate == {1, 2} do
+        binary_part(bits, 0, div(byte_size(bits), 2) * 2)
+      else
+        # a whole number of puncturing periods, erasures (2) in the gaps
+        whole = div(byte_size(bits), per_period) * per_period
+
+        for <<chunk::binary-size(per_period) <- binary_part(bits, 0, whole)>>, into: <<>> do
+          {out, _} =
+            Enum.map_reduce(slots, chunk, fn
+              1, <<b, rest::binary>> -> {b, rest}
+              0, rest -> {2, rest}
+            end)
+
+          :binary.list_to_bin(out)
+        end
+      end
+
+    ExHdl.SIMD.NIF.viterbi_dvbt(rx, Keyword.get(opts, :start, :zero) == :unknown)
+  end
+
+  defp code(:e), do: 2
+  defp code(b), do: b
+
+  @doc "The Elixir reference Viterbi decoder (same results as the native one)."
+  def decode_reference(bits, rate \\ {1, 2}, opts \\ []) do
     pairs = depuncture(bits, rate)
     inf = 1_000_000
 

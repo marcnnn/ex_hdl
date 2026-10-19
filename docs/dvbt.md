@@ -34,44 +34,62 @@ Observation: on the same noise-free signal gr-dtv's equalised output drops
 to 40-67 dB against the ideal points for some symbols (its per-symbol
 frequency/sampling corrections), while hard decisions stay correct.
 
-## End to end with noise
+## End to end: fair comparison
 
-ExHdl's transmitter (4 superframes, 1008 packets) -> AWGN -> both receivers
-on the identical samples (`MIX_ENV=test mix run scripts/dvbt_compare.exs 4.0 4.5 5.0`):
+ExHdl's transmitter (4 superframes, 1008 packets), then an unknown start
+(3333 samples of noise in front), a carrier frequency offset of 1.37
+subcarriers (6.1 kHz) and AWGN. Both receivers synchronise themselves and
+decode the identical samples (`MIX_ENV=test mix run scripts/dvbt_compare.exs 4.0 4.5 5.0`):
 
 | SNR per sample (C/N in band) | ExHdl correct packets | gr-dtv correct packets |
 |---|---|---|
 | noise-free | 992 / 992 | 640 / 640 |
-| 3.5 dB (4.3 dB) | 0.1 % | 0 % |
-| 4.0 dB (4.8 dB) | 50 % | 3 % |
-| 4.5 dB (5.3 dB) | 98.6 % | 91.9 % |
-| 5.0 dB (5.8 dB) | 100 % | 100 % |
-| 6.0 / 8.0 dB | 100 % | 100 % |
+| 3.5 dB (4.3 dB) | 0.2 % | 0 % |
+| 4.0 dB (4.8 dB) | 49.1 % | 9.9 % |
+| 4.5 dB (5.3 dB) | 99.3 % | 91.9 % |
+| 5.0 / 6.0 / 8.0 dB | 100 % | 100 % |
 
-Both receivers use hard-decision Viterbi decoding; with soft decisions the
-standard expects quasi-error-free reception around C/N 3.1 dB, about 2 dB
-lower. The comparison is not yet like for like:
+ExHdl's acquisition (`ExHdl.DVBT.Sync`): cyclic prefix correlation for
+timing and fractional frequency offset, continual pilot energy for the
+integer offset, TPS sync word and frame number for the superframe start;
+it finds the start to the sample and the offset to within 0.003
+subcarriers. ExHdl outputs from the first complete superframe, gr-dtv one
+superframe later (it locks during the first).
 
-- ExHdl's receiver gets the symbol timing (no acquisition yet); gr-dtv
-  synchronises itself (cyclic prefix correlation, TPS) and starts output
-  one superframe later.
-- ExHdl's Viterbi traces back over the whole block; gr-dtv uses a short
-  traceback (about 40 bits at rate 1/2).
+Both use hard-decision Viterbi decoding; with soft decisions the standard
+expects quasi-error-free reception around C/N 3.1 dB. The remaining 0.3-0.5
+dB advantage near the threshold is plausibly ExHdl's full-block Viterbi
+traceback (gr-dtv: about 40 bits at rate 1/2) and its equaliser (see the
+observation above); not separated yet.
+
+## Speed
+
+Same 2.3M samples (4 superframes), Neoverse-N1, one process each:
+
+| Receiver | Time | Throughput |
+|---|---|---|
+| gr-dtv (C++, VOLK) | 16.4 s | 0.14 Msamples/s |
+| ExHdl fast path (`Receiver.receive_sync/2`: EXLA tensors + native Viterbi) | 1.4-1.7 s | 1.4-1.6 Msamples/s |
+| ExHdl list reference (`Receiver.receive/2`) | 81 s | 0.03 Msamples/s |
+
+Real time for 2k DVB-T is 9.14 Msamples/s; neither receiver reaches it on
+this machine. In ExHdl's fast path the native Viterbi decoder runs at
+about 5 Mbit/s (scalar C++); the fast path makes the same hard decisions
+and decodes to the same output as the reference.
 
 ## Not done yet
 
-- Acquisition (timing, frequency offset) in ExHdl's receiver.
 - Soft-decision Viterbi.
 - Fixed-point front end (integer FFT, conjugate-multiply equalisation) and
-  the SIMD/FPGA paths; the Elixir reference receiver needs about 70 s for
-  4 superframes.
+  its SIMD/FPGA paths; a SIMD Viterbi.
 - 16/64-QAM, other code rates and 8k mode are implemented in the building
   blocks but not yet compared against gr-dtv.
 
 ## Running
 
 ```sh
-mix test --only dvbt                                   # stage comparisons (25 s)
+mix test --only dvbt                                   # stage comparisons and end to end
+mix test --only dvbt_live                              # end to end against gr-dtv (podman)
 scripts/dvbt_golden.sh                                 # regenerate reference data
 MIX_ENV=test mix run scripts/dvbt_compare.exs 4.5 5.0  # end to end, needs podman image
 ```

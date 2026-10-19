@@ -77,6 +77,71 @@ defmodule ExHdl.DVBT.Receiver do
       |> Enum.map(fn b -> Enum.reduce(b, 0, &(&2 * 2 + &1)) end)
       |> :binary.list_to_bin()
 
+    bytes
+    |> outer()
+    |> Map.update!(
+      :stages,
+      &Map.merge(&1, %{
+        symbol_deinterleaver: symbol_deint,
+        bit_deinterleaver: bit_deint,
+        viterbi: bytes
+      })
+    )
+  end
+
+  @doc """
+  Fast receiver (`ExHdl.DVBT.Fast`): tensors on EXLA when available and the
+  native Viterbi kernel. `samples` start at a superframe boundary unless
+  `:start` (sample index) and `:freq_offset` (subcarrier spacings) are
+  given, e.g. by `ExHdl.DVBT.Sync.acquire/2`. Same decisions and output as
+  `receive/2`.
+  """
+  def receive_fast(samples, opts) do
+    constellation = Keyword.fetch!(opts, :constellation)
+    rate = Keyword.fetch!(opts, :code_rate)
+    start = Keyword.get(opts, :start, 0)
+    backend = if Code.ensure_loaded?(EXLA.Backend), do: EXLA.Backend, else: Nx.BinaryBackend
+
+    bits =
+      Nx.with_default_backend(backend, fn ->
+        x =
+          samples
+          |> Nx.backend_transfer(backend)
+          |> then(&Nx.slice(&1, [start], [Nx.size(&1) - start]))
+
+        n = div(Nx.size(x), 2112)
+
+        x
+        |> ExHdl.DVBT.Fast.carriers(n, Keyword.get(opts, :freq_offset, 0.0))
+        |> ExHdl.DVBT.Fast.equalise(0)
+        |> ExHdl.DVBT.Fast.demap(constellation)
+        |> ExHdl.DVBT.Fast.symbol_deinterleave(0)
+        |> ExHdl.DVBT.Fast.bit_deinterleave(constellation)
+        |> ExHdl.DVBT.Fast.unpack(constellation)
+      end)
+
+    bits
+    |> Convolutional.decode_binary(rate, start: :unknown)
+    |> ExHdl.DVBT.Fast.pack()
+    |> outer()
+  end
+
+  @doc """
+  Complete receiver: acquisition (`ExHdl.DVBT.Sync.acquire/2`: timing,
+  frequency offset, superframe start) followed by `receive_fast/2`.
+  Returns the `receive_fast/2` result with the acquisition under `:sync`,
+  or `{:error, reason}`.
+  """
+  def receive_sync(samples, opts) do
+    with {:ok, sync} <- ExHdl.DVBT.Sync.acquire(samples, opts) do
+      samples
+      |> receive_fast(Keyword.merge(opts, start: sync.start, freq_offset: sync.freq_offset))
+      |> Map.put(:sync, sync)
+    end
+  end
+
+  # Forney deinterleaver, RS decoding and descrambling of decoded bytes.
+  defp outer(bytes) do
     deinterleaved = OuterInterleaver.deinterleave(bytes)
     # the first 11 packets are FIFO fill
     payload =
@@ -111,13 +176,7 @@ defmodule ExHdl.DVBT.Receiver do
       ts: ts,
       rs_corrected: corrected,
       rs_failed: failed,
-      stages: %{
-        symbol_deinterleaver: symbol_deint,
-        bit_deinterleaver: bit_deint,
-        viterbi: bytes,
-        outer_deinterleaver: deinterleaved,
-        reed_solomon: rs_out
-      }
+      stages: %{outer_deinterleaver: deinterleaved, reed_solomon: rs_out}
     }
   end
 end

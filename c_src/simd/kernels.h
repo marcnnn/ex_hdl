@@ -43,6 +43,14 @@ uint16_t DdcQ15Scalar(const int16_t* in_i, const int16_t* in_q, size_t n, int16_
 void FirQ15Scalar(const int16_t* ext, size_t n, const int32_t* taps, size_t n_taps, bool round,
                   int16_t* out);
 
+// Hard-decision Viterbi decoder for the DVB-T inner code (K = 7, G1 = 171,
+// G2 = 133 octal), bit-identical to ExHdl.DVBT.Convolutional's reference:
+// `rx` holds n (x, y) pairs as bytes 0/1, or 2 for an erasure (punctured);
+// ties keep the predecessor with the smaller state, the traceback starts at
+// the best final state (smallest on ties). `start_unknown` gives all states
+// metric 0, otherwise state 0 starts at 0 and the others at 1000000.
+void ViterbiDvbt(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits);
+
 // Name of the SIMD target chosen at runtime (e.g. "NEON", "SVE2", "AVX2").
 const char* SimdTarget();
 
