@@ -70,7 +70,9 @@ defmodule ExHdl.DSPScanTest do
   end
 
   describe "FIR with constant taps" do
-    @taps "test/dsp_cases/fir_ccf_31tap.json"
+    # the taps of ex_sdr's GNU Radio comparison case
+    @taps Mix.Project.deps_paths()[:ex_sdr]
+          |> Path.join("test/dsp_cases/fir_ccf_31tap.json")
           |> File.read!()
           |> JSON.decode!()
           |> get_in(["params", "taps"])
@@ -94,7 +96,7 @@ defmodule ExHdl.DSPScanTest do
       dots =
         for n <- Map.values(scan.graph.nodes),
             n.op == :dot,
-            do: ExHdl.Types.IntSet.bounds(n.range)
+            do: NxFixed.IntSet.bounds(n.range)
 
       assert [{lo, hi}, {lo, hi}] = dots
       # extremes: -32768 on positive taps and 32767 on negative ones, and vice versa
@@ -116,9 +118,18 @@ defmodule ExHdl.DSPScanTest do
   end
 
   test "overflow is still reported first" do
-    assert {:error, %DSP.RangeError{message: msg}} =
+    assert {:error, %NxFixed.RangeError{message: msg}} =
              DSP.analyze_scan(&K.overflowing_scan_step/2, [t(:s16), t(:s16)], state: 1)
 
     assert msg =~ "add needs -65536..65534"
+  end
+
+  test "ex_sdr's format-generic ddc block as Q15 runs at one sample per cycle" do
+    f = NxFixed.Num.q(16, 15)
+    s = %NxFixed.Fixed{t: Nx.template({}, :s16), frac: 15}
+    args = [{s, s}, Nx.template({}, :u16), Nx.template({}, :u16), s, [format: f]]
+
+    assert {:ok, %{loop_latency: 1, ii: 1}} =
+             DSP.analyze_scan(&ExSdr.DSP.Blocks.ddc/5, args, state: 1)
   end
 end

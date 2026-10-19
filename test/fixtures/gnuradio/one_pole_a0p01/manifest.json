@@ -1,6 +1,0 @@
-{
-  "case": "one_pole_a0p01",
-  "case_sha256": "ecd6e3ec600157d340268de494f83f4f74e8eaf97dc08d45e1e5434b644fdd6b",
-  "gnuradio": "3.10.12.0",
-  "numpy": "2.3.5"
-}

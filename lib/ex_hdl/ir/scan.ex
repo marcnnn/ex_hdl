@@ -44,7 +44,8 @@ defmodule ExHdl.Passes.Recurrence do
     * otherwise: error, reporting the critical path.
   """
 
-  alias ExHdl.IR.{Dataflow, Scan}
+  alias ExHdl.IR.Scan
+  alias NxFixed.Dataflow
   alias ExHdl.Passes.Schedule
   alias ExHdl.Target.Timing
 

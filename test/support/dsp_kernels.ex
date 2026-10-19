@@ -1,7 +1,7 @@
 defmodule ExHdl.Test.DSP do
   @moduledoc false
   import Nx.Defn
-  import ExHdl.DSP.Primitives
+  import NxFixed.Primitives
 
   # The ddc_step from the architecture plan, with explicit wrap and saturate.
   defn ddc_step(sample, phase_acc, phase_inc, gain_q15, opts \\ []) do

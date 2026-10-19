@@ -9,36 +9,26 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # sibling libraries are path dependencies until they are on Hex
+      - run: ./scripts/checkout_siblings.sh
       - uses: erlef/setup-beam@v1
         with:
           otp-version: "27.3"
           elixir-version: "1.18.3"
-      - uses: actions/cache@v4
-        with:
-          path: |
-            deps
-            _build
-          key: mix-${{ runner.os }}-${{ hashFiles('mix.lock') }}
       - run: mix deps.get
       - run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
-      # Without verilator in PATH the co-simulation tests are excluded.
       - run: mix test
 
   cosim:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - run: ./scripts/checkout_siblings.sh
       - run: sudo apt-get update && sudo apt-get install -y verilator
       - uses: erlef/setup-beam@v1
         with:
           otp-version: "27.3"
           elixir-version: "1.18.3"
-      - uses: actions/cache@v4
-        with:
-          path: |
-            deps
-            _build
-          key: mix-cosim-${{ runner.os }}-${{ hashFiles('mix.lock') }}
       - run: mix deps.get
       - run: mix test --only verilator

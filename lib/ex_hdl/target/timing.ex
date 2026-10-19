@@ -13,7 +13,7 @@ defmodule ExHdl.Target.Timing do
   overridden through options.
   """
 
-  alias ExHdl.Types.IntSet
+  alias NxFixed.IntSet
 
   defstruct clock_mhz: 150,
             # fraction of the period available to logic (routing, setup)
@@ -41,7 +41,7 @@ defmodule ExHdl.Target.Timing do
   def period_ns(%__MODULE__{clock_mhz: mhz, margin: m}), do: 1000 / mhz * m
 
   @doc "Cost of `node` in `graph` (whose nodes carry ranges)."
-  @spec cost(map(), ExHdl.IR.Dataflow.t(), t()) :: cost()
+  @spec cost(map(), NxFixed.Dataflow.t(), t()) :: cost()
   def cost(%{op: op}, _graph, _t) when op in @free, do: {:comb, 0.0}
 
   def cost(%{op: op} = node, graph, t) when op in @adder do

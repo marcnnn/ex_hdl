@@ -1,4 +1,0 @@
-# Environment for regenerating the GNU Radio reference data
-# (scripts/gnuradio_golden.sh). Not needed to run the tests.
-FROM registry.fedoraproject.org/fedora:43
-RUN dnf -y install gnuradio python3-numpy && dnf clean all
