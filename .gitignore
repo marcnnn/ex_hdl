@@ -25,3 +25,6 @@ ex_hdl-*.tar
 # Default output of `mix ex_hdl.gen.sv`.
 /hdl/generated/
 
+
+# Native build output.
+/priv/native/
