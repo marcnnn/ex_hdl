@@ -59,10 +59,16 @@ void ViterbiDvbtSimd(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* b
 // Elixir references in ExHdl.DVBT:
 // Forney deinterleaver (I = 12, M = 17), FIFOs starting at zero.
 void ForneyDeinterleave(const uint8_t* in, size_t n, uint8_t* out);
-// RS(204, 188) decoding of n_packets codewords into 188-byte packets; on
-// failure the uncorrected payload is copied. Returns corrected bytes and
-// failed packets.
-void RsDecodePackets(const uint8_t* in, size_t n_packets, uint8_t* out, size_t* corrected, size_t* failed);
+// Reed-Solomon code over GF(256), see ExHdl.Comm.ReedSolomon: roots
+// beta^(fcr + i) with beta = alpha^prim, shortened by `shortening`.
+struct RsParams {
+  unsigned field_poly;
+  int n, k, fcr, prim, shortening;
+};
+// Decodes `count` codewords of n - shortening bytes into k - shortening
+// bytes each; failed codewords are copied uncorrected. Same results as the
+// Elixir reference.
+void RsDecode(const RsParams& code, const uint8_t* in, size_t count, uint8_t* out, size_t* corrected, size_t* failed);
 // Energy dispersal descrambling of whole groups of 8 packets (first sync
 // byte 0xB8 restored to 0x47).
 void Descramble(const uint8_t* in, size_t n_groups, uint8_t* out);

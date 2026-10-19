@@ -145,15 +145,21 @@ fine::Term forney_deinterleave(ErlNifEnv* env, ErlNifBinary in) {
 }
 FINE_NIF(forney_deinterleave, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
-std::tuple<fine::Term, int64_t, int64_t> rs_decode_packets(ErlNifEnv* env, ErlNifBinary in) {
-  if (in.size % 204 != 0) throw std::invalid_argument("rs_decode_packets: input must be whole 204-byte codewords");
-  const size_t n = in.size / 204;
-  auto [out_term, out] = new_binary<uint8_t>(env, n * 188);
+std::tuple<fine::Term, int64_t, int64_t> rs_decode(ErlNifEnv* env, ErlNifBinary in, int64_t field_poly, int64_t n, int64_t k,
+                                                     int64_t fcr, int64_t prim, int64_t shortening) {
+  if (n > 255 || k >= n || shortening >= k || (field_poly & 0x100) == 0)
+    throw std::invalid_argument("rs_decode: needs a GF(256) code with 0 <= shortening < k < n <= 255");
+  const exhdl::RsParams c{static_cast<unsigned>(field_poly), static_cast<int>(n), static_cast<int>(k),
+                          static_cast<int>(fcr), static_cast<int>(prim), static_cast<int>(shortening)};
+  const size_t len = c.n - c.shortening, msg = c.k - c.shortening;
+  if (in.size % len != 0) throw std::invalid_argument("rs_decode: input must be whole codewords");
+  const size_t count = in.size / len;
+  auto [out_term, out] = new_binary<uint8_t>(env, count * msg);
   size_t corrected = 0, failed = 0;
-  exhdl::RsDecodePackets(in.data, n, out, &corrected, &failed);
+  exhdl::RsDecode(c, in.data, count, out, &corrected, &failed);
   return {out_term, static_cast<int64_t>(corrected), static_cast<int64_t>(failed)};
 }
-FINE_NIF(rs_decode_packets, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+FINE_NIF(rs_decode, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 fine::Term descramble(ErlNifEnv* env, ErlNifBinary in) {
   if (in.size % 1504 != 0) throw std::invalid_argument("descramble: input must be whole groups of 8 packets");

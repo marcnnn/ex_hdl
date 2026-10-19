@@ -148,21 +148,7 @@ defmodule ExHdl.DVBT.Receiver do
     payload = binary_part(deinterleaved, delay, byte_size(deinterleaved) - delay)
     payload = binary_part(payload, 0, div(byte_size(payload), 204) * 204)
 
-    {rs_out, corrected, failed} =
-      if native? do
-        ExHdl.SIMD.NIF.rs_decode_packets(payload)
-      else
-        {packets, c, f} =
-          for <<cw::binary-size(204) <- payload>>, reduce: {[], 0, 0} do
-            {acc, c, f} ->
-              case ReedSolomon.decode(cw) do
-                {:ok, p, n} -> {[p | acc], c + n, f}
-                {:error, :uncorrectable, p} -> {[p | acc], c, f + 1}
-              end
-          end
-
-        {packets |> Enum.reverse() |> IO.iodata_to_binary(), c, f}
-      end
+    {rs_out, corrected, failed} = ReedSolomon.decode_all(payload)
 
     # align on the first inverted sync byte, then whole groups of 8
     start =

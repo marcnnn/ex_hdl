@@ -351,66 +351,65 @@ void ForneyDeinterleave(const uint8_t* in, size_t n, uint8_t* out) {
 }
 
 namespace {
+// GF(256) for a given primitive polynomial.
 struct GF {
   uint8_t exp[512];
   uint8_t log[256];
-  GF() {
+  explicit GF(unsigned poly) {
     unsigned x = 1;
     for (int i = 0; i < 255; ++i) {
       exp[i] = static_cast<uint8_t>(x);
       log[x] = static_cast<uint8_t>(i);
       x <<= 1;
-      if (x & 0x100) x ^= 0x11D;
+      if (x & 0x100) x ^= poly;
     }
     for (int i = 255; i < 512; ++i) exp[i] = exp[i - 255];
     log[0] = 0;
   }
   uint8_t mul(uint8_t a, uint8_t b) const { return (a && b) ? exp[log[a] + log[b]] : 0; }
   uint8_t div(uint8_t a, uint8_t b) const { return a ? exp[log[a] + 255 - log[b]] : 0; }
-  uint8_t pow(int i) const { return exp[((i % 255) + 255) % 255]; }
+  uint8_t pow(long i) const { return exp[((i % 255) + 255) % 255]; }
 };
-const GF kGF;
 
-// Evaluation, coefficients lowest degree first.
-uint8_t eval_low(const uint8_t* p, int len, uint8_t x) {
+uint8_t eval_low(const GF& gf, const uint8_t* p, int len, uint8_t x) {
   uint8_t acc = 0;
-  for (int i = len - 1; i >= 0; --i) acc = kGF.mul(acc, x) ^ p[i];
+  for (int i = len - 1; i >= 0; --i) acc = gf.mul(acc, x) ^ p[i];
   return acc;
 }
 
-// Same algorithm and failure rules as ExHdl.DVBT.ReedSolomon.decode/1.
-// Returns -1 on failure, else the number of corrected bytes.
-int rs_decode(const uint8_t* cw, uint8_t* packet) {
-  constexpr int N = 255, PARITY = 16, SHORT = 51;
-  uint8_t r[N] = {0};
-  std::memcpy(r + SHORT, cw, 204);
+// Same algorithm and failure rules as ExHdl.Comm.ReedSolomon.decode/2.
+// cw: n - shortening symbols; out: k - shortening symbols. -1 on failure.
+int rs_decode(const GF& gf, const RsParams& c, const uint8_t* cw, uint8_t* out) {
+  const int n = c.n, parity = c.n - c.k, len = c.n - c.shortening, msg = c.k - c.shortening;
+  uint8_t r[255] = {0};
+  std::memcpy(r + c.shortening, cw, len);
 
-  uint8_t syn[PARITY];
+  uint8_t syn[255];
   bool zero = true;
-  for (int i = 0; i < PARITY; ++i) {
-    const uint8_t x = kGF.pow(i);
+  for (int i = 0; i < parity; ++i) {
+    const uint8_t x = gf.pow(static_cast<long>(c.prim) * (c.fcr + i));
     uint8_t acc = 0;
-    for (int k = 0; k < N; ++k) acc = kGF.mul(acc, x) ^ r[k];
+    for (int k = 0; k < n; ++k) acc = gf.mul(acc, x) ^ r[k];
     syn[i] = acc;
     zero = zero && acc == 0;
   }
-  std::memcpy(packet, cw, 188);
+  std::memcpy(out, cw, msg);
   if (zero) return 0;
 
   // Berlekamp-Massey (lowest degree first)
-  uint8_t c[PARITY + 1] = {1}, b[PARITY + 1] = {1}, t[PARITY + 1];
+  uint8_t lam[256] = {1}, b[256] = {1}, t[256];
   int l = 0, m = 1;
   uint8_t bb = 1;
-  for (int rr = 0; rr < PARITY; ++rr) {
+  for (int rr = 0; rr < parity; ++rr) {
     uint8_t dd = 0;
-    for (int i = 0; i <= l; ++i) dd ^= kGF.mul(c[i], syn[rr - i]);
+    for (int i = 0; i <= l; ++i) dd ^= gf.mul(lam[i], syn[rr - i]);
     if (dd == 0) {
       ++m;
       continue;
     }
-    const uint8_t coef = kGF.div(dd, bb);
-    std::memcpy(t, c, sizeof c);
-    for (int i = 0; i + m <= PARITY; ++i) c[i + m] ^= kGF.mul(coef, b[i]);
+    const uint8_t coef = gf.div(dd, bb);
+    std::memcpy(t, lam, sizeof lam);
+    for (int i = 0; i + m <= parity; ++i) lam[i + m] ^= gf.mul(coef, b[i]);
     if (2 * l <= rr) {
       l = rr + 1 - l;
       std::memcpy(b, t, sizeof b);
@@ -420,35 +419,31 @@ int rs_decode(const uint8_t* cw, uint8_t* packet) {
       ++m;
     }
   }
-  int deg = PARITY;
-  while (deg > 0 && c[deg] == 0) --deg;
+  int deg = parity;
+  while (deg > 0 && lam[deg] == 0) --deg;
 
-  int roots[PARITY];
+  int roots[256];
   int nroots = 0;
-  for (int p = 0; p < N && nroots <= PARITY; ++p)
-    if (eval_low(c, deg + 1, kGF.pow(-p)) == 0) {
-      if (nroots < PARITY) roots[nroots] = p;
-      ++nroots;
-    }
-  if (nroots != deg || deg > PARITY / 2) return -1;
+  for (int p = 0; p < n; ++p)
+    if (eval_low(gf, lam, deg + 1, gf.pow(-static_cast<long>(c.prim) * p)) == 0) roots[nroots++] = p;
+  if (nroots != deg || deg > parity / 2) return -1;
   for (int i = 0; i < nroots; ++i)
-    if (roots[i] >= N - SHORT) return -1;
+    if (roots[i] >= n - c.shortening) return -1;
 
-  // Omega = (S * Lambda) mod x^16, Lambda' (odd terms)
-  uint8_t omega[PARITY] = {0};
-  for (int k = 0; k < PARITY; ++k)
-    for (int i = 0; i <= k && i <= deg; ++i) omega[k] ^= kGF.mul(c[i], syn[k - i]);
-  uint8_t deriv[PARITY] = {0};
+  uint8_t omega[256] = {0};
+  for (int k = 0; k < parity; ++k)
+    for (int i = 0; i <= k && i <= deg; ++i) omega[k] ^= gf.mul(lam[i], syn[k - i]);
+  uint8_t deriv[256] = {0};
   for (int i = 1; i <= deg; ++i)
-    if (i % 2 == 1) deriv[i - 1] = c[i];
+    if (i % 2 == 1) deriv[i - 1] = lam[i];
 
   for (int i = 0; i < nroots; ++i) {
-    const int p = roots[i];
-    const uint8_t xinv = kGF.pow(-p);
-    const uint8_t mag = kGF.mul(kGF.pow(p), kGF.div(eval_low(omega, PARITY, xinv), eval_low(deriv, deg, xinv)));
-    r[N - 1 - p] ^= mag;
+    const long p = roots[i];
+    const uint8_t xinv = gf.pow(-static_cast<long>(c.prim) * p);
+    const uint8_t num = gf.mul(eval_low(gf, omega, parity, xinv), gf.pow(static_cast<long>(c.prim) * p * (1 - c.fcr)));
+    r[n - 1 - p] ^= gf.div(num, eval_low(gf, deriv, deg, xinv));
   }
-  std::memcpy(packet, r + SHORT, 188);
+  std::memcpy(out, r + c.shortening, msg);
   return deg;
 }
 
@@ -472,11 +467,13 @@ struct Prbs {
 const Prbs kPrbs;
 }  // namespace
 
-void RsDecodePackets(const uint8_t* in, size_t n_packets, uint8_t* out, size_t* corrected, size_t* failed) {
+void RsDecode(const RsParams& c, const uint8_t* in, size_t count, uint8_t* out, size_t* corrected, size_t* failed) {
+  const GF gf(c.field_poly);
+  const size_t len = c.n - c.shortening, msg = c.k - c.shortening;
   *corrected = 0;
   *failed = 0;
-  for (size_t i = 0; i < n_packets; ++i) {
-    const int r = rs_decode(in + 204 * i, out + 188 * i);
+  for (size_t i = 0; i < count; ++i) {
+    const int r = rs_decode(gf, c, in + len * i, out + msg * i);
     if (r < 0) ++*failed; else *corrected += static_cast<size_t>(r);
   }
 }

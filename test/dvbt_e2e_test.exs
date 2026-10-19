@@ -134,7 +134,7 @@ defmodule ExHdl.DVBT.EndToEndTest do
 
     assert failed > 0 and corrected > 0
 
-    assert ExHdl.SIMD.NIF.rs_decode_packets(IO.iodata_to_binary(codewords)) ==
+    assert ReedSolomon.decode_all(IO.iodata_to_binary(codewords)) ==
              {ref |> Enum.reverse() |> IO.iodata_to_binary(), corrected, failed}
 
     scrambled =

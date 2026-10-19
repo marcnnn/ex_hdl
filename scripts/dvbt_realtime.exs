@@ -34,7 +34,7 @@ dec = time.("Viterbi, SIMD kernel", fn -> NIF.viterbi_dvbt_simd(rx, true) end)
 bytes = Fast.pack(dec)
 de = time.("Forney deinterleaver", fn -> NIF.forney_deinterleave(bytes) end)
 payload = binary_part(de, 2244, div(byte_size(de) - 2244, 204) * 204)
-time.("Reed-Solomon", fn -> NIF.rs_decode_packets(payload) end)
+time.("Reed-Solomon", fn -> ExHdl.DVBT.ReedSolomon.decode_all(payload) end)
 
 opts = [constellation: :qpsk, code_rate: {1, 2}, start: s.start, freq_offset: s.freq_offset]
 Receiver.receive_fast(x, opts)
