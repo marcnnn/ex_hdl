@@ -157,10 +157,10 @@ defmodule ExHdl.Comm.ReedSolomon do
   @doc """
   Decodes a binary of whole codewords (GF(256) codes): returns
   `{messages, corrected_symbols, failed_codewords}`, failed codewords
-  copied uncorrected. Uses the native kernel when available (same results).
+  copied uncorrected. Option `:native` as in `ExHdl.Comm.Scrambler.apply/3`.
   """
-  def decode_all_bytes(%__MODULE__{field: %{m: 8}} = code, codewords) do
-    if ExHdl.SIMD.available?() do
+  def decode_all_bytes(%__MODULE__{field: %{m: 8}} = code, codewords, opts \\ []) do
+    if Keyword.get_lazy(opts, :native, &ExHdl.SIMD.available?/0) do
       ExHdl.SIMD.NIF.rs_decode(
         codewords,
         code.field.poly,

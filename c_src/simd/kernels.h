@@ -55,10 +55,11 @@ void ViterbiDvbt(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits)
 // bit-identical results.
 void ViterbiDvbtSimd(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* bits);
 
-// DVB-T outer receiver stages (EN 300 744 4.3.1-4.3.3), bit-identical to the
-// Elixir references in ExHdl.DVBT:
-// Forney deinterleaver (I = 12, M = 17), FIFOs starting at zero.
-void ForneyDeinterleave(const uint8_t* in, size_t n, uint8_t* out);
+// Byte-level channel coding blocks of ExHdl.Comm, bit-identical to the
+// Elixir references:
+// Forney interleaver (inverse = deinterleaver) with I branches and unit
+// delay M, delay lines starting at zero.
+void ConvInterleave(const uint8_t* in, size_t n, int branches, int depth, bool inverse, uint8_t* out);
 // Reed-Solomon code over GF(256), see ExHdl.Comm.ReedSolomon: roots
 // beta^(fcr + i) with beta = alpha^prim, shortened by `shortening`.
 struct RsParams {
@@ -69,9 +70,9 @@ struct RsParams {
 // bytes each; failed codewords are copied uncorrected. Same results as the
 // Elixir reference.
 void RsDecode(const RsParams& code, const uint8_t* in, size_t count, uint8_t* out, size_t* corrected, size_t* failed);
-// Energy dispersal descrambling of whole groups of 8 packets (first sync
-// byte 0xB8 restored to 0x47).
-void Descramble(const uint8_t* in, size_t n_groups, uint8_t* out);
+// out = (in & keep) ^ mask with keep/mask repeating every `period` bytes
+// (periodic additive scramblers, ExHdl.Comm.Scrambler).
+void ByteAffine(const uint8_t* in, size_t n, const uint8_t* keep, const uint8_t* mask, size_t period, uint8_t* out);
 
 // Name of the SIMD target chosen at runtime (e.g. "NEON", "SVE2", "AVX2").
 const char* SimdTarget();

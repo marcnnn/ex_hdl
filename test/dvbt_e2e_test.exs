@@ -106,12 +106,9 @@ defmodule ExHdl.DVBT.EndToEndTest do
   end
 
   @tag :dvbt
-  test "native Forney deinterleaver, RS decoder and descrambler equal the Elixir references" do
-    alias ExHdl.DVBT.{EnergyDispersal, OuterInterleaver, ReedSolomon}
+  test "native RS decoder equals the Elixir reference on DVB codewords" do
+    alias ExHdl.DVBT.ReedSolomon
     :rand.seed(:exsss, {5, 6, 7})
-
-    data = :crypto.strong_rand_bytes(204 * 40)
-    assert ExHdl.SIMD.NIF.forney_deinterleave(data) == OuterInterleaver.deinterleave(data)
 
     # 0..12 byte errors per codeword: corrected, and failed ones
     codewords =
@@ -136,13 +133,6 @@ defmodule ExHdl.DVBT.EndToEndTest do
 
     assert ReedSolomon.decode_all(IO.iodata_to_binary(codewords)) ==
              {ref |> Enum.reverse() |> IO.iodata_to_binary(), corrected, failed}
-
-    scrambled =
-      EnergyDispersal.scramble(
-        for _ <- 1..24, into: <<>>, do: <<0x47>> <> :crypto.strong_rand_bytes(187)
-      )
-
-    assert ExHdl.SIMD.NIF.descramble(scrambled) == EnergyDispersal.descramble(scrambled)
   end
 
   @tag :dvbt

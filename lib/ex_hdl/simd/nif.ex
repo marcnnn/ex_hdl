@@ -26,12 +26,12 @@ defmodule ExHdl.SIMD.NIF do
   def simd_target, do: :erlang.nif_error(:not_loaded)
   def viterbi_dvbt(_rx, _start_unknown), do: :erlang.nif_error(:not_loaded)
   def viterbi_dvbt_simd(_rx, _start_unknown), do: :erlang.nif_error(:not_loaded)
-  def forney_deinterleave(_bytes), do: :erlang.nif_error(:not_loaded)
+  def conv_interleave(_bytes, _branches, _depth, _inverse), do: :erlang.nif_error(:not_loaded)
 
   def rs_decode(_bytes, _field_poly, _n, _k, _fcr, _prim, _shortening),
     do: :erlang.nif_error(:not_loaded)
 
-  def descramble(_bytes), do: :erlang.nif_error(:not_loaded)
+  def byte_affine(_bytes, _keep, _mask), do: :erlang.nif_error(:not_loaded)
   def kernel_load(_path), do: :erlang.nif_error(:not_loaded)
   def kernel_run(_kernel, _inputs, _output_bytes), do: :erlang.nif_error(:not_loaded)
 end

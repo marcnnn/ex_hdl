@@ -13,7 +13,6 @@ defmodule ExHdl.DVBT.OFDM do
   `demodulate/3` is the float reference front end: FFT, channel estimate
   at the pilots, linear interpolation across frequency, equalisation.
   """
-  import Bitwise
 
   @fft 2048
   @cp 64
@@ -90,14 +89,9 @@ defmodule ExHdl.DVBT.OFDM do
 
   @doc "PRBS w_k for k = 0..1704 (x^11 + x^2 + 1, register all ones), as a tuple."
   def prbs do
-    {bits, _} =
-      Enum.map_reduce(0..(@active - 1), 0x7FF, fn _, reg ->
-        # output is the last stage; feedback = stage 11 xor stage 9
-        out = reg &&& 1
-        feedback = bxor(reg &&& 1, reg >>> 2 &&& 1)
-        {out, reg >>> 1 ||| feedback <<< 10}
-      end)
-
+    # output is the last stage; feedback = stage 11 xor stage 9
+    lfsr = ExHdl.Comm.LFSR.new(length: 11, taps: [9, 11], seed: 0x7FF, output: :last)
+    {bits, _} = ExHdl.Comm.LFSR.bits(lfsr, @active)
     List.to_tuple(bits)
   end
 

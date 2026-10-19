@@ -2,68 +2,48 @@ defmodule ExHdl.DVBT.EnergyDispersal do
   @moduledoc """
   Transport multiplex adaptation and randomisation (ETSI EN 300 744, 4.3.1).
 
-  The PRBS `1 + x^14 + x^15` is loaded with `100101010000000` at the start
-  of every group of 8 transport packets, whose first sync byte is inverted
-  (`0x47` -> `0xB8`). The PRBS output is XORed with all bytes except the
-  sync bytes; during the 7 other sync bytes the generator keeps running but
-  its output is not applied. Scrambling and descrambling are the same
-  operation apart from the sync byte.
+  The PRBS `1 + x^14 + x^15` (`ExHdl.Comm.LFSR`, taps `[14, 15]`) is
+  loaded with `100101010000000` at the start of every group of 8 transport
+  packets, whose first sync byte is inverted (`0x47` -> `0xB8`). The PRBS
+  output is XORed with all bytes except the sync bytes; during the 7 other
+  sync bytes the generator keeps running but its output is not applied.
+  One group is one period of an `ExHdl.Comm.Scrambler`.
   """
-  import Bitwise
-
-  @init 0b100101010000000
+  alias ExHdl.Comm.{LFSR, Scrambler}
 
   @doc "Scrambles whole groups of 8 packets (188 bytes each)."
-  def scramble(ts), do: process(ts, :scramble)
+  def scramble(ts), do: Scrambler.apply(scrambler(0xB8), ts)
 
   @doc "Descrambles groups of 8 packets and restores the 0x47 sync bytes."
-  def descramble(ts), do: process(ts, :descramble)
+  def descramble(ts), do: Scrambler.apply(scrambler(0x47), ts)
 
-  defp process(ts, mode) when rem(byte_size(ts), 188 * 8) == 0 do
-    for <<group::binary-size(1504) <- ts>>, into: <<>>, do: group(group, mode)
+  defp scrambler(first_sync) do
+    key = {__MODULE__, first_sync}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        s = build(first_sync)
+        :persistent_term.put(key, s)
+        s
+
+      s ->
+        s
+    end
   end
 
-  defp group(group, mode) do
-    packets = for <<p::binary-size(188) <- group>>, do: p
+  defp build(first_sync) do
+    # 8 * 188 - 1 generator bytes: the first sync byte is not clocked
+    {prbs, _} =
+      LFSR.bytes(LFSR.new(length: 15, taps: [14, 15], seed: 0b100101010000000), 8 * 188 - 1)
 
-    {out, _reg} =
-      packets
-      |> Enum.with_index()
-      |> Enum.map_reduce(@init, fn {<<_sync, payload::binary-size(187)>>, i}, reg ->
-        sync =
-          case {i, mode} do
-            {0, :scramble} -> 0xB8
-            {0, :descramble} -> 0x47
-            _ -> 0x47
-          end
-
-        # the generator runs through the sync bytes of packets 2..8
-        reg = if i == 0, do: reg, else: elem(prbs_byte(reg), 1)
-        {payload, reg} = xor_prbs(payload, reg)
-        {<<sync, payload::binary>>, reg}
-      end)
-
-    IO.iodata_to_binary(out)
-  end
-
-  defp xor_prbs(bytes, reg) do
-    {out, reg} =
-      for <<b <- bytes>>, reduce: {[], reg} do
-        {acc, reg} ->
-          {mask, reg} = prbs_byte(reg)
-          {[bxor(b, mask) | acc], reg}
+    {keep, mask} =
+      for p <- 0..7, reduce: {[], []} do
+        {k, m} ->
+          payload = binary_part(prbs, 188 * p, 187)
+          sync = if p == 0, do: first_sync, else: 0x47
+          {[k, 0x00, :binary.copy(<<0xFF>>, 187)], [m, sync, payload]}
       end
 
-    {acc_to_binary(out), reg}
-  end
-
-  defp acc_to_binary(rev), do: rev |> Enum.reverse() |> :binary.list_to_bin()
-
-  # 8 PRBS bits, first bit as MSB. reg bit 14 is stage 1, bit 0 stage 15.
-  defp prbs_byte(reg) do
-    Enum.reduce(1..8, {0, reg}, fn _, {byte, reg} ->
-      out = bxor(reg >>> 1 &&& 1, reg &&& 1)
-      {byte <<< 1 ||| out, reg >>> 1 ||| out <<< 14}
-    end)
+    Scrambler.new(IO.iodata_to_binary(keep), IO.iodata_to_binary(mask))
   end
 end

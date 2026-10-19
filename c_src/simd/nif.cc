@@ -138,12 +138,13 @@ fine::Term viterbi_dvbt_simd(ErlNifEnv* env, ErlNifBinary rx, bool start_unknown
 }
 FINE_NIF(viterbi_dvbt_simd, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
-fine::Term forney_deinterleave(ErlNifEnv* env, ErlNifBinary in) {
+fine::Term conv_interleave(ErlNifEnv* env, ErlNifBinary in, int64_t branches, int64_t depth, bool inverse) {
+  if (branches < 1 || depth < 0) throw std::invalid_argument("conv_interleave: needs branches >= 1, depth >= 0");
   auto [out_term, out] = new_binary<uint8_t>(env, in.size);
-  exhdl::ForneyDeinterleave(in.data, in.size, out);
+  exhdl::ConvInterleave(in.data, in.size, static_cast<int>(branches), static_cast<int>(depth), inverse, out);
   return out_term;
 }
-FINE_NIF(forney_deinterleave, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+FINE_NIF(conv_interleave, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 std::tuple<fine::Term, int64_t, int64_t> rs_decode(ErlNifEnv* env, ErlNifBinary in, int64_t field_poly, int64_t n, int64_t k,
                                                      int64_t fcr, int64_t prim, int64_t shortening) {
@@ -161,13 +162,14 @@ std::tuple<fine::Term, int64_t, int64_t> rs_decode(ErlNifEnv* env, ErlNifBinary 
 }
 FINE_NIF(rs_decode, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
-fine::Term descramble(ErlNifEnv* env, ErlNifBinary in) {
-  if (in.size % 1504 != 0) throw std::invalid_argument("descramble: input must be whole groups of 8 packets");
+fine::Term byte_affine(ErlNifEnv* env, ErlNifBinary in, ErlNifBinary keep, ErlNifBinary mask) {
+  if (keep.size != mask.size || mask.size == 0 || in.size % mask.size != 0)
+    throw std::invalid_argument("byte_affine: masks of equal size, input whole periods");
   auto [out_term, out] = new_binary<uint8_t>(env, in.size);
-  exhdl::Descramble(in.data, in.size / 1504, out);
+  exhdl::ByteAffine(in.data, in.size, keep.data, mask.data, mask.size, out);
   return out_term;
 }
-FINE_NIF(descramble, ERL_NIF_DIRTY_JOB_CPU_BOUND);
+FINE_NIF(byte_affine, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 
 // -- generated kernels (ExHdl.SIMD.Compiler) --------------------------------
 // A generated shared library exports

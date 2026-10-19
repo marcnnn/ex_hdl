@@ -79,7 +79,8 @@ defmodule ExHdl.Comm.ReedSolomonTest do
       assert corrected > 0 and failed > 0
 
       if ExHdl.SIMD.available?() do
-        assert ReedSolomon.decode_all_bytes(code, IO.iodata_to_binary(codewords)) == ref
+        assert ReedSolomon.decode_all_bytes(code, IO.iodata_to_binary(codewords), native: true) ==
+                 ref
       end
     end
   end

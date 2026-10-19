@@ -32,7 +32,7 @@ rx = Convolutional.depunctured_binary(bits, {1, 2})
 time.("Viterbi, scalar kernel", fn -> NIF.viterbi_dvbt(rx, true) end)
 dec = time.("Viterbi, SIMD kernel", fn -> NIF.viterbi_dvbt_simd(rx, true) end)
 bytes = Fast.pack(dec)
-de = time.("Forney deinterleaver", fn -> NIF.forney_deinterleave(bytes) end)
+de = time.("Forney deinterleaver", fn -> ExHdl.DVBT.OuterInterleaver.deinterleave(bytes) end)
 payload = binary_part(de, 2244, div(byte_size(de) - 2244, 204) * 204)
 time.("Reed-Solomon", fn -> ExHdl.DVBT.ReedSolomon.decode_all(payload) end)
 

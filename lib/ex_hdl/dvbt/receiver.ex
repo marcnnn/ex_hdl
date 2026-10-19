@@ -133,16 +133,10 @@ defmodule ExHdl.DVBT.Receiver do
     end
   end
 
-  # Forney deinterleaver, RS decoding and descrambling of decoded bytes:
-  # native kernels when the NIF is loaded, else the Elixir references (same
-  # results).
+  # Forney deinterleaver, RS decoding and descrambling of decoded bytes
+  # (each native when the NIF is loaded, same results).
   defp outer(bytes) do
-    native? = ExHdl.SIMD.available?()
-
-    deinterleaved =
-      if native?,
-        do: ExHdl.SIMD.NIF.forney_deinterleave(bytes),
-        else: OuterInterleaver.deinterleave(bytes)
+    deinterleaved = OuterInterleaver.deinterleave(bytes)
 
     delay = OuterInterleaver.delay()
     payload = binary_part(deinterleaved, delay, byte_size(deinterleaved) - delay)
@@ -159,8 +153,7 @@ defmodule ExHdl.DVBT.Receiver do
 
     groups = binary_part(aligned, 0, div(byte_size(aligned), 1504) * 1504)
 
-    ts =
-      if native?, do: ExHdl.SIMD.NIF.descramble(groups), else: EnergyDispersal.descramble(groups)
+    ts = EnergyDispersal.descramble(groups)
 
     %{
       ts: ts,

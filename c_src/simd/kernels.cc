@@ -330,16 +330,15 @@ void ViterbiDvbtSimd(const uint8_t* rx, size_t n, bool start_unknown, uint8_t* b
   }
 }
 
-// -- DVB-T outer stages ------------------------------------------------------
+// -- byte-level channel coding (ExHdl.Comm) ---------------------------------
 
-void ForneyDeinterleave(const uint8_t* in, size_t n, uint8_t* out) {
-  constexpr int I = 12, M = 17;
-  // branch j: FIFO of (I - 1 - j) * M bytes, as a ring buffer
-  std::vector<uint8_t> fifo[I];
-  size_t pos[I] = {0};
-  for (int j = 0; j < I; ++j) fifo[j].assign((I - 1 - j) * M, 0);
+void ConvInterleave(const uint8_t* in, size_t n, int branches, int depth, bool inverse, uint8_t* out) {
+  // branch j: FIFO of j * M (or (I - 1 - j) * M) bytes, as a ring buffer
+  std::vector<std::vector<uint8_t>> fifo(branches);
+  std::vector<size_t> pos(branches, 0);
+  for (int j = 0; j < branches; ++j) fifo[j].assign((inverse ? branches - 1 - j : j) * depth, 0);
   for (size_t k = 0; k < n; ++k) {
-    const int j = static_cast<int>(k % I);
+    const int j = static_cast<int>(k % branches);
     if (fifo[j].empty()) {
       out[k] = in[k];
       continue;
@@ -447,24 +446,6 @@ int rs_decode(const GF& gf, const RsParams& c, const uint8_t* cw, uint8_t* out) 
   return deg;
 }
 
-// PRBS 1 + x^14 + x^15 from 100101010000000, as bytes for one group of 8
-// packets: 187 bytes, then 1 (sync, generator running but unused), ...
-struct Prbs {
-  uint8_t bytes[8 * 188];
-  Prbs() {
-    unsigned reg = 0x4A80;  // 0b100101010000000
-    for (int i = 0; i < 8 * 188; ++i) {
-      uint8_t byte = 0;
-      for (int k = 0; k < 8; ++k) {
-        const unsigned out = ((reg >> 1) ^ reg) & 1;
-        byte = static_cast<uint8_t>((byte << 1) | out);
-        reg = (reg >> 1) | (out << 14);
-      }
-      bytes[i] = byte;
-    }
-  }
-};
-const Prbs kPrbs;
 }  // namespace
 
 void RsDecode(const RsParams& c, const uint8_t* in, size_t count, uint8_t* out, size_t* corrected, size_t* failed) {
@@ -478,18 +459,9 @@ void RsDecode(const RsParams& c, const uint8_t* in, size_t count, uint8_t* out, 
   }
 }
 
-void Descramble(const uint8_t* in, size_t n_groups, uint8_t* out) {
-  for (size_t g = 0; g < n_groups; ++g) {
-    const uint8_t* src = in + g * 1504;
-    uint8_t* dst = out + g * 1504;
-    // PRBS byte index: payload of packet p starts after p sync bytes
-    size_t prbs = 0;
-    for (int p = 0; p < 8; ++p) {
-      dst[188 * p] = 0x47;
-      if (p > 0) ++prbs;  // the generator runs through sync bytes 2..8
-      for (int k = 1; k < 188; ++k) dst[188 * p + k] = src[188 * p + k] ^ kPrbs.bytes[prbs++];
-    }
-  }
+void ByteAffine(const uint8_t* in, size_t n, const uint8_t* keep, const uint8_t* mask, size_t period, uint8_t* out) {
+  for (size_t g = 0; g + period <= n; g += period)
+    for (size_t k = 0; k < period; ++k) out[g + k] = (in[g + k] & keep[k]) ^ mask[k];
 }
 
 }  // namespace exhdl
