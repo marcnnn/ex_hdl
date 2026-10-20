@@ -110,6 +110,70 @@ defmodule ExHdl.DSPScanTest do
     end
   end
 
+  describe "state groups (one loop per strongly connected part of the state)" do
+    alias ExHdl.Test.Audio, as: A
+
+    defp biquad(opts),
+      do:
+        DSP.analyze_scan(
+          &A.biquad/3,
+          A.args(),
+          [state: 1, param_ranges: A.param_ranges()] ++ opts
+        )
+
+    test "a biquad's input history is not part of its feedback loop" do
+      assert {:ok, scan} = biquad(ii: :auto)
+      assert [%{leaves: [0]}, %{leaves: [1]}, %{leaves: [2, 3, 4], loop_latency: l}] = scan.groups
+      assert scan.loop_latency == l
+      # the feed-forward products of x1, x2 are computed ahead of the loop
+      assert hd(scan.critical_path) in hd(tl(tl(scan.groups))).params
+    end
+
+    test "a cascade of four biquads has the loop of one" do
+      {:ok, one} = biquad(ii: :auto)
+      spec = DSP.cascade(for k <- 1..4, do: A.stage("eq#{k}"))
+      opts = Keyword.drop(spec, [:fun, :args])
+      assert {:ok, scan} = DSP.analyze_scan(spec[:fun], spec[:args], opts ++ [ii: :auto])
+      assert scan.loop_latency == one.loop_latency
+      assert length(scan.groups) == 12
+      assert spec[:param_names] == ~w(eq1_coef eq2_coef eq3_coef eq4_coef)
+    end
+
+    test "state in RAM needs channels of at least the loop plus the read latency" do
+      {:ok, %{loop_latency: l}} = biquad(ii: :auto)
+      assert {:ok, %{channels: ^l, state_mem: :registers}} = biquad(channels: l)
+      assert {:error, %{message: msg}} = biquad(channels: l, state_mem: :block)
+      assert msg =~ "state memory read 1 more, so more than channels: #{l}"
+      assert msg =~ "channels: #{l + 1}"
+      assert {:ok, %{ram_latency: 1}} = biquad(channels: l + 1, state_mem: :block)
+      assert {:error, _} = biquad(channels: l + 1, state_mem: :ultra)
+      assert {:ok, %{ram_latency: 2}} = biquad(channels: l + 2, state_mem: :ultra)
+      assert {:error, %{message: msg}} = biquad(ii: :auto, state_mem: :block)
+      assert msg =~ "needs channels: n"
+      assert {:error, %{message: msg}} = biquad(channels: 20, state_mem: :flash)
+      assert msg =~ "state_mem: must be one of"
+    end
+
+    test "per-channel parameters, tid and unknown names are checked" do
+      {:ok, scan} = biquad(ii: :auto)
+      sv = ExHdl.Backends.SystemVerilog.Scan
+
+      assert_raise ArgumentError, ~r/channel_params: needs channels/, fn ->
+        sv.generate(scan, param_names: ["coef"], channel_params: ["coef"])
+      end
+
+      assert_raise ArgumentError, ~r/tid: true needs channels/, fn ->
+        sv.generate(scan, tid: true)
+      end
+
+      {:ok, scan} = biquad(channels: 12)
+
+      assert_raise ArgumentError, ~r/no parameter argument named "gain"/, fn ->
+        sv.generate(scan, param_names: ["coef"], channel_params: ["gain"])
+      end
+    end
+  end
+
   test "next_state must keep the state's type" do
     assert {:error, %DSP.ScheduleError{message: msg}} =
              DSP.analyze_scan(&K.widening_state_step/2, [t(:s16), t(:s16)], state: 1)

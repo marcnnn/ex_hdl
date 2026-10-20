@@ -17,7 +17,8 @@ defmodule ExHdl.ProtocolFsmCosimTest do
 
   @packets [
     {:iq_frame, &P.encode_iq_frame/2},
-    {:be_frame, &P.encode_be_frame/2}
+    {:be_frame, &P.encode_be_frame/2},
+    {:odd_frame, &P.encode_odd_frame/2}
   ]
 
   setup_all do

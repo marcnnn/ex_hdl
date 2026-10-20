@@ -62,6 +62,23 @@ defmodule ExHdl.ProtocolCodecTest do
     end
   end
 
+  describe "odd_frame (flags, enums, header ending mid-word)" do
+    test "wire layout and decoded names" do
+      bin = P.encode_odd_frame(%{kind: :ctrl, urgent: true, seq: 7}, [0x0102])
+      assert bin == <<0x2D, 0, 0, 0, 7, 1, 2>>
+
+      assert P.decode_odd_frame(bin) ==
+               {:ok, %{kind: :ctrl, urgent: true, tag: 5, seq: 7}, [0x0102]}
+
+      # unknown enum values decode to integers
+      assert {:ok, %{kind: 3, urgent: false}, []} =
+               P.decode_odd_frame(<<0x35, 0, 0, 0, 0>>)
+
+      assert P.decode_odd_frame(<<0x2C, 0, 0, 0, 7>>) == {:error, {:assert_failed, :tag, 4}}
+      assert {:ok, _, <<1, 2>>} = P.decode_odd_frame_header(bin)
+    end
+  end
+
   describe "be_frame (big endian bit fields)" do
     test "wire layout" do
       bin =
@@ -92,12 +109,25 @@ defmodule ExHdl.ProtocolCodecTest do
       """)
     end
 
-    test "header must fill whole bus words" do
-      assert_raise ArgumentError, ~r/24 bits, which is not a multiple of bus_width 32/, fn ->
+    test "headers need whole bytes, not whole bus words" do
+      {{:module, mod, _, _}, _} =
         define("""
         defpacket :p, bus_width: 32 do
           header do
             field :a, 24
+          end
+          payload :d, type: :u8
+        end
+        """)
+
+      assert mod.encode_p(%{a: 0x010203}, [9]) == <<1, 2, 3, 9>>
+      assert mod.decode_p(<<1, 2, 3, 9>>) == {:ok, %{a: 0x010203}, [9]}
+
+      assert_raise ArgumentError, ~r/is 12 bits, not a whole number of bytes/, fn ->
+        define("""
+        defpacket :p do
+          header do
+            field :a, 12
           end
           payload :d, type: :u8
         end

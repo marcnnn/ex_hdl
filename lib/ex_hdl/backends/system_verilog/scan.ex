@@ -21,6 +21,52 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   `rst_n` (synchronous, active low) loads the initial state (`:init`) and
   the parameter ports directly.
 
+  With `channels: n` the module also has
+
+    * `m_axis_tid` - the channel of each output;
+    * `s_axis_tid` (option `tid: true`) - the channel of each input sample,
+      instead of the arrival order. Two samples of one channel must then be
+      at least `n` beats apart (the loop's read-after-write distance; the
+      round-robin order guarantees it).
+
+  `tuser: bits` adds `s_axis_tuser`/`m_axis_tuser`, carried through the
+  pipeline with the sample unchanged (shift registers without reset).
+
+  ## State in memory
+
+  `state_mem: :distributed | :block | :ultra` (with `channels: n`) keeps the
+  state of all channels in one memory per state group (see
+  `ExHdl.IR.Scan`), one word per channel, instead of registers. The word of
+  a channel is read `ram_latency` cycles before the group's state stage and
+  written back at its write stage. No forwarding is needed: the analysis
+  requires `n >= loop latency + ram_latency`, so a channel's next sample
+  reads after the write. `state_init: :clear` (default) writes `:init` to
+  every word after reset, one per cycle, while the output `busy` is high
+  and no sample is accepted; `state_init: :initial` puts `:init` into the
+  memory's initial contents instead (no sweep, but reset does not clear).
+
+  ## Per-channel parameters
+
+  `channel_params: [name, ...]` (or `:all`) reads those parameter arguments
+  from a memory indexed by the channel instead of from ports, each leaf at
+  the stage of its first use. The memory has two banks of `n` words. The
+  host writes the inactive bank through
+
+    * `pc_addr`, `pc_data`, `pc_we` - channel, all per-channel leaves packed
+      like parameter ports (`Design.channel_params` has the offsets);
+    * `pc_swap` - a pulse requesting a bank swap. The swap happens at the
+      next frame boundary: when the next sample is channel 0 (round robin),
+      or with `tid: true` before a sample whose channel is not greater than
+      the previous one's (and right after reset). So every frame sees one
+      consistent coefficient set;
+    * `pc_pending` - high from `pc_swap` until the swap is done and no
+      sample that reads the old bank is left in the pipeline. Write only
+      while it is low.
+
+  `pc_clock: :separate` adds `pc_clk` for the write port (`pc_addr`,
+  `pc_data`, `pc_we`); `pc_swap` and `pc_pending` stay in the `clk` domain.
+  `param_mem:` picks the memory style (default `:block`).
+
   No ready path is combinational: `s_axis_tready` depends only on
   registers, `m_axis_tready` only on the two-entry output buffer.
 
@@ -38,9 +84,10 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   All pipeline registers share one clock enable `ce`: the pipeline
   advances while the two-entry output buffer has room.
 
-  The state is read in stage `S`, where everything the state update needs
-  from outside the loop is available, and written back at the end of the
-  stage where the next state is complete. With `ii: n` the input accepts
+  Each state group is read in its stage `S`, where everything its update
+  needs from outside its loop (including other groups' results) is
+  available, and written back at the end of the stage where its next state
+  is complete. With `ii: n` the input accepts
   one sample every `n` enabled cycles. With `channels: n` the kernel holds
   `n` states and accepts one sample per cycle; samples belong to channels
   0, 1, ..., n-1, 0, ... in arrival order (reset starts at channel 0).
@@ -69,8 +116,17 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       * `latency` - cycles from accepting a sample to presenting its output
         (without stalls), including the output buffer.
       * `ii`, `channels` - as in `ExHdl.IR.Scan`.
-      * `state_stage`, `write_stage` - pipeline stages reading and writing
-        the state.
+      * `state_stage`, `write_stage` - first stage reading and last stage
+        writing state; `state_groups` the stages per group:
+        `%{leaves:, state_stage:, write_stage:}`.
+      * `state_mem` - where the state lives (`:registers`, `:distributed`,
+        `:block`, `:ultra`); `busy` is true when the module has a `busy`
+        output (state clear after reset).
+      * `channel_params` - the per-channel parameter leaves
+        `%{name:, index:, type:, shape:, bits:, offset:}` in the `pc_data`
+        word of `pc_width` bits; `pc_clock` `:shared` or `:separate`.
+      * `tid`, `tuser` - whether the module has `s_axis_tid`, and the
+        `tuser` width (0 without).
       * `inputs`, `outputs` - the tdata fields:
         `%{index:, type:, shape:, offset:, bits:}` (`bits` per element).
       * `params` - the parameter ports: `%{port:, index:, type:, shape:, bits:}`.
@@ -87,10 +143,18 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       :state_stage,
       :write_stage,
       :inputs,
+      :busy,
       :outputs,
       :params,
       :in_width,
-      :out_width
+      :out_width,
+      state_groups: [],
+      state_mem: :registers,
+      channel_params: [],
+      pc_width: 0,
+      pc_clock: :shared,
+      tid: false,
+      tuser: 0
     ]
   end
 
@@ -127,6 +191,11 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       are valid and leave through the output buffer one per beat.
     * `:fir` - `:chain` (default) maps FIR dot products onto DSP chains,
       `:tree` keeps multipliers and an adder tree.
+    * `:state_init` - `:clear` (default) or `:initial`, for `state_mem:`
+      other than `:registers` (see "State in memory").
+    * `:tid`, `:tuser` - channel input and sideband width.
+    * `:channel_params`, `:param_mem`, `:param_ram_latency`, `:pc_clock` -
+      per-channel parameters (see "Per-channel parameters").
 
   Returns a `%Design{}`; raises `UnsupportedError`.
   """
@@ -138,8 +207,9 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     check_supported!(graph)
 
     layout = layout(scan, opts)
-    {state_stage, sched} = schedule(scan, timing, layout)
-    c = context(scan, timing, layout, state_stage, sched, %{})
+    check_options!(scan, layout)
+    {stages, sched} = schedule(scan, timing, layout)
+    c = context(scan, timing, layout, stages, sched, %{})
 
     # FIR dot products become DSP chains with their own latency: plan them
     # on a first lowering, then schedule and lower again.
@@ -152,24 +222,29 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       if fir == %{} do
         c
       else
-        {state_stage, sched} = schedule(scan, timing, layout, Fir.costs(fir))
-        context(scan, timing, layout, state_stage, sched, fir)
+        {stages, sched} = schedule(scan, timing, layout, Fir.costs(fir))
+        context(scan, timing, layout, stages, sched, fir)
       end
 
     c = Enum.reduce(graph.order, c, &lower/2)
-    {c, write_stage, state_writes} = state_writes(c, scan)
+    {c, groups} = state_writes(c, scan)
 
-    spacing = scan.ii
-    loop = write_stage - state_stage + 1
+    for g <- groups do
+      loop = g.write_stage - g.state_stage + 1 + scan.ram_latency
 
-    if loop > spacing do
-      raise UnsupportedError,
-            "scan: the generated state update needs #{loop} cycles (stages #{state_stage}-#{write_stage}), " <>
-              "more than ii: #{spacing}; this is a mismatch between the schedule and the generator"
+      if loop > scan.ii do
+        raise UnsupportedError,
+              "scan: the generated state update needs #{loop} cycles (stages #{g.state_stage}-#{g.write_stage}" <>
+                "#{if scan.ram_latency > 0, do: ", memory read #{scan.ram_latency}", else: ""}), " <>
+                "more than ii: #{scan.ii}; this is a mismatch between the schedule and the generator"
+      end
     end
 
+    state_stage = groups |> Enum.map(& &1.state_stage) |> Enum.min(fn -> 0 end)
+    write_stage = groups |> Enum.map(& &1.write_stage) |> Enum.max(fn -> 0 end)
+
     {c, latency, out_expr} = outputs(c, scan)
-    depth = max(latency, write_stage)
+    depth = Enum.max([latency, write_stage | Map.values(c.pc_stages)])
 
     source =
       emit(c, %{
@@ -177,8 +252,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
         scan: scan,
         latency: latency,
         depth: depth,
-        write_stage: write_stage,
-        state_writes: state_writes,
+        groups: groups,
         out_expr: out_expr
       })
 
@@ -191,21 +265,41 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       channels: scan.channels,
       state_stage: state_stage,
       write_stage: write_stage,
+      state_groups: Enum.map(groups, &Map.take(&1, [:leaves, :state_stage, :write_stage])),
+      state_mem: scan.state_mem,
+      busy: scan.state_mem != :registers and layout.state_init == :clear and groups != [],
       inputs: layout.inputs,
       outputs: layout.outputs,
       params: layout.params,
+      channel_params: layout.chan_params,
+      pc_width: layout.pc_width,
+      pc_clock: layout.pc_clock,
+      tid: layout.tid,
+      tuser: layout.tuser,
       in_width: layout.in_width,
       out_width: layout.out_width
     }
   end
 
-  defp context(scan, timing, layout, state_stage, sched, fir) do
-    %{
+  defp context(scan, timing, layout, stages, sched, fir) do
+    users =
+      for id <- scan.graph.order, input <- Enum.uniq(scan.graph.nodes[id].inputs), reduce: %{} do
+        acc -> Map.update(acc, input, [id], &[id | &1])
+      end
+
+    c = %{
       graph: scan.graph,
       timing: timing,
       sched: sched,
       layout: layout,
-      state_stage: state_stage,
+      users: users,
+      # state stage of every state parameter (Nx index), and of each group
+      state_stages: stages.by_index,
+      groups: scan.groups,
+      group_stages: stages.groups,
+      state_mem: scan.state_mem,
+      ram_latency: scan.ram_latency,
+      pc_stages: %{},
       channels: scan.channels,
       sigs: %{},
       defs: %{},
@@ -221,6 +315,34 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       fir: fir,
       planning: false
     }
+
+    # per-channel parameters are read from their memory where first used
+    pc_stages =
+      for p <- layout.chan_params, into: %{} do
+        id = Enum.find(scan.graph.order, &(param_index(scan.graph, &1) == p.index))
+        use = id && first_use(c, id)
+        {p.index, max(layout.pc_latency, use || layout.pc_latency)}
+      end
+
+    %{c | pc_stages: pc_stages}
+  end
+
+  defp param_index(graph, id) do
+    node = graph.nodes[id]
+    if node.op == :parameter, do: node.attrs
+  end
+
+  # Views are wiring: the stage where the value first enters an operation.
+  @views [:as_type, :reshape, :squeeze, :broadcast, :transpose, :slice, :concatenate]
+
+  defp first_use(c, id) do
+    c.users
+    |> Map.get(id, [])
+    |> Enum.map(fn u ->
+      if c.graph.nodes[u].op in @views, do: first_use(c, u), else: exec_stage(c, u)
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.min(fn -> nil end)
   end
 
   # -- checks ------------------------------------------------------------------------------
@@ -292,20 +414,47 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
     {outputs, out_bits} = fields(outputs)
 
-    params =
+    per_channel = Keyword.get(opts, :channel_params, [])
+
+    {chan_params, params} =
       param_args
       |> Enum.with_index()
       |> Enum.flat_map(fn {arg, k} ->
         base = Enum.at(names, k) || "param#{arg.arg}"
+        chan? = per_channel == :all or base in List.wrap(per_channel)
 
         case arg.leaves do
-          [leaf] -> [{base, leaf}]
-          leaves -> leaves |> Enum.with_index() |> Enum.map(fn {l, i} -> {"#{base}_#{i}", l} end)
+          [leaf] ->
+            [{base, leaf, chan?}]
+
+          leaves ->
+            leaves |> Enum.with_index() |> Enum.map(fn {l, i} -> {"#{base}_#{i}", l, chan?} end)
         end
       end)
-      |> Enum.map(fn {n, leaf} ->
-        Map.merge(leaf, %{port: "p_#{n}", bits: type_bits(leaf.type)})
+      |> Enum.map(fn {n, leaf, chan?} ->
+        {chan?, Map.merge(leaf, %{port: "p_#{n}", name: n, bits: type_bits(leaf.type)})}
       end)
+      |> Enum.split_with(&elem(&1, 0))
+
+    params = Enum.map(params, &elem(&1, 1))
+
+    {chan_params, pc_bits} =
+      chan_params
+      |> Enum.map(&(&1 |> elem(1) |> Map.delete(:port)))
+      |> fields()
+
+    known =
+      param_args
+      |> Enum.with_index()
+      |> Enum.map(fn {arg, k} -> Enum.at(names, k) || "param#{arg.arg}" end)
+
+    for name <- if(per_channel == :all, do: [], else: List.wrap(per_channel)),
+        name not in known,
+        do:
+          raise(
+            ArgumentError,
+            "scan: channel_params: no parameter argument named #{inspect(name)}"
+          )
 
     params_by_index = Map.new(params, &{&1.index, &1})
     inputs_by_index = Map.new(inputs, &{&1.index, &1})
@@ -317,12 +466,24 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       |> Enum.with_index()
       |> Enum.map(fn {leaf, k} -> Map.merge(leaf, %{leaf: k, init: Enum.at(init, k)}) end)
 
+    param_mem = Keyword.get(opts, :param_mem, :block)
+    pc_latency = Keyword.get(opts, :param_ram_latency, if(param_mem == :ultra, do: 2, else: 1))
+
     %{
       lanes: lanes,
       count_id: count_id,
       inputs: inputs,
       outputs: outputs,
       params: params,
+      chan_params: chan_params,
+      chan_by_index: Map.new(chan_params, &{&1.index, &1}),
+      pc_width: pc_bits,
+      pc_latency: pc_latency,
+      param_mem: param_mem,
+      pc_clock: Keyword.get(opts, :pc_clock, :shared),
+      tid: Keyword.get(opts, :tid, false),
+      tuser: Keyword.get(opts, :tuser, 0),
+      state_init: Keyword.get(opts, :state_init, :clear),
       params_by_index: params_by_index,
       inputs_by_index: inputs_by_index,
       states: states,
@@ -387,35 +548,84 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   defp byte_align(0), do: 8
   defp byte_align(bits), do: div(bits + 7, 8) * 8
 
+  defp check_options!(scan, l) do
+    multi = scan.channels > 1
+
+    problem =
+      cond do
+        l.tid and not multi ->
+          "tid: true needs channels: n"
+
+        l.chan_params != [] and not multi ->
+          "channel_params: needs channels: n"
+
+        l.param_mem not in [:distributed, :block, :ultra] ->
+          "param_mem: must be :distributed, :block or :ultra"
+
+        not (is_integer(l.pc_latency) and l.pc_latency >= 1) ->
+          "param_ram_latency: must be a positive integer"
+
+        l.pc_clock not in [:shared, :separate] ->
+          "pc_clock: must be :shared or :separate"
+
+        l.state_init not in [:clear, :initial] ->
+          "state_init: must be :clear or :initial"
+
+        not (is_integer(l.tuser) and l.tuser >= 0) ->
+          "tuser: must be a bit width"
+
+        true ->
+          nil
+      end
+
+    if problem, do: raise(ArgumentError, "scan: " <> problem)
+  end
+
   # -- schedule ------------------------------------------------------------------------------
 
   # Static values (parameter ports, constants and what is computed only from
-  # them) need no pipeline registers. The state is read in the stage where
-  # every non-static value entering the loop is available.
+  # them) need no pipeline registers. Per-channel parameters arrive from
+  # their memory `pc_latency` cycles after the sample. Each state group
+  # (in dependency order) is read in the stage where every non-static value
+  # entering its loop is available, at least `ram_latency` (the state
+  # memory's read is issued that much earlier).
   defp schedule(scan, timing, layout, costs \\ %{}) do
     graph = scan.graph
-    base = Schedule.asap(graph, graph.order, timing, %{}, costs)
     static = static_nodes(graph, layout)
 
-    next_ids = flatten(scan.next_state)
+    pc_seeds =
+      for id <- graph.order,
+          Map.has_key?(layout.chan_by_index, param_index(graph, id)),
+          into: %{},
+          do: {id, {layout.pc_latency, 0.0}}
 
-    entering =
-      for(
-        id <- MapSet.to_list(scan.recurrence),
-        input <- graph.nodes[id].inputs,
-        not MapSet.member?(scan.recurrence, input),
-        do: input
-      ) ++ Enum.reject(next_ids, &MapSet.member?(scan.recurrence, &1))
+    {seeds, stages} =
+      Enum.reduce(scan.groups, {pc_seeds, []}, fn g, {seeds, stages} ->
+        sched = Schedule.asap(graph, graph.order, timing, seeds, costs)
 
-    stage =
-      entering
-      |> Enum.uniq()
-      |> Enum.reject(&(MapSet.member?(static, &1) or &1 in scan.state_params))
-      |> Enum.map(fn id -> available(base[id].at) end)
-      |> Enum.max(fn -> 0 end)
+        entering =
+          for(
+            id <- MapSet.to_list(g.recurrence),
+            input <- graph.nodes[id].inputs,
+            not MapSet.member?(g.recurrence, input),
+            do: input
+          ) ++ Enum.reject(g.next, &MapSet.member?(g.recurrence, &1))
 
-    seeds = Map.new(scan.state_params, &{&1, {stage, 0.0}})
-    {stage, Schedule.asap(graph, graph.order, timing, seeds, costs)}
+        stage =
+          entering
+          |> Enum.uniq()
+          |> Enum.reject(&(MapSet.member?(static, &1) or &1 in g.params))
+          |> Enum.map(fn id -> available(sched[id].at) end)
+          |> Enum.max(fn -> 0 end)
+          |> max(scan.ram_latency)
+
+        {Enum.reduce(g.params, seeds, &Map.put(&2, &1, {stage, 0.0})), [stage | stages]}
+      end)
+
+    by_index = Map.new(scan.state_params, &{graph.nodes[&1].attrs, elem(seeds[&1], 0)})
+
+    {%{by_index: by_index, groups: Enum.reverse(stages)},
+     Schedule.asap(graph, graph.order, timing, seeds, costs)}
   end
 
   defp available({c, t}) when t == 0, do: c
@@ -486,6 +696,18 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
           name = elem_name(node, e)
           c = new_sig(c, name, fmt, :static, false)
           {assign(c, name, "#{port.port}_q[#{e * port.bits} +: #{bits(fmt)}]"), {:sig, name}}
+        end)
+
+      Map.has_key?(l.chan_by_index, index) ->
+        # read from the leaf's memory (emitted with the bank logic) in its stage
+        k = Enum.find_index(l.chan_params, &(&1.index == index))
+        r = c.pc_stages[index]
+        w = bits(fmt)
+
+        map_c(0..(size(node.shape) - 1), c, fn e, c ->
+          name = elem_name(node, e)
+          c = c |> new_sig(name, fmt, r, false) |> assign(name, "pc#{k}_q[#{e * w} +: #{w}]")
+          {c, {:sig, name}}
         end)
 
       state = l.states_by_index[index] ->
@@ -954,23 +1176,73 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
   defp state_read(c, node, state) do
     fmt = IntSet.bit_width(node.range)
-    s = c.state_stage
+    s = c.state_stages[state.index]
 
     map_c(0..(size(node.shape) - 1), c, fn e, c ->
       name = elem_name(node, e)
       c = define(c, name, {:state, state.index, e, Enum.at(state.init, e)})
 
-      if c.channels == 1 do
-        {new_sig(c, name, fmt, s, true), {:sig, name}}
-      else
-        c = c |> new_sig(name, fmt, s, false) |> assign(name, "#{name}_mem[#{ch(s)}]")
-        {c, {:sig, name}}
+      cond do
+        c.state_mem != :registers ->
+          # a field of the group's memory word, read ahead (`state_logic`)
+          {g, offset} = state_field(c, node.id, e)
+          w = bits(fmt)
+          c = c |> new_sig(name, fmt, s, false) |> assign(name, "st#{g}_q[#{offset} +: #{w}]")
+          {c, {:sig, name}}
+
+        c.channels == 1 ->
+          {new_sig(c, name, fmt, s, true), {:sig, name}}
+
+        true ->
+          c = c |> new_sig(name, fmt, s, false) |> assign(name, "#{name}_mem[#{ch(s)}]")
+          {c, {:sig, name}}
       end
     end)
   end
 
-  # Delays every next-state element to the latest one's stage; returns the
-  # write stage and `[{reg_or_mem_name, fmt, init, expr}]`.
+  # Memory and bit offset of element `e` of state parameter `id`.
+  defp state_field(c, id, e) do
+    c
+    |> state_words()
+    |> Enum.find_value(fn {u, _groups, fields} ->
+      Enum.find_value(fields, fn {fid, fe, offset, _fmt} ->
+        if fid == id and fe == e, do: {u, offset}
+      end)
+    end)
+  end
+
+  # State memories: the groups read in the same stage share one memory
+  # word (written at the latest of their write stages, which keeps every
+  # loop within its bound). `[{unit, group_indices, [{param_id, e, offset, fmt}]}]`,
+  # leaves and elements in order.
+  defp state_words(c) do
+    c.groups
+    |> Enum.zip(c.group_stages)
+    |> Enum.with_index()
+    |> Enum.reject(fn {{g, _s}, _gi} -> g.params == [] end)
+    |> Enum.group_by(fn {{_g, s}, _gi} -> s end)
+    |> Enum.sort_by(fn {_s, [{_, gi} | _]} -> gi end)
+    |> Enum.with_index()
+    |> Enum.map(fn {{_s, members}, u} ->
+      {fields, _} =
+        members
+        |> Enum.flat_map(fn {{g, _s}, _gi} -> g.params end)
+        |> Enum.flat_map(fn id ->
+          node = c.graph.nodes[id]
+          fmt = IntSet.bit_width(node.range)
+          for e <- 0..(size(node.shape) - 1), do: {id, e, fmt}
+        end)
+        |> Enum.map_reduce(0, fn {id, e, fmt}, offset ->
+          {{id, e, offset, fmt}, offset + bits(fmt)}
+        end)
+
+      {u, Enum.map(members, &elem(&1, 1)), fields}
+    end)
+  end
+
+  # Per state group: delays every next-state element to the latest one's
+  # stage (the group's write stage). Returns the groups as
+  # `%{index:, leaves:, state_stage:, write_stage:, writes: [{name, fmt, init, expr}]}`.
   defp state_writes(c, scan) do
     graph = c.graph
     next_ids = flatten(scan.next_state)
@@ -978,38 +1250,64 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     leaves =
       for {state, next_id} <- Enum.zip(c.layout.states, next_ids),
           param = Enum.find(scan.state_params, &(graph.nodes[&1].attrs == state.index)),
-          do: {state, graph.nodes[param], next_id}
+          param != nil,
+          into: %{},
+          do: {param, {state, graph.nodes[param], next_id}}
 
-    for {_state, pnode, next_id} <- leaves,
+    for {_param, {_state, pnode, next_id}} <- leaves,
         not IntSet.subtype?(graph.nodes[next_id].range, pnode.range) do
       raise UnsupportedError,
             "scan: next state (node #{next_id}) can leave the state's range " <>
               "(#{inspect(IntSet.bounds(graph.nodes[next_id].range))} vs #{inspect(IntSet.bounds(pnode.range))})"
     end
 
-    write_stage =
-      for {_, _, next_id} <- leaves,
-          ref <- Tuple.to_list(c.elems[next_id]),
-          not static?(c, ref),
-          reduce: c.state_stage do
-        acc -> max(acc, c.sigs[elem(ref, 1)].stage)
-      end
-
-    {writes, c} =
-      Enum.flat_map_reduce(leaves, c, fn {state, pnode, next_id}, c ->
-        fmt = IntSet.bit_width(pnode.range)
-
-        c.elems[next_id]
-        |> Tuple.to_list()
-        |> Enum.with_index()
-        |> Enum.map_reduce(c, fn {ref, e}, c ->
-          {c, x, _} = operand(c, ref, write_stage)
-          init = Enum.at(state.init, e)
-          {{elem_name(pnode, e), fmt, init, "#{bits(fmt)}'(#{x})"}, c}
-        end)
+    own_w =
+      scan.groups
+      |> Enum.zip(c.group_stages)
+      |> Enum.map(fn {g, s} ->
+        for id <- g.params,
+            {_, _, next_id} = Map.fetch!(leaves, id),
+            ref <- Tuple.to_list(c.elems[next_id]),
+            not static?(c, ref),
+            reduce: s do
+          acc -> max(acc, c.sigs[elem(ref, 1)].stage)
+        end
       end)
 
-    {c, write_stage, writes}
+    # groups sharing a state memory write together
+    unit_w =
+      if c.state_mem == :registers,
+        do: own_w,
+        else:
+          Enum.reduce(state_words(c), own_w, fn {_u, gis, _}, ws ->
+            w = gis |> Enum.map(&Enum.at(ws, &1)) |> Enum.max()
+            Enum.reduce(gis, ws, &List.replace_at(&2, &1, w))
+          end)
+
+    scan.groups
+    |> Enum.zip(c.group_stages)
+    |> Enum.with_index()
+    |> Enum.map_reduce(c, fn {{g, s}, gi}, c ->
+      members = Enum.map(g.params, &Map.fetch!(leaves, &1))
+      w = Enum.at(unit_w, gi)
+
+      {writes, c} =
+        Enum.flat_map_reduce(members, c, fn {state, pnode, next_id}, c ->
+          fmt = IntSet.bit_width(pnode.range)
+
+          c.elems[next_id]
+          |> Tuple.to_list()
+          |> Enum.with_index()
+          |> Enum.map_reduce(c, fn {ref, e}, c ->
+            {c, x, _} = operand(c, ref, w)
+            init = Enum.at(state.init, e)
+            {{elem_name(pnode, e), fmt, init, "#{bits(fmt)}'(#{x})"}, c}
+          end)
+        end)
+
+      {%{index: gi, leaves: g.leaves, state_stage: s, write_stage: w, writes: writes}, c}
+    end)
+    |> swap()
   end
 
   # -- outputs --------------------------------------------------------------------------------
@@ -1163,11 +1461,11 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
       :negate ->
         {c, [a], _} = operands(c, refs, stage, rsw)
-        {c, "#{w}'(-#{a})"}
+        {c, "#{w}'(-(#{a}))"}
 
       :abs ->
         {c, [a], e} = operands(c, refs, stage, rsw)
-        {c, "#{w}'((#{a} < #{lit(0, e)}) ? -#{a} : #{a})"}
+        {c, "#{w}'((#{a} < #{lit(0, e)}) ? -(#{a}) : #{a})"}
 
       :min ->
         {c, [a, b], _} = operands(c, refs, stage, rsw)
@@ -1668,19 +1966,51 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     l = c.layout
     scan = d.scan
     depth = d.depth
-    s = c.state_stage
-    w = d.write_stage
     n = scan.channels
+    cw = max(1, bit_len(n - 1))
+    busy = scan.state_mem != :registers and l.state_init == :clear and d.groups != []
+    chan? = l.chan_params != []
 
     params =
       Enum.map(l.params, fn p ->
         "  input  logic [#{p.bits * size(p.shape) - 1}:0] #{p.port},\n"
       end) ++ if(l.params == [], do: [], else: ["  input  logic p_load,\n"])
 
+    pc_ports =
+      if chan? do
+        [
+          if(l.pc_clock == :separate, do: "  input  logic pc_clk,\n", else: []),
+          "  input  logic [#{cw - 1}:0] pc_addr,\n",
+          "  input  logic [#{l.pc_width - 1}:0] pc_data,\n",
+          "  input  logic pc_we,\n",
+          "  input  logic pc_swap,\n",
+          "  output logic pc_pending,\n"
+        ]
+      else
+        []
+      end
+
+    in_side =
+      [
+        if(l.tid, do: "  input  logic [#{cw - 1}:0] s_axis_tid,\n", else: []),
+        if(l.tuser > 0, do: "  input  logic [#{l.tuser - 1}:0] s_axis_tuser,\n", else: [])
+      ]
+
+    out_side =
+      [
+        if(n > 1, do: "  output logic [#{cw - 1}:0] m_axis_tid,\n", else: []),
+        if(l.tuser > 0, do: "  output logic [#{l.tuser - 1}:0] m_axis_tuser,\n", else: [])
+      ]
+
+    state_regs =
+      for g <- d.groups, {name, _, _, _} <- g.writes, into: MapSet.new(), do: name
+
     decls =
       c.decls
       |> Enum.reverse()
-      |> Enum.reject(&state_reg?(c, &1, d.state_writes))
+      |> Enum.reject(
+        &(n == 1 and scan.state_mem == :registers and MapSet.member?(state_regs, &1))
+      )
       |> Enum.map(fn name ->
         sig = c.sigs[name]
         "  #{decl_type({if(sig.signed, do: :s, else: :u), sig.bits})} #{name};\n"
@@ -1690,6 +2020,11 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       if depth == 1,
         do: "vld_0",
         else: "{vld[#{depth - 1}:1], vld_0}"
+
+    holds =
+      [if(l.params == [], do: nil, else: "!p_pending"), if(busy, do: "!st_clr")]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map_join(&" && #{&1}")
 
     control = [
       "  // control: one clock enable for the whole pipeline, from registers\n",
@@ -1701,8 +2036,9 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       "  logic [#{depth}:1] vld;  // vld[k]: stage k holds a sample\n",
       "  logic ob_room;\n",
       if(l.params == [], do: [], else: "  logic p_pending;\n"),
+      if(busy, do: "  logic st_clr;\n", else: []),
       "  assign ce = ob_room;\n",
-      "  assign issue_ok = gap_ok#{if l.params == [], do: "", else: " && !p_pending"};\n",
+      "  assign issue_ok = gap_ok#{holds};\n",
       "  assign s_axis_tready = ce && issue_ok;\n",
       "  assign vld_0 = s_axis_tvalid && issue_ok;\n",
       "  always_ff @(posedge clk) begin\n",
@@ -1715,33 +2051,45 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       if n > 1 or scan.ii == 1 do
         "  assign gap_ok = 1'b1;\n"
       else
-        cw = max(1, bit_len(scan.ii - 1))
-        last = "#{cw}'d#{scan.ii - 1}"
+        gw = max(1, bit_len(scan.ii - 1))
+        last = "#{gw}'d#{scan.ii - 1}"
 
         [
           "  // one sample every #{scan.ii} enabled cycles\n",
-          "  logic [#{cw - 1}:0] gap;\n",
+          "  logic [#{gw - 1}:0] gap;\n",
           "  assign gap_ok = (gap == #{last});\n",
           "  always_ff @(posedge clk) begin\n",
           "    if (!rst_n) gap <= #{last};\n",
-          "    else if (ce) gap <= vld_0 ? #{cw}'d0 : (gap_ok ? gap : gap + #{cw}'d1);\n",
+          "    else if (ce) gap <= vld_0 ? #{gw}'d0 : (gap_ok ? gap : gap + #{gw}'d1);\n",
           "  end\n"
         ]
       end
 
     channel =
       if n > 1 do
-        cw = max(1, bit_len(n - 1))
         regs = Enum.map(0..depth, &"  logic [#{cw - 1}:0] #{ch(&1)};\n")
         pipe = Enum.map(1..depth//1, &"      #{ch(&1)} <= #{ch(&1 - 1)};\n")
 
+        first =
+          if l.tid do
+            [
+              "  // channel of the sample in each stage, from s_axis_tid\n",
+              regs,
+              "  assign #{ch(0)} = s_axis_tid;\n"
+            ]
+          else
+            [
+              "  // channel of the sample in each stage, round robin in arrival order\n",
+              regs,
+              "  always_ff @(posedge clk) begin\n",
+              "    if (!rst_n) #{ch(0)} <= '0;\n",
+              "    else if (ce && vld_0) #{ch(0)} <= (#{ch(0)} == #{cw}'d#{n - 1}) ? '0 : #{ch(0)} + #{cw}'d1;\n",
+              "  end\n"
+            ]
+          end
+
         [
-          "  // channel of the sample in each stage, round robin in arrival order\n",
-          regs,
-          "  always_ff @(posedge clk) begin\n",
-          "    if (!rst_n) #{ch(0)} <= '0;\n",
-          "    else if (ce && vld_0) #{ch(0)} <= (#{ch(0)} == #{cw}'d#{n - 1}) ? '0 : #{ch(0)} + #{cw}'d1;\n",
-          "  end\n",
+          first,
           "  always_ff @(posedge clk) begin\n",
           "    if (ce) begin\n",
           pipe,
@@ -1752,7 +2100,29 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
         []
       end
 
-    {state_decls, state_logic} = state_logic(d.state_writes, n, s, w)
+    user =
+      if l.tuser > 0 do
+        regs = Enum.map(1..d.latency, &"  logic [#{l.tuser - 1}:0] user_#{&1};\n")
+
+        pipe =
+          Enum.map(1..d.latency, fn k ->
+            "      user_#{k} <= #{if k == 1, do: "s_axis_tuser", else: "user_#{k - 1}"};\n"
+          end)
+
+        [
+          "  // tuser travels with the sample\n",
+          regs,
+          "  always_ff @(posedge clk) begin\n",
+          "    if (ce) begin\n",
+          pipe,
+          "    end\n",
+          "  end\n"
+        ]
+      else
+        []
+      end
+
+    {state_decls, state_logic} = state_logic(c, d.groups, n, busy)
     sample_logic = sample_logic(c)
 
     ffs =
@@ -1768,27 +2138,43 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
           ]
       end
 
+    side =
+      [
+        if(l.tuser > 0, do: {"user_#{d.latency}", "m_axis_tuser", l.tuser}),
+        if(n > 1, do: {ch(d.latency), "m_axis_tid", cw})
+      ]
+      |> Enum.reject(&is_nil/1)
+
     IO.iodata_to_binary([
       "// Generated by ExHdl from a stream kernel. Do not edit.\n",
-      "// #{d.name}: latency #{d.latency + 1}, ii #{scan.ii}, channels #{n}\n",
+      "// #{d.name}: latency #{d.latency + 1}, ii #{scan.ii}, channels #{n}",
+      if(scan.state_mem == :registers, do: "", else: ", state in #{scan.state_mem} RAM"),
+      "\n",
       "// s_axis_tdata: #{describe_fields(l.inputs)}\n",
       "// m_axis_tdata: #{describe_fields(l.outputs)}\n",
+      if(chan?, do: "// pc_data: #{describe_fields(l.chan_params)}\n", else: []),
       "/* verilator lint_off UNUSEDSIGNAL */\n",
       "module #{d.name} (\n",
       "  input  logic clk,\n",
       "  input  logic rst_n,\n",
       params,
+      pc_ports,
+      if(busy, do: "  output logic busy,\n", else: []),
       "  input  logic [#{l.in_width - 1}:0] s_axis_tdata,\n",
+      in_side,
       "  input  logic s_axis_tvalid,\n",
       "  output logic s_axis_tready,\n",
       "  output logic [#{l.out_width - 1}:0] m_axis_tdata,\n",
+      out_side,
       "  output logic m_axis_tvalid,\n",
       "  input  logic m_axis_tready\n",
       ");\n\n",
       control,
       throttle,
       channel,
+      user,
       param_logic(l.params),
+      channel_param_logic(c, cw),
       "\n",
       Enum.reverse(c.blocks),
       state_decls,
@@ -1802,7 +2188,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       state_logic,
       sample_logic,
       "\n",
-      out_buffer(d.out_expr, l.out_width, valid(d.latency)),
+      out_buffer(d.out_expr, l.out_width, valid(d.latency), side),
       "endmodule\n",
       "/* verilator lint_on UNUSEDSIGNAL */\n"
     ])
@@ -1811,23 +2197,29 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   # Output buffer: the pipeline pushes its result (up to `lanes` items, the
   # valid ones first) with the clock enable, the stream pops one item per
   # beat; the pipeline runs while the buffer has room for a full push.
-  defp out_buffer({lanes, count}, width, valid) do
+  # `side` are sideband fields `{expr, port, bits}` stored with every item.
+  defp out_buffer({lanes, count}, width, valid, side) do
     n = length(lanes)
     depth = pow2(max(2, 2 * n))
     aw = ceil_log2(depth)
     cw = bit_len(n)
+    word = width + (side |> Enum.map(&elem(&1, 2)) |> Enum.sum())
+    side_exprs = side |> Enum.map(&elem(&1, 0)) |> Enum.reverse()
+    pack = fn x -> "{" <> Enum.join(side_exprs ++ [x], ", ") <> "}" end
+    ports = (side |> Enum.map(&elem(&1, 1)) |> Enum.reverse()) ++ ["m_axis_tdata"]
 
     writes =
       lanes
       |> Enum.with_index()
       |> Enum.map(fn {x, j} ->
         guard = if count, do: "if (ob_n > #{cw}'d#{j}) ", else: ""
-        "        #{guard}ob_mem[#{aw}'(ob_wp + #{aw}'d#{j})] <= #{x};\n"
+
+        "        #{guard}ob_mem[#{aw}'(ob_wp + #{aw}'d#{j})] <= #{if side == [], do: x, else: pack.(x)};\n"
       end)
 
     [
       "  // output buffer#{if count, do: " (#{n} lanes, count of valid ones)", else: ""}\n",
-      "  logic [#{width - 1}:0] ob_mem [#{depth}];\n",
+      "  logic [#{word - 1}:0] ob_mem [#{depth}];\n",
       "  logic [#{aw - 1}:0] ob_wp, ob_rp;\n",
       "  logic [#{aw}:0] ob_count;\n",
       "  logic [#{cw - 1}:0] ob_n;\n",
@@ -1851,7 +2243,10 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       "    end\n",
       "  end\n",
       "  assign m_axis_tvalid = ob_count != '0;\n",
-      "  assign m_axis_tdata = ob_mem[ob_rp];\n"
+      if(side == [],
+        do: "  assign m_axis_tdata = ob_mem[ob_rp];\n",
+        else: "  assign {#{Enum.join(ports, ", ")}} = ob_mem[ob_rp];\n"
+      )
     ]
   end
 
@@ -1884,38 +2279,281 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     ]
   end
 
-  defp state_logic([], _n, _s, _w), do: {[], []}
+  # Per-channel parameters: one memory per leaf with two banks of a word per
+  # channel, addressed `{bank, channel}`. The bank of a sample is fixed when
+  # it is accepted and travels with it; the read is issued `pc_latency`
+  # stages before the leaf's first use.
+  defp channel_param_logic(%{layout: %{chan_params: []}}, _cw), do: []
 
-  defp state_logic(writes, n, s, w) do
+  defp channel_param_logic(c, cw) do
+    l = c.layout
+    pl = l.pc_latency
+    wclk = if l.pc_clock == :separate, do: "pc_clk", else: "clk"
+    depth = 1 <<< (cw + 1)
+
+    leaves =
+      for {p, k} <- Enum.with_index(l.chan_params),
+          id = Enum.find(c.graph.order, &(param_index(c.graph, &1) == p.index)),
+          id != nil do
+        fmt = IntSet.bit_width(c.graph.nodes[id].range)
+        {p, k, bits(fmt), c.pc_stages[p.index]}
+      end
+
+    # last stage that issues a read: old-bank samples are gone once the
+    # swap marker has passed it
+    last_read = leaves |> Enum.map(fn {_, _, _, r} -> r - pl end) |> Enum.max(fn -> 0 end)
+    marks = max(1, last_read)
+
+    frame_start =
+      if l.tid,
+        do: "pc_fresh || (vld_0 && s_axis_tid <= pc_last)",
+        else: "#{ch(0)} == #{cw}'d0"
+
+    banks = Enum.map(1..last_read//1, &"  logic bank_#{&1};\n")
+    bank_pipe = Enum.map(1..last_read//1, &"      bank_#{&1} <= bank_#{&1 - 1};\n")
+
+    mems =
+      Enum.map(leaves, fn {p, k, w, r} ->
+        mw = w * size(p.shape)
+        a = r - pl
+        regs = Enum.map(1..pl, &"  logic [#{mw - 1}:0] pc#{k}_r#{&1};\n")
+
+        reads =
+          Enum.map(1..pl, fn j ->
+            src = if j == 1, do: "pc#{k}_mem[{bank_#{a}, #{ch(a)}}]", else: "pc#{k}_r#{j - 1}"
+            "      pc#{k}_r#{j} <= #{src};\n"
+          end)
+
+        data =
+          (size(p.shape) - 1)..0//-1
+          |> Enum.map_join(", ", &"pc_data[#{p.offset + &1 * p.bits} +: #{w}]")
+
+        [
+          "  // #{p.name}: read in stage #{a} for stage #{r}\n",
+          "  (* ram_style = \"#{ram_style(l.param_mem)}\" *) logic [#{mw - 1}:0] pc#{k}_mem [#{depth}];\n",
+          regs,
+          "  logic [#{mw - 1}:0] pc#{k}_q;\n",
+          "  assign pc#{k}_q = pc#{k}_r#{pl};\n",
+          "  always_ff @(posedge #{wclk}) begin\n",
+          "    if (pc_we) pc#{k}_mem[{~pc_active, pc_addr}] <= {#{data}};\n",
+          "  end\n",
+          "  always_ff @(posedge clk) begin\n",
+          "    if (ce) begin\n",
+          reads,
+          "    end\n",
+          "  end\n"
+        ]
+      end)
+
+    [
+      "  // per-channel parameters: two banks, the host writes the inactive one;\n",
+      "  // pc_swap makes it active at the next frame boundary\n",
+      "  logic pc_active, pc_req, pc_flip, pc_frame_start;\n",
+      "  logic bank_0;\n",
+      banks,
+      "  logic [#{marks}:1] pc_mark;\n",
+      if(l.tid, do: "  logic pc_fresh;\n  logic [#{cw - 1}:0] pc_last;\n", else: []),
+      "  assign pc_frame_start = #{frame_start};\n",
+      "  assign pc_flip = ce && pc_req && pc_frame_start;\n",
+      "  assign bank_0 = pc_active ^ pc_flip;\n",
+      "  assign pc_pending = pc_req || (pc_mark != '0);\n",
+      "  always_ff @(posedge clk) begin\n",
+      "    if (!rst_n) begin\n",
+      "      pc_active <= 1'b0;\n",
+      "      pc_req <= 1'b0;\n",
+      "      pc_mark <= '0;\n",
+      if(l.tid, do: "      pc_fresh <= 1'b1;\n      pc_last <= '0;\n", else: []),
+      "    end else begin\n",
+      "      if (pc_flip) pc_active <= ~pc_active;\n",
+      "      if (pc_flip) pc_req <= 1'b0;\n",
+      "      else if (pc_swap) pc_req <= 1'b1;\n",
+      "      if (ce) pc_mark <= #{if marks == 1, do: "pc_flip", else: "{pc_mark[#{marks - 1}:1], pc_flip}"};\n",
+      if(l.tid,
+        do: [
+          "      if (ce && vld_0) begin\n",
+          "        pc_fresh <= 1'b0;\n",
+          "        pc_last <= s_axis_tid;\n",
+          "      end\n"
+        ],
+        else: []
+      ),
+      "    end\n",
+      "  end\n",
+      if(last_read > 0,
+        do: [
+          "  always_ff @(posedge clk) begin\n",
+          "    if (ce) begin\n",
+          bank_pipe,
+          "    end\n",
+          "  end\n"
+        ],
+        else: []
+      ),
+      mems
+    ]
+  end
+
+  defp ram_style(:ultra), do: "ultra"
+  defp ram_style(:block), do: "block"
+  defp ram_style(:distributed), do: "distributed"
+
+  # State per group: registers (one channel), register arrays indexed by
+  # the channel, or a memory with a word per channel.
+  defp state_logic(c, groups, n, busy) do
+    parts =
+      if c.state_mem == :registers do
+        Enum.map(groups, &group_state(c, &1, n))
+      else
+        Enum.map(state_words(c), fn {u, gis, fields} ->
+          members = Enum.map(gis, &Enum.at(groups, &1))
+          memory_state(c, u, members, fields, n)
+        end)
+      end
+
+    clear =
+      if busy do
+        aw = max(1, bit_len(n - 1))
+
+        [
+          "  // state clear after reset: one word per cycle, busy until done\n",
+          "  logic [#{aw - 1}:0] st_clr_addr;\n",
+          "  assign busy = st_clr;\n",
+          "  always_ff @(posedge clk) begin\n",
+          "    if (!rst_n) begin\n",
+          "      st_clr <= 1'b1;\n",
+          "      st_clr_addr <= '0;\n",
+          "    end else if (st_clr) begin\n",
+          "      st_clr_addr <= st_clr_addr + #{aw}'d1;\n",
+          "      if (st_clr_addr == #{aw}'d#{n - 1}) st_clr <= 1'b0;\n",
+          "    end\n",
+          "  end\n"
+        ]
+      else
+        []
+      end
+
+    {[clear | Enum.map(parts, &elem(&1, 0))], Enum.map(parts, &elem(&1, 1))}
+  end
+
+  defp group_state(_c, %{writes: []}, _n), do: {[], []}
+
+  defp group_state(%{state_mem: :registers}, g, n) do
+    s = g.state_stage
+    w = g.write_stage
+
     {decls, resets, updates, what} =
       if n == 1 do
         {
-          Enum.map(writes, fn {name, fmt, _, _} -> "  #{decl_type(fmt)} #{name};\n" end),
-          Enum.map(writes, fn {name, fmt, init, _} ->
+          Enum.map(g.writes, fn {name, fmt, _, _} -> "  #{decl_type(fmt)} #{name};\n" end),
+          Enum.map(g.writes, fn {name, fmt, init, _} ->
             "      #{name} <= #{lit(init, bits(fmt))};\n"
           end),
-          Enum.map(writes, fn {name, _, _, x} -> "      #{name} <= #{x};\n" end),
+          Enum.map(g.writes, fn {name, _, _, x} -> "      #{name} <= #{x};\n" end),
           "state"
         }
       else
         {
-          Enum.map(writes, fn {name, fmt, _, _} -> "  #{decl_type(fmt)} #{name}_mem [#{n}];\n" end),
-          Enum.map(writes, fn {name, fmt, init, _} ->
+          Enum.map(g.writes, fn {name, fmt, _, _} ->
+            "  #{decl_type(fmt)} #{name}_mem [#{n}];\n"
+          end),
+          Enum.map(g.writes, fn {name, fmt, init, _} ->
             "      for (int i = 0; i < #{n}; i++) #{name}_mem[i] <= #{lit(init, bits(fmt))};\n"
           end),
-          Enum.map(writes, fn {name, _, _, x} -> "      #{name}_mem[#{ch(w)}] <= #{x};\n" end),
+          Enum.map(g.writes, fn {name, _, _, x} -> "      #{name}_mem[#{ch(w)}] <= #{x};\n" end),
           "state of #{n} channels"
         }
       end
 
     {
-      ["  // #{what}: read in stage #{s}, written at the end of stage #{w}\n", decls, "\n"],
+      [
+        "  // #{what} (group #{g.index}): read in stage #{s}, written at the end of stage #{w}\n",
+        decls,
+        "\n"
+      ],
       [
         "  always_ff @(posedge clk) begin\n",
         "    if (!rst_n) begin\n",
         resets,
         "    end else if (ce && #{valid(w)}) begin\n",
         updates,
+        "    end\n",
+        "  end\n"
+      ]
+    }
+  end
+
+  defp memory_state(c, u, groups, fields, n) do
+    g = hd(groups)
+    writes = Enum.flat_map(groups, & &1.writes)
+    s = g.state_stage
+    w = g.write_stage
+    rl = c.ram_latency
+    ww = fields |> Enum.map(fn {_, _, _, fmt} -> bits(fmt) end) |> Enum.sum()
+    aw = max(1, bit_len(n - 1))
+    m = "st#{u}"
+
+    what =
+      "group#{if length(groups) > 1, do: "s"} " <> Enum.map_join(groups, ", ", &"#{&1.index}")
+
+    init =
+      writes
+      |> Enum.zip(fields)
+      |> Enum.reduce(0, fn {{_, fmt, v, _}, {_, _, offset, _}}, acc ->
+        acc ||| band(v, (1 <<< bits(fmt)) - 1) <<< offset
+      end)
+
+    init_lit = "#{ww}'h#{Integer.to_string(init, 16)}"
+    data = writes |> Enum.reverse() |> Enum.map_join(", ", fn {_, _, _, x} -> x end)
+    clear = c.layout.state_init == :clear
+
+    regs = Enum.map(1..rl, &"  logic [#{ww - 1}:0] #{m}_r#{&1};\n")
+
+    reads =
+      Enum.map(1..rl, fn j ->
+        src = if j == 1, do: "#{m}_mem[#{ch(s - rl)}]", else: "#{m}_r#{j - 1}"
+        "      #{m}_r#{j} <= #{src};\n"
+      end)
+
+    {
+      [
+        "  // state of #{n} channels (#{what}) in #{c.state_mem} RAM: read in stage #{s - rl} ",
+        "for stage #{s}, written at the end of stage #{w}\n",
+        "  (* ram_style = \"#{ram_style(c.state_mem)}\" *) logic [#{ww - 1}:0] #{m}_mem [#{n}];\n",
+        regs,
+        "  logic [#{ww - 1}:0] #{m}_q;\n",
+        "  logic #{m}_we;\n",
+        "  logic [#{aw - 1}:0] #{m}_wa;\n",
+        "  logic [#{ww - 1}:0] #{m}_wd;\n",
+        "  assign #{m}_q = #{m}_r#{rl};\n",
+        if(clear,
+          do: [],
+          else: [
+            "  initial begin\n",
+            "    for (int i = 0; i < #{n}; i++) #{m}_mem[i] = #{init_lit};\n",
+            "  end\n"
+          ]
+        ),
+        "\n"
+      ],
+      [
+        if(clear,
+          do: [
+            "  assign #{m}_we = st_clr || (ce && #{valid(w)});\n",
+            "  assign #{m}_wa = st_clr ? st_clr_addr : #{ch(w)};\n",
+            "  assign #{m}_wd = st_clr ? #{init_lit} : {#{data}};\n"
+          ],
+          else: [
+            "  assign #{m}_we = ce && #{valid(w)};\n",
+            "  assign #{m}_wa = #{ch(w)};\n",
+            "  assign #{m}_wd = {#{data}};\n"
+          ]
+        ),
+        "  always_ff @(posedge clk) begin\n",
+        "    if (#{m}_we) #{m}_mem[#{m}_wa] <= #{m}_wd;\n",
+        "  end\n",
+        "  always_ff @(posedge clk) begin\n",
+        "    if (ce) begin\n",
+        reads,
         "    end\n",
         "  end\n"
       ]
@@ -1956,10 +2594,6 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   defp valid(k), do: "vld[#{k}]"
 
   defp ch(k), do: "ch_#{k}"
-
-  defp state_reg?(c, name, writes) do
-    c.channels == 1 and Enum.any?(writes, fn {n, _, _, _} -> n == name end)
-  end
 
   defp describe_fields([]), do: "(none)"
 

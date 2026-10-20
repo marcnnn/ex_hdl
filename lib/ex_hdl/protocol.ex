@@ -3,6 +3,8 @@ defmodule ExHdl.Protocol do
   DSL for packet layouts that compile to both BEAM binary codecs and AXI4-Stream
   hardware.
 
+  A packet with one fixed header:
+
       defmodule MySDR.Protocol do
         use ExHdl.Protocol
 
@@ -18,22 +20,115 @@ defmodule ExHdl.Protocol do
         end
       end
 
+  A chain of headers, where the next layer follows from a field value (in the
+  style of a P4 parser):
+
+      defheader :eth do
+        field :dst, 48
+        field :src, 48
+        field :ethertype, 16, type: {:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800}
+      end
+
+      defheader :vlan do
+        field :pcp, 3
+        field :dei, 1, type: :flag
+        field :vid, 12
+        field :ethertype, 16, type: {:enum, vlan: 0x8100, ipv4: 0x0800}
+      end
+
+      defheader :ipv4 do
+        field :version, 4, assert: 4
+        field :ihl, 4, header_length: 4          # header is ihl * 4 bytes
+        field :dscp_ecn, 8
+        field :total_length, 16, length: :total  # this header + everything after it
+        field :id, 16
+        field :flags, 3
+        field :frag_offset, 13
+        field :ttl, 8
+        field :protocol, 8
+        field :checksum, 16, checksum: :header
+        field :src, 32
+        field :dst, 32
+        field :options, :bytes                   # the rest of the header
+      end
+
+      defheader :udp do
+        field :src_port, 16
+        field :dst_port, 16, match: 4            # 4-entry runtime table in hardware
+        field :length, 16, length: :total
+        field :checksum, 16, checksum: :segment, optional: true,
+          pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
+      end
+
+      defpacket :udp_rx, bus_width: 64 do
+        layer :eth, next: {:ethertype, vlan: :vlan, qinq: :vlan, ipv4: :ipv4}
+        layer :vlan, max: 2, next: {:ethertype, vlan: :vlan, ipv4: :ipv4}
+        layer :ipv4, next: {:protocol, %{17 => :udp}}
+        layer :udp
+        payload :data, type: :bytes
+      end
+
+  ## Fields
+
+  `field name, bits, opts`. Options:
+
+    * `type:` - `:uN` / `:sN` (default unsigned), `:flag` (1 bit, a boolean)
+      or `{:enum, name: value, ...}` (decodes to the name if known, encodes
+      names or integers)
+    * `assert: value` - the packet is dropped unless the field has this value
+    * `error: reason` - decode returns `{:error, reason}` when this field's
+      check fails, instead of the default tuple
+    * `match: n` - compared at run time against a table: in hardware `n`
+      entries from input ports, on the BEAM the `match:` decode option
+    * `length: :total` - bytes from the start of this layer to the end of the
+      packet; computed on encode, checked on decode, and the packet is cut
+      there (Ethernet padding is dropped)
+    * `header_length: unit` - the layer's header is `value * unit` bytes; the
+      last field `field :options, :bytes` holds the bytes past the fixed part
+    * `checksum: :header` - RFC 1071 checksum over this layer's header
+    * `checksum: :segment` - checksum over `pseudo:` fields (each zero-extended
+      to 16-bit words), this layer and the payload; `optional: true` means a
+      transmitted 0 is not checked and a computed 0 is sent as `0xFFFF` (UDP)
+
+  ## Layers
+
+  `defheader name do ... end` declares a reusable header, `layer name, opts`
+  places it in a packet (`header: other` or `header: {Module, other}` to use
+  a header under another name). Options: `next: {field, cases}` with cases a
+  map or keyword list from field values (or enum names) to the next layer or
+  `:payload`, `default:` the target of unlisted values (default `:reject`),
+  `max:` how often the layer may repeat. A layer without `next:` is followed
+  by the payload. The first layer is the root.
+
+  ## Generated functions
+
   For every packet `name` the module gets:
 
     * `name/0` - the validated `ExHdl.Protocol.Spec`
-    * `encode_name/2` - `(header :: map | keyword, payload :: list) -> binary`.
-      Asserted fields default to their asserted value.
-    * `decode_name/1` - `binary -> {:ok, header_map, payload_list} | {:error, reason}`,
-      implemented as a single binary pattern match.
-    * `__ex_hdl_packets__/0` - all specs of the module.
+    * `encode_name/2` - `(header :: map | keyword, payload) -> binary`.
+      Asserted fields default to their asserted value, computed fields are
+      computed unless given, selector fields default to the value that leads
+      to the next layer present in the map.
+    * `decode_name/1,2` - `binary -> {:ok, header, payload} | {:error, reason}`
+    * `decode_name_header/1,2` - `binary -> {:ok, header, rest} | {:error, reason}`,
+      the header chain only, `rest` the bytes after it
+    * `__ex_hdl_packets__/0`, `__ex_hdl_headers__/0`
+
+  Header maps are flat for a single `header` block. For layer chains they
+  map each layer to its field map, repeated layers (`max: n > 1`) to a list,
+  absent single layers are missing. Payloads are lists of integers (or
+  `{i, q}` for complex types), or binaries with `type: :bytes`. See
+  `ExHdl.Protocol.Codec` for the decode rules and error tuples, and
+  `ExHdl.Backends.SystemVerilog.Protocol` for the hardware.
   """
 
   alias ExHdl.Protocol.Spec
 
   defmacro __using__(_opts) do
     quote do
-      import ExHdl.Protocol, only: [defpacket: 2, defpacket: 3]
+      import ExHdl.Protocol, only: [defpacket: 2, defpacket: 3, defheader: 2]
       Module.register_attribute(__MODULE__, :ex_hdl_packets, accumulate: true)
+      Module.register_attribute(__MODULE__, :ex_hdl_headers, accumulate: true)
       @before_compile ExHdl.Protocol
     end
   end
@@ -48,155 +143,53 @@ defmodule ExHdl.Protocol do
     end
   end
 
+  defmacro defheader(name, do: block) do
+    quote do
+      ExHdl.Protocol.Builder.start_header(__MODULE__, unquote(name))
+      import ExHdl.Protocol.DSL, only: [field: 2, field: 3]
+      unquote(block)
+      import ExHdl.Protocol.DSL, only: []
+      ExHdl.Protocol.Builder.finish_header(__MODULE__)
+    end
+  end
+
   defmacro __before_compile__(env) do
     specs = env.module |> Module.get_attribute(:ex_hdl_packets) |> Enum.reverse()
+    headers = env.module |> Module.get_attribute(:ex_hdl_headers) |> Enum.reverse()
 
     defs = Enum.map(specs, &packet_functions/1)
 
     quote do
       @doc false
       def __ex_hdl_packets__, do: unquote(Macro.escape(specs))
+      @doc false
+      def __ex_hdl_headers__, do: unquote(Macro.escape(headers))
       unquote_splicing(defs)
     end
   end
 
-  # -- code generation -------------------------------------------------------
-
   defp packet_functions(%Spec{} = spec) do
-    encode = :"encode_#{spec.name}"
-    decode = :"decode_#{spec.name}"
-    header_var = Macro.var(:header, __MODULE__)
-    payload_var = Macro.var(:payload, __MODULE__)
-    endian = spec.byte_order
-
-    encode_segments =
-      Enum.map(spec.fields, fn f ->
-        value =
-          quote do
-            ExHdl.Protocol.Runtime.fetch_field!(
-              unquote(header_var),
-              unquote(spec.name),
-              unquote(f.name),
-              unquote(f.bits),
-              unquote(f.signed),
-              unquote(f.assert)
-            )
-          end
-
-        segment(value, f.bits, f.signed, endian)
-      end)
-
-    decode_segments =
-      Enum.map(spec.fields, fn f -> segment(field_var(f), f.bits, f.signed, endian) end)
-
-    header_map = {:%{}, [], Enum.map(spec.fields, fn f -> {f.name, field_var(f)} end)}
-
-    assert_checks =
-      for f <- spec.fields, f.assert != nil do
-        quote do
-          :ok <-
-            ExHdl.Protocol.Runtime.check_assert(
-              unquote(f.name),
-              unquote(field_var(f)),
-              unquote(f.assert)
-            )
-        end
-      end
-
-    elem_bytes = Spec.payload_elem_bytes(spec)
+    name = spec.name
+    encode = :"encode_#{name}"
+    decode = :"decode_#{name}"
+    decode_header = :"decode_#{name}_header"
 
     quote do
-      @doc "Returns the `ExHdl.Protocol.Spec` for `#{unquote(inspect(spec.name))}`."
-      def unquote(spec.name)(), do: unquote(Macro.escape(spec))
+      @doc "Returns the `ExHdl.Protocol.Spec` for `#{unquote(inspect(name))}`."
+      def unquote(name)(), do: unquote(Macro.escape(spec))
 
-      @doc "Encodes a `#{unquote(inspect(spec.name))}` packet."
-      def unquote(encode)(unquote(header_var), unquote(payload_var))
-          when is_list(unquote(payload_var)) do
-        unquote(header_var) = Map.new(unquote(header_var))
+      @doc "Encodes a `#{unquote(inspect(name))}` packet."
+      def unquote(encode)(header, payload),
+        do: ExHdl.Protocol.Codec.encode(unquote(name)(), header, payload)
 
-        <<unquote_splicing(encode_segments), unquote(encode_payload(spec, payload_var))::binary>>
-      end
+      @doc "Decodes a `#{unquote(inspect(name))}` packet (options: `match:`)."
+      def unquote(decode)(bin, opts \\ []) when is_binary(bin),
+        do: ExHdl.Protocol.Codec.decode(unquote(name)(), bin, opts)
 
-      @doc "Decodes a `#{unquote(inspect(spec.name))}` packet."
-      def unquote(decode)(<<unquote_splicing(decode_segments), unquote(payload_var)::binary>>) do
-        with unquote_splicing(assert_checks),
-             0 <- rem(byte_size(unquote(payload_var)), unquote(elem_bytes)) do
-          {:ok, unquote(header_map), unquote(decode_payload(spec, payload_var))}
-        else
-          unquote(
-            if assert_checks == [] do
-              quote(do: (_ -> {:error, :partial_payload_element}))
-            else
-              quote do
-                {:error, _} = err -> err
-                _ -> {:error, :partial_payload_element}
-              end
-            end
-          )
-        end
-      end
-
-      def unquote(decode)(bin) when is_binary(bin), do: {:error, :truncated_header}
+      @doc "Decodes the headers of a `#{unquote(inspect(name))}` packet, returning the rest as a binary."
+      def unquote(decode_header)(bin, opts \\ []) when is_binary(bin),
+        do: ExHdl.Protocol.Codec.decode_header(unquote(name)(), bin, opts)
     end
-  end
-
-  defp encode_payload(%Spec{payload: p, byte_order: endian, name: name}, payload_var) do
-    check = fn var ->
-      quote do
-        ExHdl.Protocol.Runtime.check_value!(
-          unquote(name),
-          unquote(p.name),
-          unquote(var),
-          unquote(p.elem_bits),
-          unquote(p.signed)
-        )
-      end
-    end
-
-    i = Macro.var(:i, __MODULE__)
-    q = Macro.var(:q, __MODULE__)
-
-    if p.complex do
-      quote do
-        for {unquote(i), unquote(q)} <- unquote(payload_var), into: <<>> do
-          <<unquote(segment(check.(i), p.elem_bits, p.signed, endian)),
-            unquote(segment(check.(q), p.elem_bits, p.signed, endian))>>
-        end
-      end
-    else
-      quote do
-        for unquote(i) <- unquote(payload_var), into: <<>> do
-          <<unquote(segment(check.(i), p.elem_bits, p.signed, endian))>>
-        end
-      end
-    end
-  end
-
-  defp decode_payload(%Spec{payload: p, byte_order: endian}, payload_var) do
-    i = Macro.var(:i, __MODULE__)
-    q = Macro.var(:q, __MODULE__)
-
-    if p.complex do
-      quote do
-        for <<unquote(segment(i, p.elem_bits, p.signed, endian)),
-              unquote(segment(q, p.elem_bits, p.signed, endian)) <- unquote(payload_var)>>,
-            do: {unquote(i), unquote(q)}
-      end
-    else
-      quote do
-        for <<unquote(segment(i, p.elem_bits, p.signed, endian)) <- unquote(payload_var)>>,
-          do: unquote(i)
-      end
-    end
-  end
-
-  defp field_var(f), do: Macro.var(:"field_#{f.name}", __MODULE__)
-
-  # Builds `value::endian-signedness-size(bits)`.
-  defp segment(value, bits, signed, endian) do
-    sign = if signed, do: :signed, else: :unsigned
-    type = {:-, [], [{:-, [], [{endian, [], nil}, {sign, [], nil}]}, {:size, [], [bits]}]}
-    {:"::", [], [value, type]}
   end
 end
 
@@ -213,6 +206,12 @@ defmodule ExHdl.Protocol.DSL do
   defmacro field(name, bits, opts \\ []) do
     quote do
       ExHdl.Protocol.Builder.field(__MODULE__, unquote(name), unquote(bits), unquote(opts))
+    end
+  end
+
+  defmacro layer(name, opts \\ []) do
+    quote do
+      ExHdl.Protocol.Builder.layer(__MODULE__, unquote(name), unquote(opts))
     end
   end
 
@@ -234,18 +233,42 @@ defmodule ExHdl.Protocol.Builder do
     unless is_atom(name), do: raise(ArgumentError, "defpacket name must be an atom")
 
     Module.put_attribute(mod, @attr, %{
+      kind: :packet,
       name: name,
       opts: opts,
       header: nil,
       fields: [],
+      layers: [],
       payload: nil
     })
   end
 
-  def header(mod, opts), do: update(mod, &%{&1 | header: opts})
+  def start_header(mod, name) do
+    if Module.get_attribute(mod, @attr), do: raise(ArgumentError, "defheader cannot be nested")
+    unless is_atom(name), do: raise(ArgumentError, "defheader name must be an atom")
+    Module.put_attribute(mod, @attr, %{kind: :header, name: name, fields: []})
+  end
+
+  def header(mod, opts) do
+    update(mod, fn wip ->
+      if wip.header || wip.layers != [],
+        do: raise(ArgumentError, "defpacket #{inspect(wip.name)}: use one header block or layers")
+
+      %{wip | header: opts}
+    end)
+  end
 
   def field(mod, name, bits, opts),
     do: update(mod, &%{&1 | fields: [{name, bits, opts} | &1.fields]})
+
+  def layer(mod, name, opts) do
+    update(mod, fn wip ->
+      if wip.header,
+        do: raise(ArgumentError, "defpacket #{inspect(wip.name)}: use one header block or layers")
+
+      %{wip | layers: [{name, opts} | wip.layers]}
+    end)
+  end
 
   def payload(mod, name, opts) do
     update(mod, fn wip ->
@@ -256,25 +279,66 @@ defmodule ExHdl.Protocol.Builder do
     end)
   end
 
+  def finish_header(mod) do
+    wip = Module.get_attribute(mod, @attr)
+    Module.delete_attribute(mod, @attr)
+    Module.put_attribute(mod, :ex_hdl_headers, {wip.name, Enum.reverse(wip.fields)})
+  end
+
   def finish(mod) do
     wip = Module.get_attribute(mod, @attr)
     Module.delete_attribute(mod, @attr)
 
-    spec =
-      ExHdl.Protocol.Spec.build!(
-        wip.name,
-        wip.opts,
-        wip.header,
-        Enum.reverse(wip.fields),
-        wip.payload
-      )
+    {raw_layers, opts, flat?} =
+      if wip.layers == [] do
+        if wip.fields != [] or wip.header do
+          opts = Keyword.merge(wip.opts, Keyword.take(wip.header || [], [:on_mismatch]))
+          {[{:header, :header, Enum.reverse(wip.fields), []}], opts, true}
+        else
+          {[], wip.opts, true}
+        end
+      else
+        if wip.fields != [],
+          do: raise(ArgumentError, "defpacket #{inspect(wip.name)}: fields belong in defheader")
 
+        layers =
+          wip.layers
+          |> Enum.reverse()
+          |> Enum.map(fn {lname, lopts} ->
+            {hname, fields} = lookup_header!(mod, wip.name, Keyword.get(lopts, :header, lname))
+            {lname, hname, fields, Keyword.delete(lopts, :header)}
+          end)
+
+        {layers, wip.opts, false}
+      end
+
+    spec = ExHdl.Protocol.Spec.build!(wip.name, opts, raw_layers, wip.payload, flat?)
     Module.put_attribute(mod, :ex_hdl_packets, spec)
+  end
+
+  defp lookup_header!(_mod, pkt, {other, hname}) do
+    Code.ensure_compiled!(other)
+
+    case List.keyfind(other.__ex_hdl_headers__(), hname, 0) do
+      nil ->
+        raise ArgumentError,
+              "defpacket #{inspect(pkt)}: #{inspect(other)} has no header #{inspect(hname)}"
+
+      found ->
+        found
+    end
+  end
+
+  defp lookup_header!(mod, pkt, hname) do
+    case List.keyfind(Module.get_attribute(mod, :ex_hdl_headers), hname, 0) do
+      nil -> raise ArgumentError, "defpacket #{inspect(pkt)}: unknown header #{inspect(hname)}"
+      found -> found
+    end
   end
 
   defp update(mod, fun) do
     case Module.get_attribute(mod, @attr) do
-      nil -> raise ArgumentError, "header/field/payload must be used inside defpacket"
+      nil -> raise ArgumentError, "header/field/layer/payload must be used inside defpacket"
       wip -> Module.put_attribute(mod, @attr, fun.(wip))
     end
   end

@@ -66,6 +66,32 @@ defmodule ExHdl.ScanSvTest do
     end
   end
 
+  test "unary minus is emitted as -(x), not as the cast -25'(x) that Yosys rejects" do
+    t = &Nx.template({}, &1)
+
+    {:ok, scan} =
+      ExHdl.DSP.analyze_scan(&K.misc_ops_step/3, [{t.(:s16), t.(:s16)}, t.(:s16), t.(:u8)],
+        state: 1
+      )
+
+    d = SV.generate(scan, name: "misc_abs")
+    assert d.source =~ "-("
+    refute d.source =~ ~r/-\d+'\(/
+  end
+
+  @tag :yosys
+  test "Yosys reads a kernel with Nx.abs and Nx.negate" do
+    t = &Nx.template({}, &1)
+
+    {:ok, scan} =
+      ExHdl.DSP.analyze_scan(&K.misc_ops_step/3, [{t.(:s16), t.(:s16)}, t.(:s16), t.(:u8)],
+        state: 1
+      )
+
+    d = SV.generate(scan, name: "misc_abs")
+    assert {:ok, _} = ExHdl.Synth.Yosys.utilization(%{"misc_abs.sv" => d.source}, "misc_abs")
+  end
+
   @tag :tmp_dir
   test "mix ex_hdl.gen.sv writes the kernels of a module", %{tmp_dir: dir} do
     Mix.shell(Mix.Shell.Process)

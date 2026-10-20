@@ -1,6 +1,6 @@
 defmodule ExHdl.Synth.Yosys do
   @moduledoc """
-  Resource estimates for 7-series parts (Zynq-7020) with Yosys
+  Resource estimates for 7-series (Zynq-7020) and UltraScale+ parts with Yosys
   `synth_xilinx`. Only synthesis: no placement, no timing. I/O buffers are
   not inserted (`-noiopad`), so the numbers are those of the module as a
   block inside a larger design.
@@ -11,7 +11,8 @@ defmodule ExHdl.Synth.Yosys do
   module. Returns `{:ok, %{lut:, ff:, dsp:, bram18:, carry:, srl:, lutram:, cells:}}`
   where `bram18` counts RAMB36E1 as two, and `cells` has every cell type.
 
-  Options: `:yosys` (executable, default from `PATH`), `:family` (default `"xc7"`).
+  Options: `:yosys` (executable, default from `PATH`), `:family` (default
+  `"xc7"`; `"xcup"` for UltraScale+ such as the XCKU3P).
   """
   @spec utilization(%{String.t() => String.t()}, String.t(), keyword()) ::
           {:ok, map()} | {:error, String.t()}
@@ -59,8 +60,10 @@ defmodule ExHdl.Synth.Yosys do
       lut: count.(&String.match?(&1, ~r/^LUT\d$/)),
       ff: count.(&String.match?(&1, ~r/^FD[A-Z]*$/)),
       dsp: count.(&String.starts_with?(&1, "DSP48")),
-      bram18: count.(&(&1 == "RAMB18E1")) + 2 * count.(&(&1 == "RAMB36E1")),
-      carry: count.(&(&1 == "CARRY4")),
+      bram18:
+        count.(&(&1 in ["RAMB18E1", "RAMB18E2"])) + 2 * count.(&(&1 in ["RAMB36E1", "RAMB36E2"])),
+      uram: count.(&(&1 == "URAM288")),
+      carry: count.(&(&1 in ["CARRY4", "CARRY8"])),
       srl: count.(&String.starts_with?(&1, "SRL")),
       lutram: count.(&String.match?(&1, ~r/^RAM\d+[MX]/)),
       cells: cells

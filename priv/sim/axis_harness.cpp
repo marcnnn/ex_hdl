@@ -8,6 +8,7 @@
 // usage: sim <in_beats> <out_beats> <seed> <valid_pct> <ready_pct> <max_cycles>
 //
 // Beat files contain one beat per line: "<tdata hex> <tkeep hex> <tlast 0|1>".
+// With -DEXHDL_TUSER the top also has m_axis_tuser, written as a fourth column.
 // The output file ends with "dropped <n>" and "cycles <n>".
 // Exit codes: 0 ok, 1 usage/io error, 2 cycle limit reached (likely deadlock).
 //
@@ -92,8 +93,14 @@ int main(int argc, char** argv) {
         const bool in_hs = top->s_axis_tvalid && top->s_axis_tready;
         const bool out_hs = top->m_axis_tvalid && top->m_axis_tready;
         if (out_hs) {
+#ifdef EXHDL_TUSER
+            std::fprintf(out, "%" PRIx64 " %" PRIx64 " %d %d\n", (uint64_t)top->m_axis_tdata,
+                         (uint64_t)top->m_axis_tkeep, (int)top->m_axis_tlast,
+                         (int)top->m_axis_tuser);
+#else
             std::fprintf(out, "%" PRIx64 " %" PRIx64 " %d\n", (uint64_t)top->m_axis_tdata,
                          (uint64_t)top->m_axis_tkeep, (int)top->m_axis_tlast);
+#endif
         }
 
         tick();
