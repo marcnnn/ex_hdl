@@ -156,6 +156,29 @@ The BEAM simulator (`ExHdl.RTL.Sim`) is a value with `poke/3`,
 Each top clock has a period and phase; an event is the set of clocks
 rising at one time, and all of them update together. Black boxes run
 their `ExHdl.RTL.Model`; without one, `Sim.new/2` raises.
+`Sim.reset_inputs(mod, :asserted | :released)` gives the reset ports
+and levels (empty for a module without resets), so testbenches need not
+poke `rst_n` by name.
+
+`Sim.new/2` compiles the flattened design into BEAM code (`engine:
+:compiled`, the default): every sub-expression used more than once in
+the design is computed once per settle, widths become constant masks,
+comparisons stay booleans where they are conditions, muxes and switches
+evaluate only the selected operand, and the code is split into small
+functions in several modules compiled in parallel. Combinational logic
+settles lazily (a poke, sample, step loop settles once per cycle). The
+compiled code is cached by content and the last designs per process are
+kept, so building a simulator for the same module again is cheap.
+`engine: :interpret` evaluates the expression trees directly; the tests
+check both engines against each other on every signal.
+
+| Design | `:interpret` | `:compiled` |
+|---|---|---|
+| ex_pcie endpoint (loopback, 4.4k LUT), idle | 1.1k cycles/s | 110k-150k cycles/s |
+| ex_net RX classifier (5k FF), random input | 28 cycles/s | 20k-37k cycles/s |
+
+Building the simulator takes 0.4 s (endpoint) and 2 s (classifier) the
+first time in a process.
 
 `ExHdl.RTL.Cosim` compiles any module with a generated port-level
 Verilator harness and runs the same stimulus (one input map per event).
@@ -164,6 +187,74 @@ output at every event. Ports and signals may have any width; values
 wider than 64 bits are plain integers in the BEAM simulator and
 `VlWide` words in the harness (tested at 65, 66, 72, 97, 128 and 512
 bits).
+
+## Closed loop
+
+`ExHdl.RTL.Cosim.open/2` starts an interactive Verilator simulation
+(`ExHdl.RTL.Cosim.Session`) with the API and event model of `Sim`:
+`poke/3`, `peek/2`, `outputs/1`, `step/2`, `cycle/3`, `run/2`,
+`reset/2`, `time/1`, `cycles/2`, plus `step_until/4` (step until an
+output has a value) and `close/1`. The process speaks a binary protocol
+over a pipe; commands without a reply are batched with the next query,
+so a poke, peek, step loop costs one round trip per cycle (tens of
+microseconds), while `run/2`, `step/2` and `step_until/4` run at
+Verilator speed (a few million events per second for small designs).
+A session is a handle: its functions return the same value.
+
+```elixir
+{:ok, s} = Cosim.open(mod, clocks: [sys: [period: 4]])
+s = Cosim.poke(s, %{s_axis_tvalid: 1, s_axis_tdata: 7})
+if Cosim.peek(s, :s_axis_tready) == 1, do: ...
+s = Cosim.step(s)
+Cosim.close(s)
+```
+
+`ExHdl.RTL.Bench` is a closed-loop testbench over either simulator:
+agents (`ExHdl.RTL.Bench.Agent`, `drive/2` and `sample/3`) drive inputs
+and watch outputs, the first `reset:` cycles hold the resets, and every
+cycle's inputs are recorded. `Bench.compare/2` replays them in the BEAM
+and in Verilator; `Bench.drive/4` is the function form of a single loop.
+
+```elixir
+bench = Bench.new(Sim.new(mod), src: %Source{beats: beats}, sink: %Sink{})
+bench = Bench.run_until(bench, &done?/1, 5_000)
+:ok = Bench.compare(bench, vcd: "replay.vcd")
+```
+
+`vcd: path` on `Cosim.open/2`, `Cosim.run/3`, `compare/3` and
+`check_model/4` writes a Verilator VCD (built with `--trace`; VCD time is
+10 times the simulation time, timescale `vcd_timescale:`, default
+`"100ps"`). `flags:` passes Verilator options (`["-O3"]`, `["--threads",
+"2"]`, `["-CFLAGS", "-O3"]`); they are part of the build cache key.
+
+## Black-box models
+
+`model:` on `black_box/3` names an `ExHdl.RTL.Model`. Its `init/1`
+receives the instance's parameters (the box's `params:` merged with the
+instance's), one state per instance. `model: {module, config}` calls
+`init(params, config)`.
+
+`ExHdl.RTL.Wrap.scan(design, model: [fun:, args:, init:])` (or `model:
+%NxFixed.Block{}`) gives a stream kernel a BEAM model: the Nx kernel is
+compiled once and stepped per accepted sample, and the handshake follows
+the generated module cycle by cycle (one clock enable from the output
+buffer's room, `ii` spacing, `p_load` applying between samples, channels,
+`tid`/`tuser`, the state clear after reset, variable-rate outputs). The
+tests run random valid/ready, parameter loads and resets through the
+model and through the generated SV in Verilator and compare every output
+of every cycle. Per-channel parameters are not modelled. `typed: true`
+makes `p_<name>` ports of one signed element and single-element signed
+`tdata` signed; `Wrap.scan_axis/3` returns the matching interfaces.
+
+## Internal clocks
+
+The BEAM simulator drives every top-level domain clock ideally, also
+when the domain has `clock_port: false` and its clock wire is driven by
+an MMCM or BUFG black box. Co-simulation does the same:
+`Cosim.substitute_clocks/1` turns those clocks into inputs of the
+harness, driven with the periods of `clocks:` (by domain or clock name),
+and leaves the black box's clock output unread. Internal clocks of child
+modules are rejected with a message; generate clocks in the top level.
 
 ## Reference models
 
@@ -334,9 +425,11 @@ encode/decode helpers with property tests.
 
 * Only rising-edge clocks; no latches, tristates or `inout`.
 * No partial assignment (`x[3..0] <~ ...`); build words with `cat/1`.
-* The BEAM simulator drives every clock ideally, including internal ones
-  (an MMCM model does not generate its clock); co-simulation needs clocks
-  that are top-level ports.
+* Both simulators drive every top-level clock ideally, including
+  internal ones (an MMCM model does not generate or gate its clock).
+  Clocks generated inside child modules do not tick in `Sim` and are
+  rejected by co-simulation.
+* A session peeks top-level ports only.
 * Register initial values for FPGA configuration (`INIT`) are not
   emitted; state before reset is undefined on hardware.
 * Register maps: 32-bit data, one clock domain (`:sys`, cross to others

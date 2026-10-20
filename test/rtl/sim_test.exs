@@ -144,6 +144,20 @@ defmodule ExHdl.RTL.SimTest do
     end
   end
 
+  test "black-box models are initialised with the instance's parameters" do
+    # the box declares DEPTH: 3, the instance overrides it
+    top =
+      module "delay_param_top" do
+        d = input(:d, 8)
+        q = output(:q, 8)
+        u = instance(:u, RTLDesigns.delay_box(3), params: [DEPTH: 5], connect: [d: d])
+        q <~ u.q
+      end
+
+    {_, out} = top |> Sim.new() |> Sim.run(Enum.map(1..8, &%{d: &1}))
+    assert Enum.map(out, & &1.q) == [0, 0, 0, 0, 0, 1, 2, 3]
+  end
+
   @tag :verilator
   test "a modelled black box with its SV source co-simulates" do
     stim = for d <- [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5], do: %{d: d}

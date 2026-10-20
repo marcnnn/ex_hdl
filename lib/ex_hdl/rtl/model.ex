@@ -16,9 +16,16 @@ defmodule ExHdl.RTL.Model do
         def outputs(q, _inputs), do: %{q: q}
         def clock(:sys, _q, inputs), do: inputs.d
       end
+
+  `init/1` receives the instance's parameters: the black box's `params:`
+  defaults merged with the `params:` of `instance/3`. One state is kept
+  per instance. `model: {module, config}` calls `init(params, config)`
+  instead, for models built from data (`ExHdl.RTL.Wrap.scan/2`).
   """
 
   @callback init(params :: keyword()) :: term()
+  @callback init(params :: keyword(), config :: term()) :: term()
+  @optional_callbacks init: 2
   @callback outputs(state :: term(), inputs :: %{atom() => integer()}) :: %{atom() => integer()}
   @callback clock(domain :: atom(), state :: term(), inputs :: %{atom() => integer()}) :: term()
 end

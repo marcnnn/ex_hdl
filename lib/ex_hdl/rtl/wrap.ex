@@ -2,7 +2,8 @@ defmodule ExHdl.RTL.Wrap do
   @moduledoc """
   Existing ExHdl generators as instantiable black boxes, with their
   SystemVerilog attached as `sources`, so RTL designs can use them and
-  co-simulate them in Verilator. They have no BEAM model.
+  co-simulate them in Verilator. Stream kernels can carry a BEAM model
+  (`scan/2`, option `model:`); protocol blocks have none.
 
       parser = Wrap.protocol(MySDR.Protocol.iq_frame(), :parser)
       u = instance :rx, parser
@@ -59,28 +60,55 @@ defmodule ExHdl.RTL.Wrap do
   and with per-channel parameters `pc_addr`, `pc_data`, `pc_we` (domain
   `:pc` with clock `pc_clk` for `pc_clock: :separate`), `pc_swap`,
   `pc_pending`; `busy` for a state memory cleared after reset.
+
+  Options:
+
+    * `model: [fun: f, args: args, init: state]` - a BEAM model for
+      `ExHdl.RTL.Sim` (`ExHdl.RTL.Wrap.ScanModel`): `fun` and `args` as
+      given to `ExHdl.DSP.analyze_scan/3` (`state:` index, default 1),
+      `init` the initial state as for `scan_to_sv/3` (default zeros). The
+      model steps the Nx kernel once per accepted sample and reproduces
+      the generated module's handshake cycle by cycle. A
+      `%NxFixed.Block{}` (as given to `ExHdl.Block.scan_to_sv/2`) works too.
+    * `typed: true` - signed ports where the kernel's values are signed:
+      `p_<name>` of one signed element, and `tdata` when it holds exactly
+      one signed element without padding. Default `false` (all ports
+      unsigned vectors, as before).
+
+      bb = Wrap.scan(design, model: [fun: &Servo.pi_step/5, args: args], typed: true)
   """
-  def scan(%ExHdl.Backends.SystemVerilog.Scan.Design{} = d) do
+  def scan(%ExHdl.Backends.SystemVerilog.Scan.Design{} = d, opts \\ []) do
     cw = max(1, bit_len(d.channels - 1))
-    s_id = if d.tid, do: cw, else: 0
-    m_id = if d.channels > 1, do: cw, else: 0
-
-    s_axis =
-      Interface.axi_stream(data: d.in_width, keep: false, last: false, id: s_id, user: d.tuser)
-
-    m_axis =
-      Interface.axi_stream(data: d.out_width, keep: false, last: false, id: m_id, user: d.tuser)
+    typed = Keyword.get(opts, :typed, false)
+    s_axis = scan_axis(d, :s_axis, typed: typed)
+    m_axis = scan_axis(d, :m_axis, typed: typed)
+    out_t = tdata_type(d.outputs, d.out_width, typed)
 
     sources = %{"#{d.name}.sv" => d.source}
     separate = d.pc_clock == :separate
 
-    black_box d.name, sources: sources do
+    model =
+      case Keyword.get(opts, :model) do
+        nil ->
+          nil
+
+        %NxFixed.Block{} = b ->
+          m = [fun: b.fun, args: ExHdl.Block.args(b), init: ExHdl.Block.init(b)]
+          {ExHdl.RTL.Wrap.ScanModel, {d, Keyword.put(m, :out_type, out_t)}}
+
+        m when is_list(m) ->
+          {ExHdl.RTL.Wrap.ScanModel, {d, Keyword.put(m, :out_type, out_t)}}
+      end
+
+    black_box d.name, sources: sources, model: model do
       domain(:sys)
       if separate, do: domain(:pc, clock: :pc_clk, reset: nil)
 
       for p <- d.params do
-        bits = p.bits * (p.shape |> Tuple.to_list() |> Enum.product())
-        input(String.to_atom(p.port), bits, domain: :static)
+        n = p.shape |> Tuple.to_list() |> Enum.product()
+        bits = p.bits * n
+        t = if typed and n == 1 and elem(p.type, 0) == :s, do: s(bits), else: u(bits)
+        input(String.to_atom(p.port), t, domain: :static)
       end
 
       # captures the parameter ports; they apply once earlier samples have left
@@ -102,6 +130,42 @@ defmodule ExHdl.RTL.Wrap do
       master(:m_axis, m_axis, domain: :sys, comb_from: :none)
     end
   end
+
+  @doc """
+  The AXI4-Stream interface of a wrapped kernel's `:s_axis` or `:m_axis`
+  bundle (option `typed:` as in `scan/2`), for the bundles of the module
+  that instantiates it.
+  """
+  def scan_axis(%ExHdl.Backends.SystemVerilog.Scan.Design{} = d, which, opts \\ [])
+      when which in [:s_axis, :m_axis] do
+    cw = max(1, bit_len(d.channels - 1))
+    typed = Keyword.get(opts, :typed, false)
+
+    {fields, width, id} =
+      case which do
+        :s_axis -> {d.inputs, d.in_width, if(d.tid, do: cw, else: 0)}
+        :m_axis -> {d.outputs, d.out_width, if(d.channels > 1, do: cw, else: 0)}
+      end
+
+    iface = Interface.axi_stream(data: width, keep: false, last: false, id: id, user: d.tuser)
+    t = tdata_type(fields, width, typed)
+
+    Interface.new(
+      :axi_stream,
+      Enum.map(iface.fields, fn
+        {:tdata, _, dir} -> {:tdata, t, dir}
+        f -> f
+      end)
+    )
+  end
+
+  # tdata is signed only when it is one signed element filling the word
+  defp tdata_type([%{type: {:s, _}, shape: shape, bits: bits}], width, true)
+       when bits == width do
+    if Tuple.product(shape) == 1, do: s(width), else: u(width)
+  end
+
+  defp tdata_type(_fields, width, _typed), do: u(width)
 
   defp bit_len(0), do: 0
   defp bit_len(v), do: 1 + bit_len(Bitwise.bsr(v, 1))

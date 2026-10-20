@@ -56,7 +56,17 @@ defmodule ExHdl.Sim.Verilator do
   @doc """
   Compiles `sources` (`%{filename => sv_source}`) with the AXI4-Stream harness
   (`:harness`, default the packet harness) and returns the path to the executable.
-  `:defines` are C preprocessor macros for the harness.
+
+  Options:
+
+    * `:defines` - C preprocessor macros for the harness.
+    * `:flags` - extra Verilator arguments, e.g. `["-O3", "--threads", "2"]`
+      or `["-CFLAGS", "-O3"]` (the default is `-O2`; a later `-O` wins).
+    * `:trace` - `true` adds `--trace` (VCD support) and defines
+      `EXHDL_TRACE` for the harness.
+    * `:cache_dir`, `:verilator` (path of the executable).
+
+  Flags, defines and tracing are part of the cache key.
   """
   @spec build(%{String.t() => String.t()}, String.t(), keyword()) ::
           {:ok, Path.t()} | {:error, String.t()}
@@ -64,13 +74,15 @@ defmodule ExHdl.Sim.Verilator do
     verilator = Keyword.get(opts, :verilator, System.find_executable("verilator"))
     harness_file = Keyword.get(opts, :harness, harness_path())
     harness = File.read!(harness_file)
-    defines = Keyword.get(opts, :defines, [])
+    trace = Keyword.get(opts, :trace, false)
+    defines = Keyword.get(opts, :defines, []) ++ if(trace, do: ["EXHDL_TRACE"], else: [])
+    flags = Keyword.get(opts, :flags, []) ++ if(trace, do: ["--trace"], else: [])
 
     if verilator == nil do
       {:error, "verilator not found in PATH"}
     else
       hash =
-        {top, harness, Enum.sort(sources), defines}
+        {top, harness, Enum.sort(sources), defines, flags}
         |> :erlang.term_to_binary()
         |> then(&:crypto.hash(:sha256, &1))
         |> Base.encode16(case: :lower)
@@ -81,13 +93,13 @@ defmodule ExHdl.Sim.Verilator do
 
       if File.exists?(exe),
         do: {:ok, exe},
-        else: compile(verilator, sources, top, dir, exe, harness_file, defines)
+        else: compile(verilator, sources, top, dir, exe, harness_file, defines, flags)
     end
   end
 
   # Builds in a scratch directory and renames it into place, so concurrent
   # builds of the same design never see a half-written cache entry.
-  defp compile(verilator, sources, top, dir, exe, harness_file, defines) do
+  defp compile(verilator, sources, top, dir, exe, harness_file, defines, flags) do
     tmp = "#{dir}.tmp-#{System.unique_integer([:positive])}"
     File.mkdir_p!(tmp)
 
@@ -102,7 +114,7 @@ defmodule ExHdl.Sim.Verilator do
       ~w(--cc --exe --build -j 0 -O2 -Wall --top-module #{top} --prefix Vtop) ++
         ["-Mdir", Path.join(tmp, "obj"), "-o", Path.join(tmp, "sim")] ++
         Enum.flat_map(defines, &["-CFLAGS", "-D#{&1}"]) ++
-        sv_files ++ [harness_file]
+        flags ++ sv_files ++ [harness_file]
 
     case System.cmd(verilator, args, stderr_to_stdout: true) do
       {_, 0} ->

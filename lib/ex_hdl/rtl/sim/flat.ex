@@ -1,14 +1,28 @@
 defmodule ExHdl.RTL.Sim.Flat do
   @moduledoc false
-  # Flattens a module hierarchy into closures over a value map:
-  #   nodes - combinational processes in evaluation order
-  #   sync  - register groups per clock
-  #   mems, mem_writes, mem_reads, models, async_resets
-  # Signal ids are hierarchical strings ("q", "u_cnt.count").
+  # Flattens a module hierarchy into a symbolic description both simulator
+  # engines read (ExHdl.RTL.Sim.Interp builds closures from it,
+  # ExHdl.RTL.Sim.Compiler generates a BEAM module):
+  #
+  #   sigs         - id => %{type, kind}
+  #   nodes        - combinational processes in evaluation order, each
+  #                  %{outs, deps, ir} with ir one of
+  #                    {:comb, target_id, stmts, prefix}
+  #                    {:alias, src_id, dst_id, invert?}
+  #                    {:model, state_key, model, inputs, outputs}
+  #   sync         - register groups (one per domain of every module):
+  #                  %{clock, reset: {id, level} | nil, resets: [{id, value}],
+  #                    stmts, prefix}
+  #   mems         - memory id => %{key, width, depth, init, byte}
+  #   mem_writes   - %{clock, key, addr, data, en, be, width, byte, depth, prefix}
+  #   mem_reads    - synchronous read ports %{clock, key, addr, en, data, prefix}
+  #   models       - black-box model instances %{key, model, init, clocks, inputs}
+  #   async_resets - %{reset, level, regs: [{id, value}]}
+  #
+  # Signal ids are hierarchical strings ("q", "u_cnt.count"); expressions
+  # keep the names of their module and are resolved with `prefix`.
 
-  import Bitwise
-
-  alias ExHdl.RTL.{ElaborationError, Expr, Module, Stmt}
+  alias ExHdl.RTL.{ElaborationError, Module, Stmt}
 
   defstruct sigs: %{},
             nodes: [],
@@ -43,7 +57,7 @@ defmodule ExHdl.RTL.Sim.Flat do
       async_resets: []
     }
 
-    acc = flatten(top, "", clock_map, acc)
+    acc = flatten(top, "", clock_map, [], acc)
 
     %__MODULE__{
       sigs: acc.sigs,
@@ -59,55 +73,56 @@ defmodule ExHdl.RTL.Sim.Flat do
     }
   end
 
-  defp id(prefix, name), do: prefix <> Atom.to_string(name)
+  @doc false
+  def id(prefix, name), do: prefix <> Atom.to_string(name)
 
   # clocks: this module's clock signal name => top-level clock id
-  defp flatten(%Module{kind: :black_box} = m, prefix, clocks, acc) do
-    model =
-      m.model ||
-        raise ElaborationError,
-              "black box #{m.name} (#{String.trim_trailing(prefix, ".")}) has no simulation model; " <>
-                "pass model: to black_box/3"
+  # params: the instance's parameters (black boxes: defaults merged with the
+  # instance's params:)
+  defp flatten(%Module{kind: :black_box} = m, prefix, clocks, params, acc) do
+    {model, config} =
+      case m.model do
+        nil ->
+          raise ElaborationError,
+                "black box #{m.name} (#{String.trim_trailing(prefix, ".")}) has no simulation model; " <>
+                  "pass model: to black_box/3"
+
+        {mod, config} when is_atom(mod) ->
+          {mod, {:config, config}}
+
+        mod when is_atom(mod) ->
+          {mod, nil}
+      end
 
     acc = add_port_sigs(m, prefix, acc)
     inputs = for p <- m.ports, p.dir == :input, p.role != :clock, do: {p.name, id(prefix, p.name)}
     outputs = for p <- m.ports, p.dir == :output, do: {p.name, id(prefix, p.name), p.type}
     state_key = {:model, prefix}
 
-    run = fn vals ->
-      ins = Map.new(inputs, fn {p, i} -> {p, Map.fetch!(vals, i)} end)
-      outs = model.outputs(Map.fetch!(vals, state_key), ins)
-
-      Enum.reduce(outputs, vals, fn {p, i, t}, vals ->
-        v =
-          Map.get(outs, p) ||
-            raise ArgumentError, "model #{inspect(model)} returned no value for output #{p}"
-
-        unless is_integer(v) and v in Expr.range(t),
-          do:
-            raise(
-              ArgumentError,
-              "model #{inspect(model)}: #{p} = #{inspect(v)} does not fit #{Expr.fmt(t)}"
-            )
-
-        Map.put(vals, i, v)
-      end)
-    end
-
     deps =
       m.comb_paths |> Map.values() |> List.flatten() |> Enum.uniq() |> Enum.map(&id(prefix, &1))
 
-    node = %{outs: Enum.map(outputs, &elem(&1, 1)), deps: deps, run: run}
+    node = %{
+      outs: Enum.map(outputs, &elem(&1, 1)),
+      deps: deps,
+      ir: {:model, state_key, model, inputs, outputs}
+    }
 
     doms =
       for d <- m.domains, into: %{} do
         {Map.fetch!(clocks, hd(d.clock.args)), d.name}
       end
 
+    params = if params == [], do: m.params, else: params
+
     entry = %{
       key: state_key,
       model: model,
-      init: model.init(m.params),
+      init:
+        case config do
+          {:config, c} -> model.init(params, c)
+          nil -> model.init(params)
+        end,
       clocks: doms,
       inputs: inputs
     }
@@ -115,7 +130,7 @@ defmodule ExHdl.RTL.Sim.Flat do
     %{acc | nodes: [node | acc.nodes], models: [entry | acc.models]}
   end
 
-  defp flatten(%Module{} = m, prefix, clocks, acc) do
+  defp flatten(%Module{} = m, prefix, clocks, _params, acc) do
     acc = add_port_sigs(m, prefix, acc)
 
     acc =
@@ -128,14 +143,9 @@ defmodule ExHdl.RTL.Sim.Flat do
     acc =
       Enum.reduce(m.comb, acc, fn {t, stmts}, acc ->
         tid = id(prefix, t)
-        body = cs(stmts, prefix, m)
-
-        run = fn vals ->
-          Map.put(vals, tid, Map.fetch!(body.(vals, %{}), tid))
-        end
-
         deps = stmts |> Stmt.reads() |> Enum.map(&id(prefix, &1))
-        %{acc | nodes: [%{outs: [tid], deps: deps, run: run} | acc.nodes]}
+        node = %{outs: [tid], deps: deps, ir: {:comb, tid, stmts, prefix}}
+        %{acc | nodes: [node | acc.nodes]}
       end)
 
     # registers
@@ -145,7 +155,6 @@ defmodule ExHdl.RTL.Sim.Flat do
         stmts = Keyword.get(m.sync, d.name, [])
         regs = for n <- m.decls, s = m.signals[n], s.kind == :reg, s.domain == d.name, do: s
         resets = for r <- regs, r.reset != nil, do: {id(prefix, r.name), r.reset}
-        body = cs(stmts, prefix, m)
         rst = d.reset && id(prefix, hd(d.reset.args))
         level = if d.reset_active == :low, do: 0, else: 1
 
@@ -153,7 +162,8 @@ defmodule ExHdl.RTL.Sim.Flat do
           clock: cid,
           reset: rst && {rst, level},
           resets: resets,
-          run: fn vals -> body.(vals, %{}) end
+          stmts: stmts,
+          prefix: prefix
         }
 
         acc = %{acc | sync: [group | acc.sync]}
@@ -191,7 +201,8 @@ defmodule ExHdl.RTL.Sim.Flat do
             key: key,
             width: mem.width,
             depth: mem.depth,
-            init: mem.init || %{}
+            init: mem.init || %{},
+            byte: mem.byte
           })
     }
 
@@ -199,35 +210,20 @@ defmodule ExHdl.RTL.Sim.Flat do
 
     acc =
       Enum.reduce(mem.write_ports, acc, fn p, acc ->
-        fa = cx(p.addr, prefix, m)
-        fd = cx(p.data, prefix, m)
-        fe = cx(p.en, prefix, m)
-        full = (1 <<< mem.width) - 1
+        w = %{
+          clock: clock.(p.domain),
+          key: key,
+          addr: p.addr,
+          data: p.data,
+          en: p.en,
+          be: p.be,
+          width: mem.width,
+          byte: mem.byte,
+          depth: mem.depth,
+          prefix: prefix
+        }
 
-        fm =
-          case p.be do
-            nil ->
-              fn _ -> full end
-
-            be ->
-              fb = cx(be, prefix, m)
-              n = div(mem.width, mem.byte)
-              byte_mask = (1 <<< mem.byte) - 1
-
-              fn vals ->
-                b = fb.(vals)
-
-                Enum.reduce(0..(n - 1), 0, fn i, acc ->
-                  if (b >>> i &&& 1) == 1, do: acc ||| byte_mask <<< (i * mem.byte), else: acc
-                end)
-              end
-          end
-
-        run = fn vals ->
-          if fe.(vals) == 1, do: {key, fa.(vals), fd.(vals), fm.(vals), mem.depth}, else: nil
-        end
-
-        %{acc | mem_writes: [%{clock: clock.(p.domain), run: run} | acc.mem_writes]}
+        %{acc | mem_writes: [w | acc.mem_writes]}
       end)
 
     Enum.reduce(mem.read_ports, acc, fn
@@ -235,20 +231,18 @@ defmodule ExHdl.RTL.Sim.Flat do
         acc
 
       p, acc ->
-        fa = cx(p.addr, prefix, m)
-        fe = cx(p.en, prefix, m)
-        did = id(prefix, p.data)
+        r = %{
+          clock: clock.(p.domain),
+          key: key,
+          addr: p.addr,
+          en: p.en,
+          data: id(prefix, p.data),
+          prefix: prefix
+        }
 
-        run = fn vals ->
-          if fe.(vals) == 1, do: {did, mem_get(vals, key, fa.(vals))}, else: nil
-        end
-
-        %{acc | mem_reads: [%{clock: clock.(p.domain), run: run} | acc.mem_reads]}
+        %{acc | mem_reads: [r | acc.mem_reads]}
     end)
   end
-
-  @doc false
-  def mem_get(vals, key, addr), do: vals |> Map.fetch!(key) |> Map.get(addr, 0)
 
   defp instance(inst, prefix, m, clocks, acc) do
     child = inst.module
@@ -273,26 +267,21 @@ defmodule ExHdl.RTL.Sim.Flat do
           wid = id(prefix, w)
           pid = id(cprefix, port)
           {src, dst} = if p.dir == :input, do: {wid, pid}, else: {pid, wid}
-          alias_node(acc, src, dst, fn v -> v end)
+          alias_node(acc, src, dst, false)
 
         {port, {:reset, pd, invert}}, acc ->
           rid = id(prefix, hd(Module.domain(m, pd).reset.args))
-          alias_node(acc, rid, id(cprefix, port), if(invert, do: &(1 - &1), else: & &1))
+          alias_node(acc, rid, id(cprefix, port), invert)
 
         {_port, {:clock, _}}, acc ->
           acc
       end)
 
-    flatten(child, cprefix, child_clocks, acc)
+    flatten(child, cprefix, child_clocks, Map.get(inst, :params, []), acc)
   end
 
-  defp alias_node(acc, src, dst, f) do
-    node = %{
-      outs: [dst],
-      deps: [src],
-      run: fn vals -> Map.put(vals, dst, f.(Map.fetch!(vals, src))) end
-    }
-
+  defp alias_node(acc, src, dst, invert) do
+    node = %{outs: [dst], deps: [src], ir: {:alias, src, dst, invert}}
     %{acc | nodes: [node | acc.nodes]}
   end
 
@@ -344,178 +333,6 @@ defmodule ExHdl.RTL.Sim.Flat do
     end
   end
 
-  # -- closures --------------------------------------------------------------------------
-
-  # Statements: fn vals, acc -> acc (acc: id => assigned value).
-  defp cs(stmts, p, m) do
-    fs = Enum.map(stmts, &cs1(&1, p, m))
-    fn vals, acc -> Enum.reduce(fs, acc, fn f, acc -> f.(vals, acc) end) end
-  end
-
-  defp cs1({:assign, t, e}, p, m) do
-    tid = id(p, t)
-    f = cx(e, p, m)
-    fn vals, acc -> Map.put(acc, tid, f.(vals)) end
-  end
-
-  defp cs1({:if, c, a, b}, p, m) do
-    fc = cx(c, p, m)
-    fa = cs(a, p, m)
-    fb = cs(b, p, m)
-    fn vals, acc -> if fc.(vals) == 1, do: fa.(vals, acc), else: fb.(vals, acc) end
-  end
-
-  defp cs1({:switch, subj, cases, default}, p, m) do
-    fs = cx(subj, p, m)
-
-    table =
-      for {vals, body} <- cases, f = cs(body, p, m), v <- vals, into: %{}, do: {hd(v.args), f}
-
-    fd = cs(default || [], p, m)
-
-    fn vals, acc ->
-      case table do
-        %{} -> Map.get(table, fs.(vals), fd).(vals, acc)
-      end
-    end
-  end
-
-  # Expressions: fn vals -> integer. Same semantics as ExHdl.RTL.Expr.eval/3.
   @doc false
-  def cx(%Expr{op: :sig, args: [n | _]}, p, _m) do
-    i = id(p, n)
-    fn vals -> :erlang.map_get(i, vals) end
-  end
-
-  def cx(%Expr{op: :const, args: [c | _]}, _p, _m), do: fn _ -> c end
-
-  def cx(%Expr{op: :mem_read, args: [mem, addr]}, p, _m) do
-    key = {:mem, id(p, mem)}
-    fa = cx(addr, p, nil)
-    fn vals -> mem_get(vals, key, fa.(vals)) end
-  end
-
-  def cx(%Expr{op: op, args: [a, b], type: t}, p, m) when op in [:add, :sub, :mul] do
-    fa = cx(a, p, m)
-    fb = cx(b, p, m)
-    exact = exact?(op, a, b, t)
-
-    case {op, exact} do
-      {:add, true} -> fn v -> fa.(v) + fb.(v) end
-      {:add, false} -> fn v -> Expr.wrap(fa.(v) + fb.(v), t) end
-      {:sub, true} -> fn v -> fa.(v) - fb.(v) end
-      {:sub, false} -> fn v -> Expr.wrap(fa.(v) - fb.(v), t) end
-      {:mul, true} -> fn v -> fa.(v) * fb.(v) end
-      {:mul, false} -> fn v -> Expr.wrap(fa.(v) * fb.(v), t) end
-    end
-  end
-
-  def cx(%Expr{op: :and, args: [a, b], type: t}, p, m), do: bin2(&Bitwise.band/2, a, b, t, p, m)
-  def cx(%Expr{op: :or, args: [a, b], type: t}, p, m), do: bin2(&Bitwise.bor/2, a, b, t, p, m)
-  def cx(%Expr{op: :xor, args: [a, b], type: t}, p, m), do: bin2(&Bitwise.bxor/2, a, b, t, p, m)
-
-  def cx(%Expr{op: :eq, args: [a, b]}, p, m), do: cmp(&Kernel.==/2, a, b, p, m)
-  def cx(%Expr{op: :ne, args: [a, b]}, p, m), do: cmp(&Kernel.!=/2, a, b, p, m)
-  def cx(%Expr{op: :lt, args: [a, b]}, p, m), do: cmp(&Kernel.</2, a, b, p, m)
-  def cx(%Expr{op: :le, args: [a, b]}, p, m), do: cmp(&Kernel.<=/2, a, b, p, m)
-  def cx(%Expr{op: :gt, args: [a, b]}, p, m), do: cmp(&Kernel.>/2, a, b, p, m)
-  def cx(%Expr{op: :ge, args: [a, b]}, p, m), do: cmp(&Kernel.>=/2, a, b, p, m)
-
-  def cx(%Expr{op: :land, args: [a, b]}, p, m) do
-    fa = cx(a, p, m)
-    fb = cx(b, p, m)
-    fn v -> fa.(v) &&& fb.(v) end
-  end
-
-  def cx(%Expr{op: :lor, args: [a, b]}, p, m) do
-    fa = cx(a, p, m)
-    fb = cx(b, p, m)
-    fn v -> fa.(v) ||| fb.(v) end
-  end
-
-  def cx(%Expr{op: :lnot, args: [a]}, p, m) do
-    fa = cx(a, p, m)
-    fn v -> 1 - fa.(v) end
-  end
-
-  def cx(%Expr{op: :mux, args: [c, a, b]}, p, m) do
-    fc = cx(c, p, m)
-    fa = cx(a, p, m)
-    fb = cx(b, p, m)
-    fn v -> if fc.(v) == 1, do: fa.(v), else: fb.(v) end
-  end
-
-  def cx(%Expr{op: :slice, args: [a, lo, w], type: _}, p, m) do
-    fa = cx(a, p, m)
-    mask = (1 <<< w) - 1
-    fn v -> fa.(v) >>> lo &&& mask end
-  end
-
-  def cx(%Expr{op: :cat, args: [items]}, p, m) do
-    fs = Enum.map(items, fn i -> {cx(i, p, m), Expr.width(i), (1 <<< Expr.width(i)) - 1} end)
-    fn v -> Enum.reduce(fs, 0, fn {f, w, mask}, acc -> acc <<< w ||| (f.(v) &&& mask) end) end
-  end
-
-  def cx(%Expr{op: :resize, args: [a], type: t}, p, m) do
-    fa = cx(a, p, m)
-    if Expr.width(a) <= Expr.width(t), do: fa, else: fn v -> Expr.wrap(fa.(v), t) end
-  end
-
-  def cx(%Expr{op: :muxn, args: [sel, items, d]}, p, m) do
-    fsel = cx(sel, p, m)
-    fs = items |> Enum.map(&cx(&1, p, m)) |> List.to_tuple()
-    fd = cx(d, p, m)
-    n = tuple_size(fs)
-
-    fn v ->
-      i = fsel.(v)
-      if i < n, do: elem(fs, i).(v), else: fd.(v)
-    end
-  end
-
-  # Remaining (less frequent) operators through the reference evaluator.
-  def cx(%Expr{args: args} = e, p, m) do
-    subs = sub_exprs(args)
-    fsubs = Map.new(subs, fn s -> {s, cx(s, p, m)} end)
-
-    fn vals ->
-      e
-      |> replace_subs(fsubs, vals)
-      |> Expr.eval(fn _ -> raise "unreachable" end)
-    end
-  end
-
-  defp sub_exprs(args) do
-    Enum.flat_map(args, fn
-      %Expr{} = e -> [e]
-      l when is_list(l) -> sub_exprs(l)
-      _ -> []
-    end)
-  end
-
-  defp replace_subs(%Expr{args: args} = e, fsubs, vals) do
-    %{e | args: Enum.map(args, &rep_arg(&1, fsubs, vals))}
-  end
-
-  defp rep_arg(%Expr{type: t} = s, fsubs, vals),
-    do: %Expr{op: :const, args: [Map.fetch!(fsubs, s).(vals)], type: t}
-
-  defp rep_arg(l, fsubs, vals) when is_list(l), do: Enum.map(l, &rep_arg(&1, fsubs, vals))
-  defp rep_arg(v, _, _), do: v
-
-  defp exact?(:add, a, b, {_, w}), do: w > max(Expr.width(a), Expr.width(b))
-  defp exact?(:sub, a, b, {s, w}), do: s == :s and w > max(Expr.width(a), Expr.width(b))
-  defp exact?(:mul, a, b, {_, w}), do: w >= Expr.width(a) + Expr.width(b)
-
-  defp bin2(f, a, b, t, p, m) do
-    fa = cx(a, p, m)
-    fb = cx(b, p, m)
-    fn v -> Expr.wrap(f.(fa.(v), fb.(v)), t) end
-  end
-
-  defp cmp(f, a, b, p, m) do
-    fa = cx(a, p, m)
-    fb = cx(b, p, m)
-    fn v -> if f.(fa.(v), fb.(v)), do: 1, else: 0 end
-  end
+  def mem_get(vals, key, addr), do: vals |> Map.fetch!(key) |> Map.get(addr, 0)
 end

@@ -22,7 +22,34 @@ defmodule ExHdl.RTL.Cosim do
   The harness C++ is generated per module (port list compiled in) and
   built through `ExHdl.Sim.Verilator.build/3`, so builds are cached by
   content hash. The design must lint clean under `-Wall`, black boxes
-  need `sources:`. Clocks must be top-level ports.
+  need `sources:`.
+
+  ## Closed loop
+
+  `open/2` starts an interactive Verilator simulation
+  (`ExHdl.RTL.Cosim.Session`) with the API of `ExHdl.RTL.Sim`, for
+  testbenches whose next inputs depend on the outputs (AXI4-Stream
+  `tready`, network models, servo loops):
+
+      {:ok, s} = Cosim.open(mod)
+      s = Cosim.poke(s, %{rst_n: 1, s_tvalid: 1})
+      ready = Cosim.peek(s, :s_tready)
+      s = Cosim.step(s)
+      Cosim.close(s)
+
+  `ExHdl.RTL.Bench` runs agent-based testbenches on either simulator.
+
+  ## Internal clocks
+
+  The BEAM simulator drives every top-level domain clock ideally, also
+  when the domain has `clock_port: false` and its clock wire is driven by
+  an MMCM or BUFG black box. Co-simulation does the same: such clocks
+  become top-level inputs of the harness (`substitute_clocks/1`), driven
+  with the periods of `clocks:`, and the black box's clock output is left
+  unread. Internal clocks of child modules are not supported; generate
+  them in the top level. `vcd:` writes a Verilator VCD of a run (see
+  `ExHdl.RTL.Cosim.Session`), `flags:` passes Verilator options such as
+  `["-O3"]`.
   """
 
   import Bitwise
@@ -37,18 +64,14 @@ defmodule ExHdl.RTL.Cosim do
   @doc "Generates SV and harness, compiles (cached). Options go to `ExHdl.Sim.Verilator.build/3`."
   @spec build(Module.t(), keyword()) :: {:ok, t()} | {:error, String.t()}
   def build(%Module{} = mod, opts \\ []) do
-    clocks = for p <- mod.ports, p.role == :clock, do: p.name
-
-    internal = for d <- mod.domains, not d.clock_port, do: d.name
-
-    if internal != [] do
-      {:error,
-       "co-simulation needs top-level clock ports; internal clocks in #{inspect(internal)}"}
-    else
+    with {:ok, mod, extra_flags} <- prepare(mod) do
+      clocks = for p <- mod.ports, p.role == :clock, do: p.name
+      opts = Keyword.update(opts, :flags, extra_flags, &(&1 ++ extra_flags))
       inputs = for p <- mod.ports, p.dir == :input, p.role != :clock, do: p
       outputs = Module.outputs(mod)
       harness = harness(mod.name, inputs, outputs, clocks)
       dir = Keyword.get_lazy(opts, :cache_dir, &cache_dir/0)
+      opts = Keyword.drop(opts, [:vcd, :vcd_timescale])
       File.mkdir_p!(dir)
       hash = :crypto.hash(:sha256, harness) |> Base.encode16(case: :lower) |> binary_part(0, 16)
       path = Path.join(dir, "rtl_harness_#{mod.name}_#{hash}.cpp")
@@ -68,7 +91,25 @@ defmodule ExHdl.RTL.Cosim do
   per event. Options: `clocks:` as in `ExHdl.RTL.Sim.new/2`.
   """
   @spec run(t(), [map() | keyword()], keyword()) :: {:ok, [map()]} | {:error, term()}
-  def run(%__MODULE__{} = c, stimulus, opts \\ []) do
+  def run(c, stimulus, opts \\ [])
+
+  def run(%__MODULE__{} = c, stimulus, opts) do
+    if opts[:vcd], do: run_session(c, stimulus, opts), else: run_file(c, stimulus, opts)
+  end
+
+  # a replay with a VCD runs through a session built with --trace
+  defp run_session(c, stimulus, opts) do
+    with {:ok, s} <- ExHdl.RTL.Cosim.Session.open(c.module, opts) do
+      try do
+        {_, samples} = ExHdl.RTL.Cosim.Session.run(s, stimulus)
+        {:ok, samples}
+      after
+        ExHdl.RTL.Cosim.Session.close(s)
+      end
+    end
+  end
+
+  defp run_file(c, stimulus, opts) do
     events = Sim.schedule(c.module, length(stimulus), opts)
     bit = c.clocks |> Enum.with_index() |> Map.new(fn {n, i} -> {n, 1 <<< i} end)
 
@@ -135,7 +176,7 @@ defmodule ExHdl.RTL.Cosim do
   def compare(%Module{} = mod, stimulus, opts \\ []) do
     {_sim, beam} = mod |> Sim.new(Keyword.take(opts, [:clocks])) |> Sim.run(stimulus)
 
-    with {:ok, c} <- build(mod, Keyword.drop(opts, [:clocks])),
+    with {:ok, c} <- build(mod, Keyword.drop(opts, [:clocks, :vcd, :vcd_timescale])),
          {:ok, rtl} <- run(c, stimulus, opts) do
       first_mismatch(beam, rtl, Module.outputs(mod))
     end
@@ -354,9 +395,15 @@ defmodule ExHdl.RTL.Cosim do
   end
 
   defp actual_outputs(:verilator, mod, stimulus, opts) do
-    build_opts = Keyword.drop(opts, [:clocks, :backend, :latency, :history])
+    build_opts = Keyword.drop(opts, [:clocks, :backend, :latency, :history, :vcd, :vcd_timescale])
 
-    with {:ok, c} <- build(mod, build_opts), do: run(c, stimulus, Keyword.take(opts, [:clocks]))
+    with {:ok, c} <- build(mod, build_opts),
+         do:
+           run(
+             c,
+             stimulus,
+             Keyword.take(opts, [:clocks, :vcd, :vcd_timescale, :flags, :cache_dir])
+           )
   end
 
   defp first_model_mismatch(expected, actual, latency) do
@@ -500,7 +547,88 @@ defmodule ExHdl.RTL.Cosim do
     """
   end
 
-  defp cache_dir do
+  # -- sessions --------------------------------------------------------------------------
+
+  alias ExHdl.RTL.Cosim.Session
+
+  @doc "Starts an interactive Verilator simulation; see `ExHdl.RTL.Cosim.Session`."
+  defdelegate open(mod, opts \\ []), to: Session
+
+  @doc "`ExHdl.RTL.Cosim.Session.poke/3`."
+  defdelegate poke(session, name, value), to: Session
+
+  @doc "`ExHdl.RTL.Cosim.Session.poke/2`."
+  defdelegate poke(session, values), to: Session
+
+  @doc "`ExHdl.RTL.Cosim.Session.peek/2`."
+  defdelegate peek(session, name), to: Session
+
+  @doc "`ExHdl.RTL.Cosim.Session.outputs/1`."
+  defdelegate outputs(session), to: Session
+
+  @doc "`ExHdl.RTL.Cosim.Session.step/2`."
+  defdelegate step(session, n \\ 1), to: Session
+
+  @doc "`ExHdl.RTL.Cosim.Session.close/1`."
+  defdelegate close(session), to: Session
+
+  # -- internal clocks ---------------------------------------------------------------------
+
+  @doc """
+  The module with every top-level internal clock (`domain(..., clock_port:
+  false)`) turned into a clock input port, its driver removed: what the
+  co-simulation harness runs. Raises for internal clocks in child modules.
+  """
+  @spec substitute_clocks(Module.t()) :: Module.t()
+  def substitute_clocks(%Module{} = m) do
+    for child <- Module.hierarchy(m),
+        child != m,
+        child.kind == :module,
+        d <- child.domains,
+        not d.clock_port do
+      raise ArgumentError,
+            "co-simulation drives top-level clocks only; #{child.name} generates clock " <>
+              "#{hd(d.clock.args)} (domain #{d.name}) internally, move it to the top level"
+    end
+
+    names = for d <- m.domains, not d.clock_port, uniq: true, do: hd(d.clock.args)
+
+    if names == [] do
+      m
+    else
+      %{
+        m
+        | signals:
+            Enum.reduce(names, m.signals, fn n, s ->
+              Map.update!(s, n, &%{&1 | kind: :clock, port: :input})
+            end),
+          ports:
+            m.ports ++
+              for(
+                n <- names,
+                do: %{name: n, type: {:u, 1}, domain: nil, dir: :input, role: :clock}
+              ),
+          comb: Enum.reject(m.comb, fn {t, _} -> t in names end),
+          domains:
+            Enum.map(m.domains, fn d ->
+              if hd(d.clock.args) in names, do: %{d | clock_port: true}, else: d
+            end)
+      }
+    end
+  end
+
+  @doc false
+  # {:ok, module for the harness, extra Verilator flags} | {:error, reason}
+  def prepare(%Module{} = m) do
+    sub = substitute_clocks(m)
+    # the black box clock output that drove a substituted clock is unread
+    {:ok, sub, if(sub == m, do: [], else: ["-Wno-UNUSEDSIGNAL"])}
+  rescue
+    e in ArgumentError -> {:error, Exception.message(e)}
+  end
+
+  @doc false
+  def cache_dir do
     if Code.ensure_loaded?(Mix.Project) and Mix.Project.get() do
       Path.join(Mix.Project.build_path(), "ex_hdl_sim")
     else
