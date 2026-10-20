@@ -79,7 +79,7 @@ defmodule ExHdl.RTL.Cosim do
 
       opts = opts |> Keyword.put(:harness, path) |> Keyword.put_new(:cache_dir, dir)
 
-      with {:ok, exe} <- ExHdl.Sim.Verilator.build(SV.generate(mod), mod.name, opts) do
+      with {:ok, exe} <- ExHdl.Sim.Verilator.build(SV.generate(mod, sim: true), mod.name, opts) do
         {:ok,
          %__MODULE__{module: mod, path: exe, inputs: inputs, outputs: outputs, clocks: clocks}}
       end

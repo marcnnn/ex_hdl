@@ -200,8 +200,12 @@ their `ExHdl.RTL.Model`; without one, `Sim.new/2` raises.
 and levels (empty for a module without resets), so testbenches need not
 poke `rst_n` by name.
 
-`Sim.new/2` compiles the flattened design into BEAM code (`engine:
-:compiled`, the default): every sub-expression used more than once in
+`Sim.new/2` picks an engine (`engine: :auto`, the default): small
+designs (below about 100 kB of expression terms) are interpreted,
+because compiling and loading a module costs more than it saves there
+and loading is serialised by the code server, which matters for tests
+that build hundreds of small modules. Larger designs are compiled into
+BEAM code (`engine: :compiled`): every sub-expression used more than once in
 the design is computed once per settle, widths become constant masks,
 comparisons stay booleans where they are conditions, muxes and switches
 evaluate only the selected operand, and the code is split into small

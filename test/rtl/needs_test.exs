@@ -196,6 +196,30 @@ defmodule ExHdl.RTL.NeedsTest do
       assert Map.keys(SV.generate(m, sim: true)) == ["IBUFDS.sv", "uses_ibufds.sv"]
     end
 
+    @tag :verilator
+    test "6: co-simulation builds with the sim_sources" do
+      bb =
+        black_box "inv_stub",
+          sim_sources: %{
+            "inv_stub.sv" =>
+              "module inv_stub (input logic [7:0] a, output logic [7:0] y);\n" <>
+                "  assign y = ~a;\nendmodule\n"
+          } do
+          input(:a, 8)
+          output(:y, 8)
+        end
+
+      m =
+        module "uses_stub" do
+          a = input(:a, 8)
+          y = output(:y, 8)
+          u = instance(:u, bb, connect: [a: a])
+          y <~ u.y
+        end
+
+      assert {:ok, _} = ExHdl.RTL.Cosim.build(m)
+    end
+
     test "8: clock outputs are marked on black boxes only" do
       bb =
         black_box "BUFG" do

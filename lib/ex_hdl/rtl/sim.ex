@@ -26,10 +26,12 @@ defmodule ExHdl.RTL.Sim do
     * `clocks:` - `[domain_or_clock: [period: p, phase: ph]]`, default
       period 10, phase 0 for every clock.
     * `trace: true` - record every settled state (`trace/1`, `vcd/2`).
-    * `engine:` - `:compiled` (default) generates and loads a BEAM module
-      for the design (cached by content, so a second `new/2` of the same
-      design does not compile again); `:interpret` evaluates the
-      expression trees directly (no compile step, much slower per cycle).
+    * `engine:` - `:compiled` generates and loads a BEAM module for the
+      design (cached by content, so a second `new/2` of the same design
+      does not compile again); `:interpret` evaluates the expression trees
+      directly (no compile step, much slower per cycle); `:auto` (default)
+      interprets small designs (below about 100 kB of expression terms)
+      and compiles larger ones.
 
   Combinational logic settles lazily: `step/2` computes the register
   updates from the settled values, and the next `poke/3`, `peek/2` or
@@ -61,7 +63,10 @@ defmodule ExHdl.RTL.Sim do
   @spec new(Module.t(), keyword()) :: t()
   def new(%Module{} = mod, opts \\ []) do
     engine =
-      case Keyword.get(opts, :engine, :compiled) do
+      case Keyword.get(opts, :engine, :auto) do
+        :auto ->
+          :auto
+
         :compiled ->
           Compiler
 
@@ -69,10 +74,11 @@ defmodule ExHdl.RTL.Sim do
           Interp
 
         other ->
-          raise ArgumentError, "engine: must be :compiled or :interpret, got #{inspect(other)}"
+          raise ArgumentError,
+                "engine: must be :auto, :compiled or :interpret, got #{inspect(other)}"
       end
 
-    {flat, prog} = build(mod, engine)
+    {flat, engine, prog} = build(mod, engine)
     periods = periods(flat.clocks, Keyword.get(opts, :clocks, []), flat.domain_clock)
 
     %__MODULE__{
@@ -98,21 +104,31 @@ defmodule ExHdl.RTL.Sim do
   # once and simulated many times) and never wrong.
   @cache_size 8
 
-  defp build(mod, engine) do
+  # Size of the flat design (external term size, i.e. its expression trees
+  # unshared, which is what the interpreter walks) above which compiling
+  # pays off. Measured: an 8-bit CRC (25 kB) interprets 200 cycles in the
+  # time compiling takes; a 64-bit MAC RX (277 kB) is 100x faster compiled.
+  @compile_threshold 100_000
+
+  defp build(mod, choice) do
     key = {__MODULE__, :cache}
     cache = Process.get(key, [])
 
-    case Enum.find(cache, fn {m, e, _} -> e == engine and m == mod end) do
+    case Enum.find(cache, fn {m, c, _} -> c == choice and m == mod end) do
       {_, _, built} ->
         built
 
       nil ->
         flat = Flat.build(mod)
-        built = {flat, engine.build(flat)}
-        Process.put(key, Enum.take([{mod, engine, built} | cache], @cache_size))
+        engine = if choice == :auto, do: auto_engine(flat), else: choice
+        built = {flat, engine, engine.build(flat)}
+        Process.put(key, Enum.take([{mod, choice, built} | cache], @cache_size))
         built
     end
   end
+
+  defp auto_engine(flat),
+    do: if(:erlang.external_size(flat) >= @compile_threshold, do: Compiler, else: Interp)
 
   # -- inputs and outputs ----------------------------------------------------------------
 

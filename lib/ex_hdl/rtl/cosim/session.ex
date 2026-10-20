@@ -361,7 +361,7 @@ defmodule ExHdl.RTL.Cosim.Session do
     path = Path.join(dir, "rtl_session_#{mod.name}_#{hash}.cpp")
     unless File.exists?(path), do: File.write!(path, harness)
     opts = opts |> Keyword.put(:harness, path) |> Keyword.put_new(:cache_dir, dir)
-    ExHdl.Sim.Verilator.build(SV.generate(mod), mod.name, opts)
+    ExHdl.Sim.Verilator.build(SV.generate(mod, sim: true), mod.name, opts)
   end
 
   @doc false

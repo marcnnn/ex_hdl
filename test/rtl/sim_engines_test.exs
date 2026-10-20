@@ -7,6 +7,7 @@ defmodule ExHdl.RTL.SimEnginesTest do
   """
   use ExUnit.Case, async: true
   use ExUnitProperties
+  use ExHdl.RTL
 
   alias ExHdl.RTL.{Builder, Examples, Expr, Module, Sim}
   alias ExHdl.Test.{RTLDesigns, RTLGen}
@@ -146,11 +147,33 @@ defmodule ExHdl.RTL.SimEnginesTest do
 
   test "a second Sim.new of the same design reuses the compiled code" do
     m = Examples.crc32()
-    a = Sim.new(m)
-    b = Sim.new(m)
+    a = Sim.new(m, engine: :compiled)
+    b = Sim.new(m, engine: :compiled)
     assert a.prog.mod == b.prog.mod
     # a rebuilt, equal module too
-    assert Sim.new(Examples.crc32()).prog.mod == a.prog.mod
+    assert Sim.new(Examples.crc32(), engine: :compiled).prog.mod == a.prog.mod
+  end
+
+  test ":auto interprets small designs and compiles large ones" do
+    assert Sim.new(Examples.counter(8)).engine == ExHdl.RTL.Sim.Interp
+
+    # a long chain of 32-bit operations: well above the threshold
+    big =
+      module "big_chain" do
+        d = input(:d, 32)
+        y = output(:y, 32, reset: 0)
+
+        x =
+          Enum.reduce(1..400, d, fn i, acc ->
+            add_wrap(bxor(acc, const(rem(i * 2_654_435_761, 0x100000000), 32)), d)
+          end)
+
+        sync :sys do
+          y <~ x
+        end
+      end
+
+    assert Sim.new(big).engine == ExHdl.RTL.Sim.Compiler
   end
 
   # -- helpers ----------------------------------------------------------------------------
