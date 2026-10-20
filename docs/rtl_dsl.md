@@ -41,6 +41,7 @@ different modules with one name are rejected when emitting a hierarchy.
 | Construct | Meaning |
 |---|---|
 | `input :a, 8` / `output :q, s(16)` | ports; a bare width is unsigned |
+| `inout :sda, 1` | pad pin, only passed to instance inouts |
 | `output :q, 8, reset: 0` | registered output |
 | `reg :r, 8, reset: 0, domain: :sys` | register (`reset: nil` for none) |
 | `wire :x, 8` / `wire :sum, a + b` | named combinational signal |
@@ -50,11 +51,13 @@ different modules with one name are rejected when emitting a hierarchy.
 | `if c do ... else ... end` | conditional when `c` is hardware |
 | `switch sel do 0 -> ...; [1, 2] -> ...; _ -> ... end` | case on constants |
 | `domain :a, clock: :clk_a, reset: :rst_a_n` | clock domain |
-| `instance :u, mod, connect: [en: x]` | child; `u.q`, `u.en <~ ...` |
+| `instance :u, mod, connect: [en: x]` | child; `u.q`, `u.O`, `u[:O]`, `u.en <~ ...` |
 | `memory :ram, width: 32, depth: 1024` | array; `read_port/2`, `write_port/2` |
 | `master/slave/bundle :p, iface` | interface bundle; `connect(src, sink)` |
 | `fsm :ctrl do state :idle do ... end end` | state machine (`encoding: :one_hot` optional) |
+| `in_state(f, :idle)` / `in_state(:ctrl, :idle)` | state test, by handle or by name (may precede the FSM) |
 | `black_box "IBUFDS" do ... end` | external module |
+| `black_box_from("IBUFDS", ports, opts)` | the same from a port list `[{:input, :I, 1, opts}]` |
 
 Inside `module/3`, `black_box/3` and `rtl/1` the operators `+ - * == !=
 < <= > >= &&& ||| ~~~ <<< >>>` and `and or not && || !` build hardware
@@ -65,12 +68,33 @@ deprecates `^^^`). `cond` and `case` keep their Elixir meaning; use `if`,
 ascend, low..high), `a[i]` with a signal index, `part(a, sel, w)` for
 `w` bits from a signal start bit (SV `a[sel +: w]`).
 
+`==` and `!=` with `nil` on either side stay Elixir comparisons, so a
+fold over hardware values can test `acc == nil`. Any other use of `nil`
+as an operand raises with a hint, as does a multi-bit hardware `if`
+condition: inside `module/3` an `if` on a hardware value is a hardware
+conditional, so elaboration-time decisions on generator values use
+`case`, `is_nil/1` or `Kernel.if/2`.
+
+Uppercase port names (vendor primitives) parse as aliases in `u.O`;
+inside `module/3`, `black_box/3` and `rtl/1` the body is rewritten so
+`u.O` means `pin(u, :O)`, the same as `u[:O]`.
+
+`use ExHdl.RTL` imports the DSL and the `ExHdl.RTL.Expr` functions.
+`use ExHdl.RTL, except: [:sync, :state]` (or `only:`; bare names or
+`name: arity`) leaves names free for a library's own functions. The
+statement macros `comb`, `sync`, `switch`, `fsm` and `state` called with
+a `do` block always mean the DSL inside module bodies, imported or not;
+other excluded functions are called qualified (`ExHdl.RTL.signal/1`).
+
 `<~` is an Elixir operator with fixed precedence: it binds tighter than
 comparisons, `and`/`or`, `&&&`, `|||`, `<<<` and `>>>`. Write
 `full <~ (wptr == rptr)`. `<~` returns an `ExHdl.RTL.Assigned` marker
 that every operator rejects, so a missing pair of parentheses raises
 instead of building the wrong logic. Arithmetic (`x <~ a + b`) needs no
 parentheses.
+
+`Interface.axi_stream/1` has one `tkeep` bit per byte; `keep_unit: 32`
+gives one per DWord (PCIe streams).
 
 Registers take SV attributes with `attrs:` (`reg :r, 8, attrs:
 [shreg_extract: "no"]`); `async_reg: true` adds `ASYNC_REG`.
@@ -88,7 +112,10 @@ Every expression is `{:u, w}` or `{:s, w}` (two's complement), w >= 1.
    slice narrow explicitly.
 4. Integers adapt: the smallest fitting width in `+ - *` and comparisons,
    the other operand's type in bitwise ops, muxes and assignments. A
-   constant that does not fit raises.
+   constant that does not fit raises. A mux of integers only
+   (`mux(c, 4, 3)`, `mux(sel, [1, 5, 2])`) takes the smallest type that
+   holds all of them, signed if one is negative (`u3` here); an
+   assignment then extends it to the target.
 
 | Operation | Result |
 |---|---|
@@ -103,9 +130,15 @@ Every expression is `{:u, w}` or `{:s, w}` (two's complement), w >= 1.
 | comparisons, `and or not`, `reduce_*` | `u1` (logic ops need `u1`) |
 | `a[i]`, `a[lo..hi]` | `u1`, `u(hi - lo + 1)`; out-of-range dynamic index reads 0 |
 | `part(a, sel, w)` | `uw`, bits `sel..sel + w - 1`, bits above `a` read 0 (a right shifter) |
-| `cat([a, b])`, `rep(a, n)` | unsigned, sum of widths (first element in the MSBs) |
+| `cat([a, b])`, `rep(a, n)` | unsigned, sum of widths (first element in the MSBs); `nil` items skipped |
 | `mux(c, a, b)` / `mux(sel, list)` | wider of the items |
 | `zext`, `sext`, `trunc`, `resize` | as named |
+
+There are no zero-width values. `slice(a, lo, 0)`, `a[lo..(lo - 1)//1]`,
+`rep(a, 0)` and `cat([])` return `nil`, and `cat/1` skips `nil` items,
+so generator code that builds an address from optional fields needs no
+special case: `cat([bank, slice(slot, 0, group_bits), lane])` works
+with `group_bits = 0`. Using `nil` anywhere else raises.
 
 Violations raise `ExHdl.RTL.WidthError` at elaboration with both types
 and the fix, e.g. `assignment to q: u9 value does not fit u8 (1 bit(s)
@@ -121,6 +154,8 @@ contains dead operands, which Verilator would report.
 
 At the end of `module/3`:
 
+* names are SystemVerilog identifiers and not keywords (IEEE 1800-2017
+  Annex B, checked when the signal is declared);
 * every output, wire and instance input is driven exactly once (one comb
   block or one register domain);
 * every comb target is assigned on every path (no latches);
@@ -149,7 +184,12 @@ Memories: a write port writes `data` at `addr` when `en`, with byte
 enables `be` (one bit per `byte:` bits). A synchronous read port
 registers `mem[addr]` when `en`, reading the contents before that edge's
 writes (read-first); an asynchronous port reads combinationally.
-Out-of-range addresses read 0 and are not written.
+Out-of-range addresses read 0 and are not written. A synchronous read
+of the word another port writes in the same cycle returns the old word
+in the simulators; on block RAM in write-first or no-change mode and on
+URAM288 the hardware result differs or is undefined, so designs that
+read a word while the other port writes it need an address interlock
+(the simulator does not flag the collision).
 
 The BEAM simulator (`ExHdl.RTL.Sim`) is a value with `poke/3`,
 `peek/2`, `step/2`, `cycle/3`, `run/2`, `reset/2`, `trace/1` and `vcd/2`.
@@ -226,6 +266,14 @@ inputs and rejects:
 * instance inputs, memory ports and declared outputs driven from the
   wrong domain.
 
+`ExHdl.RTL.CDC.paths(top)` lists every crossing of a hierarchy for the
+constraint generator: each `async_reg`/`cdc` register with the
+registers, memories, black-box pins or top-level inputs of another clock
+it samples, traced through comb logic and instance ports, with both
+clocks named by their top-level clock signal. A Vivado flow emits
+`set_max_delay -datapath_only` (or `set_false_path` for asynchronous
+ports) per entry.
+
 The crossings ExHdl provides (`ExHdl.RTL.CDC`): `sync_ff/1` (n-stage
 synchroniser with `ASYNC_REG`), `pulse_sync/1`, `reset_sync/1`,
 `handshake/2`, and `gray/1` / `ungray/1`. An asynchronous FIFO is a
@@ -242,7 +290,12 @@ under `verilator --lint-only -Wall`.
 * Ports and signals keep their names and types (`logic signed [15:0]`).
   Instance ports are wires `<inst>_<port>`, sync read data
   `<mem>_rd<i>`, FSM states `localparam`s `<FSM>_<STATE>`, hoisted
-  subexpressions `_t<n>`.
+  subexpressions `_t<n>`, forward state tests `<fsm>_in_<state>`. Inout
+  ports are `inout wire` (a net, as `default_nettype none` requires).
+* Instance port wires keep the plain `<inst>_<port>` names (stable for
+  XDC and VCD paths). A parent signal with the same name is an error
+  that names the instance and port; prefixing instances (`u_tx`) avoids
+  it.
 * Expressions carry explicit casts so SV's context-determined widths
   cannot change a result: operands are extended to the operation width
   (`9'(a) + 9'(b)`) and overflowing operations are wrapped in a size cast
@@ -256,13 +309,30 @@ under `verilator --lint-only -Wall`.
   `always_ff` per port, byte enables as per-byte conditional writes,
   `init` as an `initial` block. `ExHdl.Target.Timing.memory_style/3`
   picks a style from width, depth and the target family (URAM only on
-  UltraScale+).
-* Unread signal bits get `verilator lint_off UNUSEDSIGNAL` pragmas.
+  UltraScale+). `style: :auto` emits no attribute: the tool decides by
+  size and port shape, and both Vivado and Yosys pick LUTRAM for shallow
+  memories (64 x 256 becomes 37 Yosys RAM cells, `:block` 8 RAMB18).
+* Unread signal bits get `verilator lint_off UNUSEDSIGNAL` pragmas,
+  including the wires of instance outputs nobody reads.
+* `mux(sel, list)` is a `case` in an `always_comb`. Yosys turns a case
+  of constants into a ROM and may merge it with a register into block
+  RAM. `wire(:t, mux(sel, table), rom_style: :distributed)` writes the
+  case into `t`, declared `(* rom_style = "distributed" *)` for Vivado,
+  with `(* rom_style = "logic" *)` on the case for Yosys, which then maps
+  it to LUTs; `rom_style: :block` asks Vivado for block RAM.
+* Black-box parameters: integers, strings, `{:bits, w, v}`, and floats or
+  `{:real, n}` for `real` parameters (`CLKOUT0_DIVIDE_F`), emitted as
+  `2.5`, `10.0`.
 
 FSM states are `localparam`s; `encoding: :one_hot` gives an `n`-bit
 state register with one bit per state, and `in_state/2` tests that bit.
 
 Black boxes are not emitted; their `sources:` files are.
+`sim_sources:` files (stubs of vendor primitives such as an `IBUFDS`
+that would clash with the real one in Vivado) come only from
+`generate(mod, sim: true)`. Black-box outputs may be marked `clock:
+true` (`BUFG` `O`, `MMCME4_ADV` `CLKOUT0`), listed in the module's
+`clock_outputs`.
 `ExHdl.RTL.Wrap.protocol/2` and `ExHdl.RTL.Wrap.scan/1` wrap the
 existing protocol and stream-kernel generators that way.
 
@@ -293,6 +363,13 @@ defmodule Mixer.Regs do
   end
 end
 ```
+
+Register, field and window names become signal names (`<reg>_<field>`,
+`<reg>_<field>_set`, `<window>_en`, ...). They are checked when the map
+is defined: a SystemVerilog keyword (`register :s` with `field :until`
+gives `s_until`) or two declarations giving one name (`a_b.c` and
+`a.b_c`, or a field clashing with the slave's internal signals) raise
+there, not when the slave is elaborated.
 
 Registers get the next free word unless `offset:` is given; `count:` and
 `stride:` make arrays; fields take a bit or an ascending range and an
@@ -332,7 +409,9 @@ encode/decode helpers with property tests.
 
 ## Limits
 
-* Only rising-edge clocks; no latches, tristates or `inout`.
+* Only rising-edge clocks; no latches or tristate logic. `inout` ports
+  only pass through to instances (an `IOBUF` black box drives the pad);
+  the simulators ignore them.
 * No partial assignment (`x[3..0] <~ ...`); build words with `cat/1`.
 * The BEAM simulator drives every clock ideally, including internal ones
   (an MMCM model does not generate its clock); co-simulation needs clocks

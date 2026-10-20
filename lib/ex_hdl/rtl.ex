@@ -56,8 +56,10 @@ defmodule ExHdl.RTL do
     * `domain/2` - a clock domain (`ExHdl.RTL.Domain`). A module without
       domain declarations gets `:sys` (`clk`, synchronous active-low
       `rst_n`) on first use.
+    * `inout/3` - bidirectional pad port, passed to instances only.
     * `instance/3`, `memory/2`, `read_port/2`, `write_port/2`,
       `master/3`, `slave/3`, `bundle/3`, `connect/2`, `fsm/3`.
+    * `black_box/3`, `black_box_from/3` - external modules.
   """
 
   alias ExHdl.RTL.{Builder, Interface}
@@ -92,53 +94,92 @@ defmodule ExHdl.RTL do
   @doc false
   def expr_funs, do: @expr_funs
 
-  defmacro __using__(_opts) do
-    quote do
-      import ExHdl.RTL,
-        only: [
-          module: 2,
-          module: 3,
-          black_box: 2,
-          black_box: 3,
-          rtl: 1,
-          domain: 1,
-          domain: 2,
-          input: 2,
-          input: 3,
-          output: 2,
-          output: 3,
-          reg: 2,
-          reg: 3,
-          wire: 2,
-          wire: 3,
-          signal: 1,
-          comb: 1,
-          sync: 1,
-          sync: 2,
-          switch: 2,
-          instance: 2,
-          instance: 3,
-          memory: 2,
-          read_port: 2,
-          write_port: 2,
-          master: 2,
-          master: 3,
-          slave: 2,
-          slave: 3,
-          bundle: 2,
-          bundle: 3,
-          connect: 2,
-          fsm: 2,
-          fsm: 3,
-          state: 2,
-          state: 3,
-          goto: 1,
-          in_state: 2
-        ]
+  @dsl_imports [
+    module: 2,
+    module: 3,
+    black_box: 2,
+    black_box: 3,
+    black_box_from: 2,
+    black_box_from: 3,
+    rtl: 1,
+    domain: 1,
+    domain: 2,
+    input: 2,
+    input: 3,
+    output: 2,
+    output: 3,
+    inout: 2,
+    inout: 3,
+    reg: 2,
+    reg: 3,
+    wire: 2,
+    wire: 3,
+    signal: 1,
+    pin: 2,
+    comb: 1,
+    sync: 1,
+    sync: 2,
+    switch: 2,
+    instance: 2,
+    instance: 3,
+    memory: 2,
+    read_port: 2,
+    write_port: 2,
+    master: 2,
+    master: 3,
+    slave: 2,
+    slave: 3,
+    bundle: 2,
+    bundle: 3,
+    connect: 2,
+    fsm: 2,
+    fsm: 3,
+    state: 2,
+    state: 3,
+    goto: 1,
+    in_state: 2
+  ]
 
-      import ExHdl.RTL.Expr, only: unquote(@expr_funs)
+  @doc """
+  Imports the DSL and the expression functions of `ExHdl.RTL.Expr`, and
+  aliases `ExHdl.RTL.Interface`.
+
+  `only:` and `except:` take `name: arity` pairs or bare names (all
+  arities) and filter both imports, so a library can define its own
+  `sync/1` or `state/2`:
+
+      use ExHdl.RTL, except: [:sync, :state]
+
+  Inside `module/3`, `black_box/3` and `rtl/1` bodies the statement macros
+  `comb`, `sync`, `switch`, `fsm` and `state` called with a `do` block
+  always mean the DSL, imported or not. Other excluded names are called
+  qualified (`ExHdl.RTL.signal(:x)`).
+  """
+  defmacro __using__(opts) do
+    dsl = filter_imports(@dsl_imports, opts)
+    expr = filter_imports(@expr_funs, opts)
+
+    quote do
+      import ExHdl.RTL, only: unquote(dsl)
+      import ExHdl.RTL.Expr, only: unquote(expr)
       alias ExHdl.RTL.Interface
     end
+  end
+
+  defp filter_imports(funs, opts) do
+    matches? = fn list, {name, arity} ->
+      Enum.any?(list, fn
+        {^name, ^arity} -> true
+        ^name -> true
+        _ -> false
+      end)
+    end
+
+    funs = if only = opts[:only], do: Enum.filter(funs, &matches?.(only, &1)), else: funs
+
+    if except = opts[:except],
+      do: Enum.reject(funs, &matches?.(except, &1)),
+      else: funs
   end
 
   # -- modules ---------------------------------------------------------------------------
@@ -168,12 +209,21 @@ defmodule ExHdl.RTL do
         output :O, 1, domain: :async, comb_from: [:I, :CE]
       end
 
-  Options: `params:` SV parameters with defaults (integers, strings or
-  `{:bits, width, value}`), overridable per instance; `sources:`
-  `%{"file.sv" => text}` emitted with the design; `model:` a module
-  implementing `ExHdl.RTL.Model` for the BEAM simulator. Output option
-  `comb_from:` lists the inputs the output depends on combinationally
-  (`:all` by default, `:none` for registered outputs).
+  Options: `params:` SV parameters with defaults (integers, floats or
+  `{:real, number}` for `real` parameters, strings, or `{:bits, width,
+  value}`), overridable per instance; `sources:` `%{"file.sv" => text}`
+  emitted with the design; `sim_sources:` files only for simulation (stubs
+  of vendor primitives, returned by
+  `ExHdl.Backends.SystemVerilog.RTL.generate(mod, sim: true)`, never sent
+  to synthesis); `model:` a module implementing `ExHdl.RTL.Model` for the
+  BEAM simulator. Output options: `comb_from:` lists the inputs the output
+  depends on combinationally (`:all` by default, `:none` for registered
+  outputs); `clock: true` marks a clock output (`BUFG` `O`, `MMCME4_ADV`
+  `CLKOUT0`), listed in `ExHdl.RTL.Module` `clock_outputs`. `inout/3`
+  declares pad pins (`IOBUF` `IO`).
+
+  Uppercase port names work with `u.O` inside `module/3` (rewritten to
+  `pin(u, :O)`), `u[:O]` and `connect: [I: x]`.
   """
   defmacro black_box(name, opts \\ [], do: body) do
     quote do
@@ -181,6 +231,48 @@ defmodule ExHdl.RTL do
         unquote(scoped(body))
       end)
     end
+  end
+
+  @doc """
+  A black box from data, for port lists generated from tables:
+
+      black_box_from("BUFGCE",
+        [{:input, :I, 1, domain: :async}, {:input, :CE, 1, domain: :async},
+         {:output, :O, 1, domain: :async, clock: true}],
+        params: [CE_TYPE: "SYNC"])
+
+  Ports are `{:input | :output | :inout, name, type}` or with a fourth
+  element of port options. `domains:` is a list of `name` or `{name,
+  domain_opts}` declared before the ports; the other options are those of
+  `black_box/3`.
+  """
+  def black_box_from(name, ports, opts \\ []) do
+    {domains, opts} = Keyword.pop(opts, :domains, [])
+
+    Builder.build(:black_box, name, opts, fn ->
+      for d <- domains do
+        case d do
+          {n, o} when is_list(o) -> Builder.domain(n, o)
+          n -> Builder.domain(n, [])
+        end
+      end
+
+      for p <- ports do
+        {dir, n, type, popts} =
+          case p do
+            {dir, n, type} -> {dir, n, type, []}
+            {dir, n, type, o} when is_list(o) -> {dir, n, type, o}
+            other -> raise ArgumentError, "black_box_from: bad port #{inspect(other)}"
+          end
+
+        case dir do
+          :input -> Builder.input(n, type, popts)
+          :output -> Builder.output(n, type, popts)
+          :inout -> Builder.inout(n, type, popts)
+          other -> raise ArgumentError, "black_box_from: port direction #{inspect(other)}"
+        end
+      end
+    end)
   end
 
   @doc """
@@ -195,8 +287,32 @@ defmodule ExHdl.RTL do
       import Kernel, except: unquote(ExHdl.RTL.Ops.kernel_excludes())
       import Bitwise, only: [band: 2, bor: 2, bnot: 1, bsl: 2, bsr: 2], warn: false
       import ExHdl.RTL.Ops, warn: false
-      unquote(body)
+      require ExHdl.RTL
+      unquote(rewrite(body))
     end
+  end
+
+  @block_macros [:comb, :sync, :switch, :fsm, :state]
+
+  # `u.O` parses as an alias (`O` is uppercase); inside the DSL it means the
+  # port `O` of the handle `u`. Statement macros with a do block are
+  # qualified, so they work when `use ExHdl.RTL, except: [...]` left them out.
+  defp rewrite(body) do
+    Macro.prewalk(body, fn
+      {:__aliases__, _meta, [{var, _, ctx} = v | keys]}
+      when is_atom(var) and is_atom(ctx) and var != :__MODULE__ ->
+        Enum.reduce(keys, v, fn k, acc -> quote(do: ExHdl.RTL.pin(unquote(acc), unquote(k))) end)
+
+      {name, meta, args} = call when name in @block_macros and is_list(args) and args != [] ->
+        last = List.last(args)
+
+        if Keyword.keyword?(last) and Keyword.has_key?(last, :do),
+          do: {{:., meta, [ExHdl.RTL, name]}, meta, args},
+          else: call
+
+      other ->
+        other
+    end)
   end
 
   # -- declarations ----------------------------------------------------------------------
@@ -207,8 +323,20 @@ defmodule ExHdl.RTL do
   @doc "Input port. Options: `domain:` (domain name, `:async`, `:static`)."
   def input(name, type, opts \\ []), do: Builder.input(name, type, opts)
 
-  @doc "Output port; registered with `reset:` or `reg: true` (then `domain:` picks its domain)."
+  @doc """
+  Output port; registered with `reset:` or `reg: true` (then `domain:`
+  picks its domain). In black boxes `clock: true` marks a clock output.
+  """
   def output(name, type, opts \\ []), do: Builder.output(name, type, opts)
+
+  @doc """
+  Bidirectional port (`inout wire` in SV) for pads such as I2C or MDIO.
+  Logic cannot read or drive it: it is passed to inout ports of instances
+  (`instance :u, iobuf, connect: [IO: sda]`), typically an `IOBUF` black
+  box whose `I`, `O` and `T` pins carry the data. The BEAM simulator and
+  co-simulation ignore inout ports.
+  """
+  def inout(name, type, opts \\ []), do: Builder.inout(name, type, opts)
 
   @doc """
   Register. Options: `reset:` (default 0 in domains with a reset, `nil` =
@@ -222,6 +350,34 @@ defmodule ExHdl.RTL do
 
   @doc "The handle of an already declared signal."
   def signal(name), do: Builder.signal(name)
+
+  @doc """
+  Port `port` of an instance (or field of a bundle): `pin(u, :O)` is
+  `u[:O]`, raising with the list of ports when there is no such port.
+  `u.O` inside `module/3` is rewritten to this.
+  """
+  def pin(%{} = handles, port) when is_atom(port) do
+    case Map.fetch(handles, port) do
+      {:ok, h} ->
+        h
+
+      :error ->
+        ports =
+          handles
+          |> Map.keys()
+          |> Enum.reject(&(&1 in [:__instance__, :__bundle__]))
+          |> Enum.sort()
+
+        what =
+          case handles do
+            %{__instance__: i} -> "instance #{i}"
+            _ -> "bundle"
+          end
+
+        raise ExHdl.RTL.ElaborationError,
+              "#{what} has no port #{inspect(port)}; ports: #{inspect(ports)}"
+    end
+  end
 
   @doc "Combinational block."
   defmacro comb(do: body), do: quote(do: Builder.comb(fn -> unquote(body) end))
@@ -249,8 +405,11 @@ defmodule ExHdl.RTL do
 
   @doc """
   Instantiates `module` as `name`. Returns a map of port handles
-  (`u.q`, `u[:q]`; child bundles as bundles). Inputs are driven with
-  `u.en <~ value` or `connect: [en: value]`.
+  (`u.q`, `u[:q]`, `u.Q`; child bundles as bundles). Inputs are driven
+  with `u.en <~ value` or `connect: [en: value]`; inout ports of the child
+  connect to inout ports of this module with `connect: [IO: pad]` (left
+  open without). Port wires are named `<name>_<port>`; a signal of that
+  name in the parent is an error naming the instance.
 
   Options: `domains:` child domain => parent domain (default: same name,
   or the parent's default domain if the child has one domain);
@@ -262,6 +421,15 @@ defmodule ExHdl.RTL do
   A memory. Options: `width:`, `depth:` (required), `init:` (list or
   `%{addr => value}`, rest 0), `style:` (`:auto`, `:block`, `:ultra`,
   `:distributed`, `:registers`), `byte:` byte-enable granularity (8).
+
+  `:auto` emits no `ram_style` attribute and leaves the choice to the
+  synthesis tool. Vivado and Yosys both decide by size and port shape:
+  small memories and memories with asynchronous reads become LUTRAM, so
+  `:auto` gives distributed RAM for a 64 x 256 FIFO (Yosys: 37 RAM cells,
+  `style: :block`: 8 RAMB18). Pick the style explicitly when it matters,
+  or from a target with `ExHdl.Target.Timing.memory_style/3`
+  (`:distributed` up to `lut_rom_max` words, `:ultra` from
+  `uram_min_bits` on UltraScale+, `:block` otherwise).
   """
   def memory(name, opts), do: Builder.memory(name, opts)
 
@@ -311,6 +479,10 @@ defmodule ExHdl.RTL do
   @doc "Next state of the enclosing FSM."
   def goto(state), do: ExHdl.RTL.FSM.goto(state)
 
-  @doc "1-bit: the FSM is in `state`."
+  @doc """
+  1-bit: the FSM is in `state`. `fsm` is the handle `fsm/3` returns or the
+  FSM's name; by name it may precede the FSM's declaration (see
+  `ExHdl.RTL.FSM`).
+  """
   def in_state(fsm, state), do: ExHdl.RTL.FSM.in_state(fsm, state)
 end

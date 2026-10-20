@@ -332,7 +332,34 @@ defmodule ExHdl.Regs do
           "#{name}: addr_width #{inspect(aw)} too small; the map needs #{needed} bits"
         )
 
-    %__MODULE__{name: name, addr_width: aw, registers: regs, windows: wins, doc: opts[:doc]}
+    map = %__MODULE__{name: name, addr_width: aw, registers: regs, windows: wins, doc: opts[:doc]}
+    check_signal_names!(map)
+    map
+  end
+
+  # The slave's signal names (`<reg>_<field>`, `<window>_en`, ...) must be
+  # SystemVerilog identifiers and distinct; checked here, not when the RTL is
+  # elaborated.
+  defp check_signal_names!(map) do
+    names = ExHdl.Regs.RTL.names(map)
+
+    for {n, what} <- names, ExHdl.RTL.Builder.sv_keyword?(n) do
+      raise ArgumentError,
+            "#{map.name}: #{what} gives the signal name #{n}, a SystemVerilog keyword; rename it"
+    end
+
+    names
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Enum.filter(fn {_, whats} -> length(whats) > 1 end)
+    |> Enum.sort()
+    |> case do
+      [] ->
+        :ok
+
+      [{n, [a, b | _]} | _] ->
+        raise ArgumentError,
+              "#{map.name}: #{a} and #{b} both give the signal name #{n}; rename one"
+    end
   end
 
   # Assigns offsets in declaration order; returns the next free byte.

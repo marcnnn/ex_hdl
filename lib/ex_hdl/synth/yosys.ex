@@ -8,8 +8,10 @@ defmodule ExHdl.Synth.Yosys do
 
   @doc """
   Synthesises `sources` (`%{filename => sv_source}`) with `top` as top
-  module. Returns `{:ok, %{lut:, ff:, dsp:, bram18:, carry:, srl:, lutram:, cells:}}`
-  where `bram18` counts RAMB36E1 as two, and `cells` has every cell type.
+  module. Returns `{:ok, %{lut:, ff:, dsp:, bram18:, bram36:, uram:, carry:, srl:,
+  lutram:, cells:}}` where `bram18` counts a RAMB36 as two, `bram36` is the
+  block RAM tile count of data sheets and Vivado (a RAMB18 is half a tile),
+  and `cells` has every cell type.
 
   Options: `:yosys` (executable, default from `PATH`), `:family` (default
   `"xc7"`; `"xcup"` for UltraScale+ such as the XCKU3P).
@@ -62,6 +64,8 @@ defmodule ExHdl.Synth.Yosys do
       dsp: count.(&String.starts_with?(&1, "DSP48")),
       bram18:
         count.(&(&1 in ["RAMB18E1", "RAMB18E2"])) + 2 * count.(&(&1 in ["RAMB36E1", "RAMB36E2"])),
+      bram36:
+        count.(&(&1 in ["RAMB36E1", "RAMB36E2"])) + count.(&(&1 in ["RAMB18E1", "RAMB18E2"])) / 2,
       uram: count.(&(&1 == "URAM288")),
       carry: count.(&(&1 in ["CARRY4", "CARRY8"])),
       srl: count.(&String.starts_with?(&1, "SRL")),

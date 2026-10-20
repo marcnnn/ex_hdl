@@ -36,14 +36,23 @@ defmodule ExHdl.Backends.SystemVerilog.RTL do
   Returns `%{filename => source}` for `mod` and every module below it, plus
   the `sources` attached to black boxes. Black boxes themselves are not
   emitted.
+
+  Option `sim: true` adds the black boxes' `sim_sources` (simulation stubs
+  of vendor primitives; they replace a `sources` file of the same name).
+  Without it they are never returned, so synthesis does not see them.
   """
-  @spec generate(Module.t()) :: %{String.t() => String.t()}
-  def generate(%Module{} = mod) do
+  @spec generate(Module.t(), keyword()) :: %{String.t() => String.t()}
+  def generate(%Module{} = mod, opts \\ []) do
+    sim = Keyword.get(opts, :sim, false)
+
     mod
     |> Module.hierarchy()
     |> Enum.reduce(%{}, fn
-      %Module{kind: :black_box, sources: srcs}, acc -> Map.merge(acc, srcs)
-      m, acc -> Map.put(acc, "#{m.name}.sv", module_source(m))
+      %Module{kind: :black_box} = bb, acc ->
+        acc |> Map.merge(bb.sources) |> Map.merge(if sim, do: bb.sim_sources, else: %{})
+
+      m, acc ->
+        Map.put(acc, "#{m.name}.sv", module_source(m))
     end)
   end
 
@@ -113,10 +122,16 @@ defmodule ExHdl.Backends.SystemVerilog.RTL do
     m.ports
     |> Enum.with_index()
     |> Enum.map(fn {p, i} ->
-      dir = if p.dir == :input, do: "input ", else: "output"
+      {dir, type} =
+        case p.dir do
+          :input -> {"input ", sv_type(p.type)}
+          :output -> {"output", sv_type(p.type)}
+          # a net: `default_nettype none` leaves `inout logic` without a net type
+          :inout -> {"inout ", "wire" <> String.replace_prefix(sv_type(p.type), "logic", "")}
+        end
 
       line =
-        "  #{dir} #{String.pad_trailing(sv_type(p.type), tw)} #{p.name}#{if i < last, do: ",", else: ""}\n"
+        "  #{dir} #{String.pad_trailing(type, tw)} #{p.name}#{if i < last, do: ",", else: ""}\n"
 
       lint_wrap(line, unused?(st, p.name, p.type), "UNUSEDSIGNAL", "  ")
     end)
@@ -265,10 +280,15 @@ defmodule ExHdl.Backends.SystemVerilog.RTL do
   def literal(v, {:s, w}), do: "#{w}'sh#{Integer.to_string(v + (1 <<< w), 16)}"
 
   defp param_value(v) when is_integer(v), do: Integer.to_string(v)
+  defp param_value(v) when is_float(v), do: real(v)
+  defp param_value({:real, v}) when is_number(v), do: real(v / 1)
   defp param_value(v) when is_binary(v), do: inspect(v)
   defp param_value({:bits, w, v}), do: "#{w}'h#{Integer.to_string(v, 16)}"
   defp param_value(true), do: "1"
   defp param_value(false), do: "0"
+
+  # SV real literal: `2.5`, `10.0`, `1.0e-3` (shortest form that reads back).
+  defp real(v), do: :erlang.float_to_binary(v, [:short])
 
   # -- expressions -----------------------------------------------------------------------
 
@@ -406,29 +426,9 @@ defmodule ExHdl.Backends.SystemVerilog.RTL do
     {"(#{sc} ? #{sa} : #{sb})", st}
   end
 
-  defp ex(%Expr{op: :muxn, args: [sel, items, default], type: t}, st) do
+  defp ex(%Expr{op: :muxn, type: t} = e, st) do
     {name, st} = fresh(st)
-    {ssel, st} = ex(sel, st)
-
-    {cases, st} =
-      items
-      |> Enum.with_index()
-      |> Enum.map_reduce(st, fn {item, i}, st ->
-        {si, st} = ex_top(item, st)
-        {"      #{literal(i, sel.type)}: #{name} = #{si};\n", st}
-      end)
-
-    {sd, st} = ex_top(default, st)
-
-    body = [
-      "  always_comb begin\n",
-      "    case (#{ssel})\n",
-      cases,
-      "      default: #{name} = #{sd};\n",
-      "    endcase\n",
-      "  end\n"
-    ]
-
+    {body, st} = case_table(name, e, "", st)
     {name, st |> add_temp(name, t, body) |> use_all(name)}
   end
 
@@ -508,6 +508,36 @@ defmodule ExHdl.Backends.SystemVerilog.RTL do
     {"#{cast_fn(s)}(#{strip_parens(sa)})", st}
   end
 
+  defp case_table(name, %Expr{op: :muxn, args: [sel, items, default]}, case_attr, st) do
+    {ssel, st} = ex(sel, st)
+
+    {cases, st} =
+      items
+      |> Enum.with_index()
+      |> Enum.map_reduce(st, fn {item, i}, st ->
+        {si, st} = ex_top(item, st)
+        {"      #{literal(i, sel.type)}: #{name} = #{si};\n", st}
+      end)
+
+    {sd, st} = ex_top(default, st)
+
+    body = [
+      "  always_comb begin\n",
+      "    #{case_attr}case (#{ssel})\n",
+      cases,
+      "      default: #{name} = #{sd};\n",
+      "    endcase\n",
+      "  end\n"
+    ]
+
+    {body, st}
+  end
+
+  defp table(t, e, style, st) do
+    attr = if style == "distributed", do: ~s|(* rom_style = "logic" *) |, else: ""
+    case_table(t, e, attr, st)
+  end
+
   defp resize(%Expr{args: [a], type: {_, w}}, st) do
     {sa, st} = if w > Expr.width(a), do: sized(a, st), else: ex(a, st)
     {"#{w}'(#{sa})", st}
@@ -576,14 +606,26 @@ defmodule ExHdl.Backends.SystemVerilog.RTL do
 
   # -- statements ------------------------------------------------------------------------
 
-  defp comb_proc({t, [{:assign, t, e}]}, st) do
-    {s, st} = ex_top(e, st)
-    {"  assign #{t} = #{s};\n", st}
+  # A table with a ROM style is written into its signal (whose declaration
+  # carries `rom_style` for Vivado); `distributed` also marks the case
+  # `rom_style = "logic"`, which keeps Yosys from merging it into block RAM.
+  defp comb_proc({t, [{:assign, t, %Expr{op: :muxn} = e}]} = proc, st) do
+    case Keyword.get(st.m.signals[t].attrs, :rom_style) do
+      nil -> comb_assign(proc, st)
+      style -> table(t, e, style, st)
+    end
   end
+
+  defp comb_proc({_t, [{:assign, _, _}]} = proc, st), do: comb_assign(proc, st)
 
   defp comb_proc({_t, stmts}, st) do
     {body, st} = stmts(stmts, "=", 2, st)
     {["  always_comb begin\n", body, "  end\n"], st}
+  end
+
+  defp comb_assign({t, [{:assign, t, e}]}, st) do
+    {s, st} = ex_top(e, st)
+    {"  assign #{t} = #{s};\n", st}
   end
 
   defp stmts(list, op, depth, st), do: Enum.map_reduce(list, st, &stmt(&1, op, depth, &2))
@@ -796,6 +838,13 @@ defmodule ExHdl.Backends.SystemVerilog.RTL do
           {{port, if(invert, do: "!#{rst}", else: "#{rst}")}, use_all(st, rst)}
       end)
 
+    {inouts, st} =
+      Enum.map_reduce(Map.get(inst, :inouts, []), st, fn
+        {port, nil}, st -> {{port, ""}, st}
+        {port, n}, st -> {{port, Atom.to_string(n)}, use_all(st, n)}
+      end)
+
+    conns = conns ++ inouts
     pw = conns |> Enum.map(&String.length(Atom.to_string(elem(&1, 0)))) |> Enum.max(fn -> 0 end)
     last = length(conns) - 1
 

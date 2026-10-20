@@ -26,6 +26,48 @@ defmodule ExHdl.RegsTest do
       assert_raise ArgumentError, ~r/outside 0..15/, fn -> R.window_offset(:coeffs, 16) end
     end
 
+    test "signal names are checked when the map is defined (ex_net 15)" do
+      assert_raise ArgumentError,
+                   ~r/field until of register s gives the signal name s_until, a SystemVerilog keyword/,
+                   fn ->
+                     regmap "m" do
+                       register :s do
+                         field :until, 0
+                       end
+                     end
+                   end
+
+      assert_raise ArgumentError,
+                   ~r/field c of register a_b and field b_c of register a both give the signal name a_b_c/,
+                   fn ->
+                     regmap "m" do
+                       register :a_b do
+                         field :c, 0
+                       end
+
+                       register :a do
+                         field :b_c, 0
+                       end
+                     end
+                   end
+
+      assert_raise ArgumentError, ~r/both give the signal name rd_val/, fn ->
+        regmap "m" do
+          register :rd do
+            field :val, 0
+          end
+        end
+      end
+
+      assert_raise ArgumentError, ~r/both give the signal name wr_go/, fn ->
+        regmap "m" do
+          register :wr, strobe: :write do
+            field :go, 0
+          end
+        end
+      end
+    end
+
     test "overlaps and bad declarations are rejected" do
       assert_raise ArgumentError, ~r/a and b overlap at offset 0x4/, fn ->
         regmap "m" do

@@ -166,6 +166,15 @@ defmodule ExHdl.RTL.Expr do
   def lift(%{__bundle__: _}, _),
     do: raise(WidthError, "a bundle is not an expression; use connect/2 or a field")
 
+  def lift(nil, _),
+    do:
+      raise(
+        WidthError,
+        "not a hardware expression: nil. Inside module/3 and rtl/1 the operators and `if` " <>
+          "build hardware when an operand is hardware; test generator values (such as an " <>
+          "accumulator that starts as nil) with is_nil/1, case or Kernel.==/2"
+      )
+
   def lift(other, _), do: raise(WidthError, "not a hardware expression: #{inspect(other)}")
 
   @doc false
@@ -526,10 +535,19 @@ defmodule ExHdl.RTL.Expr do
   `mux(c, a, b)` is `a` when the 1-bit `c` is 1, else `b` (same signedness,
   result in the wider width). `mux(sel, list)` selects `list[sel]`; indices
   past the end of the list read `default` (option, default 0).
+
+  Integers take the type of the expression operands. When there is none
+  (`mux(c, 4, 3)`, a table of plain integers) they get the smallest type
+  holding all of them, signed if one is negative: `mux(c, 4, 3)` is `u3`.
   """
   def mux(sel, list) when is_list(list), do: mux(sel, list, [])
 
   def mux(sel, list, opts) when is_list(list) and is_list(opts), do: mux_list(sel, list, opts)
+
+  def mux(c, a, b) when is_integer(a) and is_integer(b) do
+    t = const_type([a, b])
+    mux(c, const(a, t), const(b, t))
+  end
 
   def mux(c, a, b) do
     c = bit!(lift(c, {:u, 1}), "mux condition")
@@ -548,8 +566,18 @@ defmodule ExHdl.RTL.Expr do
 
     exprs = Enum.filter(list, &match?(%__MODULE__{}, &1))
 
-    if exprs == [],
-      do: raise(WidthError, "mux list needs at least one expression to define the type")
+    exprs =
+      cond do
+        exprs != [] ->
+          exprs
+
+        Enum.all?(list, &is_integer/1) ->
+          # a table of plain integers: the smallest type holding all of them
+          [const(0, const_type(list))]
+
+        true ->
+          raise WidthError, "mux list needs an expression or only integers to define the type"
+      end
 
     {sign, _} = hd(exprs).type
 
@@ -570,19 +598,51 @@ defmodule ExHdl.RTL.Expr do
     node(:muxn, [sel, items, default], t)
   end
 
-  @doc "Concatenation, first element in the most significant bits (as SV `{a, b}`). Unsigned."
-  def cat(list) when is_list(list) and list != [] do
-    items = Enum.map(list, &lift(&1, nil))
-    node(:cat, [items], {:u, items |> Enum.map(&width/1) |> Enum.sum()})
+  # Smallest common type of integer constants (signed if one is negative).
+  defp const_type(values) do
+    sign = if Enum.any?(values, &(&1 < 0)), do: :s, else: :u
+    {sign, values |> Enum.map(&width(min_type(&1, sign))) |> Enum.max()}
   end
 
-  @doc "`n` copies of `a` concatenated. Unsigned."
+  @doc """
+  Concatenation, first element in the most significant bits (as SV `{a, b}`). Unsigned.
+
+  `nil` items are skipped: they are the zero-width pieces `slice(a, lo, 0)`,
+  `rep(a, 0)` and `cat([])` return, so generator code needs no special case
+  for an empty field. A concatenation of no items is `nil` itself.
+  """
+  def cat(list) when is_list(list) do
+    case Enum.reject(list, &is_nil/1) do
+      [] ->
+        nil
+
+      list ->
+        items = Enum.map(list, &lift(&1, nil))
+        node(:cat, [items], {:u, items |> Enum.map(&width/1) |> Enum.sum()})
+    end
+  end
+
+  @doc "`n` copies of `a` concatenated. Unsigned; `n = 0` gives the zero-width `nil` (see `cat/1`)."
+  def rep(_a, 0), do: nil
+
   def rep(a, n) when is_integer(n) and n >= 1 do
     a = lift(a, nil)
     node(:rep, [a, n], {:u, width(a) * n})
   end
 
-  @doc "Bits `lo` to `lo + width - 1` of `a`, unsigned."
+  @doc """
+  Bits `lo` to `lo + width - 1` of `a`, unsigned. `w = 0` (with `lo` at most
+  the width of `a`) gives the zero-width `nil`, which `cat/1` skips.
+  """
+  def slice(a, lo, 0) when is_integer(lo) and lo >= 0 do
+    a = lift(a, nil)
+
+    if lo > width(a),
+      do: raise(WidthError, "empty slice at bit #{lo} out of range for #{fmt(a.type)} value")
+
+    nil
+  end
+
   def slice(a, lo, w) when is_integer(lo) and is_integer(w) and lo >= 0 and w >= 1 do
     a = lift(a, nil)
 
@@ -638,7 +698,7 @@ defmodule ExHdl.RTL.Expr do
   @impl Access
   def fetch(%__MODULE__{} = e, i) when is_integer(i), do: {:ok, bit(e, i)}
 
-  def fetch(%__MODULE__{} = e, %Range{first: lo, last: hi, step: 1}) when hi >= lo,
+  def fetch(%__MODULE__{} = e, %Range{first: lo, last: hi, step: 1}) when hi >= lo - 1,
     do: {:ok, slice(e, lo, hi - lo + 1)}
 
   def fetch(%__MODULE__{} = e, %Range{first: hi, last: lo, step: -1}) when hi >= lo,

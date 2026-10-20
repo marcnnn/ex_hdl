@@ -45,17 +45,25 @@ defmodule ExHdl.RTL.Interface do
 
   @doc """
   AXI4-Stream. Options: `data:` tdata bits (default 32), `keep:` (default
-  true when `data` is a multiple of 8), `strb:` (false), `last:` (true),
-  `id:`, `dest:`, `user:` bits (0 = absent), `ready:` (true).
+  true when `data` is a multiple of `keep_unit`), `keep_unit:` data bits
+  per `tkeep` bit (default 8; 32 for the DWord keeps of the PCIe streams),
+  `strb:` (false, one bit per byte), `last:` (true), `id:`, `dest:`,
+  `user:` bits (0 = absent), `ready:` (true).
   """
   def axi_stream(opts \\ []) do
     data = Keyword.get(opts, :data, 32)
     bytes = div(data + 7, 8)
-    keep = Keyword.get(opts, :keep, rem(data, 8) == 0)
+    unit = Keyword.get(opts, :keep_unit, 8)
+
+    unless is_integer(unit) and unit >= 1,
+      do:
+        raise(ArgumentError, "keep_unit must be a positive number of bits, got #{inspect(unit)}")
+
+    keep = Keyword.get(opts, :keep, rem(data, unit) == 0)
 
     fields =
       [{:tdata, data, :fwd}] ++
-        opt(keep, {:tkeep, bytes, :fwd}) ++
+        opt(keep, {:tkeep, div(data + unit - 1, unit), :fwd}) ++
         opt(Keyword.get(opts, :strb, false), {:tstrb, bytes, :fwd}) ++
         opt(Keyword.get(opts, :last, true), {:tlast, 1, :fwd}) ++
         bits(opts, :id, :tid) ++

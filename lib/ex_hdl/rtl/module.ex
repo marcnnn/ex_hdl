@@ -61,8 +61,9 @@ defmodule ExHdl.RTL.Module do
   backend, the simulator and other generators read it.
 
     * `name` - SystemVerilog module name; `kind` - `:module` or `:black_box`.
-    * `ports` - ordered `%{name, dir, type, domain, role}`; `role` is
-      `:clock`, `:reset` or `:data`. `domain` is a domain name, `:async`
+    * `ports` - ordered `%{name, dir, type, domain, role}`; `dir` is
+      `:input`, `:output` or `:inout`, `role` is `:clock`, `:reset` or
+      `:data`. `domain` is a domain name, `:async`
       (driven from any domain, only CDC cells), `:static` (quasi-static,
       no domain) or `nil` (constant / no clocked source).
     * `signals` - name => `%{name, type, kind, domain, reset, attrs}`;
@@ -70,9 +71,13 @@ defmodule ExHdl.RTL.Module do
     * `domains` - `ExHdl.RTL.Domain` list, `default_domain` its name.
     * `comb` - `[{target, statements}]` in evaluation order.
     * `sync` - `[{domain, statements}]`.
-    * `instances`, `memories`, `bundles`, `fsms`.
+    * `instances` - `%{name, module, params, conns, domains, inouts}`;
+      `inouts` is `[{child_port, parent_inout | nil}]`. `memories`,
+      `bundles`, `fsms`.
     * `params`, `sources`, `model` - black boxes: SV parameters, attached
-      SV files, Elixir simulation model.
+      SV files, Elixir simulation model. `sim_sources` are SV files for
+      simulation only (stubs of vendor primitives), never synthesised;
+      `clock_outputs` the outputs declared `clock: true`.
     * `comb_paths` - output port => input ports it depends on combinationally.
   """
   defstruct [
@@ -91,6 +96,8 @@ defmodule ExHdl.RTL.Module do
     fsms: [],
     params: [],
     sources: %{},
+    sim_sources: %{},
+    clock_outputs: [],
     model: nil,
     comb_paths: %{},
     attrs: []
