@@ -1,5 +1,56 @@
 # Used by "mix format"
+rtl_dsl = [
+  module: 2,
+  module: 3,
+  black_box: 2,
+  black_box: 3,
+  domain: 1,
+  domain: 2,
+  input: 2,
+  input: 3,
+  output: 2,
+  output: 3,
+  reg: 2,
+  reg: 3,
+  wire: 2,
+  wire: 3,
+  comb: 1,
+  sync: 1,
+  sync: 2,
+  switch: 2,
+  instance: 2,
+  instance: 3,
+  memory: 2,
+  read_port: 2,
+  write_port: 2,
+  master: 2,
+  master: 3,
+  slave: 2,
+  slave: 3,
+  bundle: 2,
+  bundle: 3,
+  connect: 2,
+  fsm: 2,
+  fsm: 3,
+  state: 2,
+  state: 3,
+  goto: 1,
+  # ExHdl.Regs
+  defregs: 2,
+  defregs: 3,
+  regmap: 2,
+  regmap: 3,
+  register: 2,
+  register: 3,
+  field: 2,
+  field: 3,
+  field: 4,
+  window: 2
+]
+
 [
   import_deps: [:nx, :stream_data],
-  inputs: ["{mix,.formatter}.exs", "{config,lib,test}/**/*.{ex,exs}"]
+  inputs: ["{mix,.formatter}.exs", "{config,lib,test}/**/*.{ex,exs}"],
+  locals_without_parens: rtl_dsl,
+  export: [locals_without_parens: rtl_dsl]
 ]

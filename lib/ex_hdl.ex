@@ -6,5 +6,9 @@ defmodule ExHdl do
   codecs, SystemVerilog AXI4-Stream parser/emitter
   (`ExHdl.Backends.SystemVerilog.Protocol`) and Verilator co-simulation
   (`ExHdl.Sim.Verilator`).
+
+  RTL layer: `ExHdl.RTL` (module DSL), `ExHdl.Backends.SystemVerilog.RTL`,
+  `ExHdl.RTL.Sim`, `ExHdl.RTL.Cosim`, `ExHdl.RTL.CDC`. Design note:
+  `docs/rtl_dsl.md`.
   """
 end
