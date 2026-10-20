@@ -74,7 +74,7 @@ defmodule ExHdl.Target.TimingTest do
     assert Timing.level_ns(t) == 0.6
     assert_in_delta add_cost(t, 16), 0.6 + 0.03 * 17, 1.0e-12
     assert mul_cost(t, 25, 18) == {:reg, 3, :dsp48}
-    assert mul_cost(t, 27, 18) == {:reg, 5, :dsp48_cascade}
+    assert mul_cost(t, 27, 18) == {:reg, 4, :dsp48_split}
     assert Timing.new(ii: 2, channels: 4, clock_mhz: 200).clock_mhz == 200
   end
 
@@ -86,7 +86,7 @@ defmodule ExHdl.Target.TimingTest do
     assert %{uram_latency: 2, bram_latency: 2, dsp_latency: 3} = t1
     assert mul_cost(t1, 27, 18) == {:reg, 3, :dsp48}
     assert mul_cost(t1, 18, 27) == {:reg, 3, :dsp48}
-    assert mul_cost(t1, 28, 18) == {:reg, 5, :dsp48_cascade}
+    assert mul_cost(t1, 28, 18) == {:reg, 4, :dsp48_split}
     assert Timing.dsp_fits?(t1, 26, 18)
     refute Timing.dsp_fits?(Timing.new(), 26, 18)
 

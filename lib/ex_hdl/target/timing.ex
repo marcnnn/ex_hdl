@@ -7,6 +7,10 @@ defmodule ExHdl.Target.Timing do
   range analysis, so a 32-bit Nx add whose values need 17 bits is costed as
   a 17-bit adder. Constant shifts and masks are wiring and cost nothing.
 
+  Products wider than the DSP multiplier are costed as their pieces
+  (`dsp_split/3`): the DSP latency plus one adder level per halving of
+  the piece count, so loops and pipelines match the generated split.
+
   The numbers are deliberately simple and only meant for scheduling
   decisions (where to put registers, how long a feedback loop is). Real
   timing closure is decided by place and route.
@@ -253,6 +257,64 @@ defmodule ExHdl.Target.Timing do
     end
   end
 
+  @doc """
+  Cost of a signed `a` x `b` bit product: one DSP slice when it fits the
+  multiplier, otherwise the pieces of `dsp_split/3` and their adder tree.
+  """
+  @spec mul_cost(t(), pos_integer(), pos_integer()) :: cost()
+  def mul_cost(%__MODULE__{} = t, a, b) do
+    case dsp_split(t, a, b) do
+      %{count: 1} -> {:reg, t.dsp_latency, :dsp48}
+      %{levels: l} -> {:reg, t.dsp_latency + l, :dsp48_split}
+    end
+  end
+
+  @doc """
+  How a signed `a` x `b` bit product maps onto DSP multipliers
+  (`dsp_multiplier`, `{27, 18}` for DSP48E2, `{25, 18}` for DSP48E1).
+
+  Each operand is cut into pieces that fit one port: unsigned low pieces of
+  `port - 1` bits (a zero sign bit is added) and a signed top piece. Every
+  pair of pieces is one DSP slice; the partial products, shifted, are summed
+  by a registered adder tree of `levels` levels. The orientation (which
+  operand goes to the wide port) with fewer slices wins.
+
+  Returns `%{count:, levels:, swap:, a: [{lsb, bits, signed?}], b: [...]}`
+  where `swap` is true when `b` goes to the wide port; `a` and `b` are the
+  pieces of the two operands as given.
+
+      iex> t = ExHdl.Target.Timing.new(family: :ultrascale_plus)
+      iex> ExHdl.Target.Timing.dsp_split(t, 32, 24).count
+      2
+      iex> ExHdl.Target.Timing.dsp_split(t, 32, 32).count
+      4
+  """
+  @spec dsp_split(t(), pos_integer(), pos_integer()) :: map()
+  def dsp_split(%__MODULE__{dsp_multiplier: {wide, narrow}}, a, b) do
+    straight = {pieces(a, wide), pieces(b, narrow)}
+    swapped = {pieces(a, narrow), pieces(b, wide)}
+
+    {{pa, pb}, swap} =
+      if length(elem(swapped, 0)) * length(elem(swapped, 1)) <
+           length(elem(straight, 0)) * length(elem(straight, 1)),
+         do: {swapped, true},
+         else: {straight, false}
+
+    count = length(pa) * length(pb)
+    %{count: count, levels: ceil_log2(count), swap: swap, a: pa, b: pb}
+  end
+
+  @doc "DSP slices of a signed `a` x `b` bit product (`dsp_split/3`)."
+  def dsp_count(%__MODULE__{} = t, a, b), do: dsp_split(t, a, b).count
+
+  # Pieces of a signed `w`-bit operand for a signed `port`-bit input.
+  defp pieces(w, port) when w <= port, do: [{0, w, true}]
+
+  defp pieces(w, port) do
+    rest = pieces(w - (port - 1), port)
+    [{0, port - 1, false} | Enum.map(rest, fn {lsb, n, s} -> {lsb + port - 1, n, s} end)]
+  end
+
   @doc "True when a signed `a` x `b` bit product fits one DSP multiplier."
   def dsp_fits?(%__MODULE__{dsp_multiplier: {ma, mb}}, a, b),
     do: (a <= ma and b <= mb) or (a <= mb and b <= ma)
@@ -290,17 +352,9 @@ defmodule ExHdl.Target.Timing do
     do: {:comb, level_ns(t)}
 
   def cost(%{op: :multiply, inputs: [a, b]}, graph, t) do
-    cond do
-      power_of_two?(graph, a) or power_of_two?(graph, b) ->
-        {:comb, 0.0}
-
-      dsp_fits?(t, signed_width(graph, a), signed_width(graph, b)) ->
-        {:reg, t.dsp_latency, :dsp48}
-
-      true ->
-        # Cascade of two DSP slices.
-        {:reg, t.dsp_latency + 2, :dsp48_cascade}
-    end
+    if power_of_two?(graph, a) or power_of_two?(graph, b),
+      do: {:comb, 0.0},
+      else: mul_cost(t, signed_width(graph, a), signed_width(graph, b))
   end
 
   def cost(%{op: :take, inputs: [table, _]}, graph, t) do
@@ -311,11 +365,21 @@ defmodule ExHdl.Target.Timing do
       else: {:reg, t.bram_latency, :bram}
   end
 
-  # One multiplier per product, then a registered adder tree.
-  def cost(%{op: :dot, inputs: [a | _], attrs: {contract, _, _, _}}, graph, t) do
+  # One multiplier per product (split like a multiply), then a registered
+  # adder tree.
+  def cost(%{op: :dot, inputs: [a, b], attrs: {contract, _, _, _}}, graph, t) do
     n = contract |> Enum.map(&elem(graph.nodes[a].shape, &1)) |> Enum.product()
-    {:reg, t.dsp_latency + ceil_log2(n), :dsp48_tree}
+    split = dsp_split(t, signed_width(graph, a), signed_width(graph, b))
+    {:reg, t.dsp_latency + split.levels + ceil_log2(n), :dsp48_tree}
   end
+
+  # Wiring (signed wrap to fewer bits, `ExHdl.Passes.Idioms`).
+  def cost(%{op: :wrap}, _graph, _t), do: {:comb, 0.0}
+
+  # Priority encoder: OR trees over halves, then one mux level per bit of
+  # the result, two per LUT.
+  def cost(%{op: :msb, attrs: {j0, j1}}, _graph, t),
+    do: {:comb, level_ns(t) * (2 + div(ceil_log2(j1 - j0 + 2) + 1, 2))}
 
   # Upper bound: all elements summed.
   def cost(%{op: :sum, inputs: [x]}, graph, t) do
@@ -341,7 +405,9 @@ defmodule ExHdl.Target.Timing do
     bits
   end
 
-  defp signed_width(graph, id) do
+  @doc false
+  # Signed bits of a node's proven range.
+  def signed_width(graph, id) do
     case IntSet.bit_width(graph.nodes[id].range) do
       {:s, bits} -> bits
       {:u, bits} -> bits + 1

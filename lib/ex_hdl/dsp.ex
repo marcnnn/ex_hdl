@@ -4,7 +4,15 @@ defmodule ExHdl.DSP do
   width check on a `step(..., state, ...) -> {output, next_state}` kernel,
   then the recurrence analysis and schedule for a target
   (`ExHdl.Passes.Recurrence`, `ExHdl.Target.Timing`).
+
+  Helpers for kernels whose hardware is cheaper than their Nx form
+  (`ExHdl.Passes.Idioms`): `wrap/2` (accumulators without a clamp),
+  `msb/2` and `count_leading_zeros/2` (priority encoders), and
+  `frame_flags/1` for the reference of kernels with a frame sideband.
   """
+
+  import Bitwise
+  import Nx.Defn, only: [deftransform: 2]
 
   defmodule ScheduleError do
     defexception [:message]
@@ -14,10 +22,13 @@ defmodule ExHdl.DSP do
   Analyses a stream kernel `step(..., state, ...) -> {output, next_state}`.
 
   `opts[:state]` is the index of the state argument in `args`. Runs the
-  width check, then `ExHdl.Passes.Recurrence`. Further options: `:ii`,
-  `:channels`, `:state_mem` and `:ram_latency` (state of all channels in
-  a memory, see `ExHdl.Backends.SystemVerilog.Scan`), timing overrides
-  (`:clock_mhz`, `:dsp_latency`, ...), and everything `analyze/3` accepts.
+  width check, then `ExHdl.Passes.Idioms` and `ExHdl.Passes.Recurrence`.
+  Further options: `:ii`, `:channels`, `:state_mem` and `:ram_latency`
+  (state of all channels in a memory, see `ExHdl.Backends.SystemVerilog.Scan`),
+  `:memories` (parameters that are RAMs read by `Nx.take`, `ExHdl.IR.Memory`),
+  `frame: true` (the sample is `{data..., {first, last}}`, the flags come
+  from the stream's `tlast`), timing overrides (`:family`, `:clock_mhz`,
+  `:dsp_latency`, ...), and everything `NxFixed.analyze_expr/2` accepts.
 
   Returns `{:ok, %ExHdl.IR.Scan{}}` or `{:error, %NxFixed.RangeError{} | %ScheduleError{}}`.
   """
@@ -29,6 +40,7 @@ defmodule ExHdl.DSP do
     with :ok <- check_scan_shape(output),
          {:ok, graph} <- NxFixed.analyze_expr(output, opts) do
       {out_ids, next_ids} = graph.outputs
+      graph = ExHdl.Passes.Idioms.run(graph, flatten_ids(out_ids) ++ flatten_ids(next_ids))
       state_indices = param_indices(args, state_arg)
 
       params_by_index =
@@ -38,17 +50,138 @@ defmodule ExHdl.DSP do
             do: {graph.nodes[id].attrs, id}
 
       leaf_params = Enum.map(state_indices, &Map.get(params_by_index, &1))
+      layout = arg_layout(args, state_arg)
 
       with :ok <- check_state_types(args, state_arg, graph, next_ids),
+           {:ok, frame} <- frame_leaves(layout, opts),
+           {:ok, memories} <-
+             ExHdl.IR.Memory.specs(graph, layout, params_by_index, opts),
+           costs = ExHdl.IR.Memory.costs(graph, memories),
            {:ok, scan} <-
-             ExHdl.Passes.Recurrence.run(graph, leaf_params, out_ids, next_ids, opts) do
-        {:ok, %{scan | args: arg_layout(args, state_arg)}}
+             ExHdl.Passes.Recurrence.run(
+               graph,
+               leaf_params,
+               out_ids,
+               next_ids,
+               Keyword.put(opts, :node_costs, costs)
+             ) do
+        {:ok, %{scan | args: layout, memories: memories, costs: costs, frame: frame}}
       else
         {:error, message} when is_binary(message) -> {:error, %ScheduleError{message: message}}
         {:error, %ScheduleError{}} = error -> error
       end
     end
   end
+
+  @doc """
+  Wraps `x` to a signed `bits`-bit value (two's complement), keeping its
+  type: `((x + 2^(bits-1)) & (2^bits - 1)) - 2^(bits-1)`. Like
+  `NxFixed.Primitives.wrap/2` for widths without an Nx type (`s48`).
+
+  The width check proves the result inside `bits` bits whatever `x` is, so
+  an accumulator written as `wrap(acc + x, 48)` needs no clamp in its loop
+  (saturate the output instead). The hardware is wiring
+  (`ExHdl.Passes.Idioms`): the accumulator's loop is one adder.
+  """
+  deftransform wrap(x, bits) when is_integer(bits) and bits >= 2 do
+    type = Nx.type(x)
+    half = Nx.tensor(1 <<< (bits - 1), type: type)
+    mask = Nx.tensor((1 <<< bits) - 1, type: type)
+    x |> Nx.add(half) |> Nx.bitwise_and(mask) |> Nx.subtract(half)
+  end
+
+  @doc """
+  Index of the leading one of a scalar `x` with `1 <= x < 2^bits`, as
+  `s32`: `floor(log2(x))`; 0 for `x <= 1`, `bits - 1` for larger `x`.
+
+  Written as the number of thresholds `2, 4, ..., 2^(bits-1)` that `x`
+  reaches, so the width check proves it and the Nx reference runs on every
+  backend; the hardware is a priority encoder instead of comparators and an
+  adder tree (`ExHdl.Passes.Idioms`). Nx's `count_leading_zeros` is not
+  supported by nx_fixed.
+  """
+  deftransform msb(x, bits) when is_integer(bits) and bits >= 2 do
+    thresholds(x, 1, bits - 1)
+  end
+
+  @doc """
+  Leading zeros of a scalar `x` as a `bits`-bit unsigned value
+  (`0 <= x < 2^bits`), as `s32`: `bits` for 0, 0 when bit `bits - 1` is
+  set. Values from `2^bits` on count as 0. A priority encoder in hardware,
+  like `msb/2`.
+  """
+  deftransform count_leading_zeros(x, bits) when is_integer(bits) and bits >= 1 do
+    Nx.subtract(bits, thresholds(x, 0, bits - 1))
+  end
+
+  defp thresholds(x, j0, j1) do
+    type = if Nx.type(x) == {:s, 64} or Nx.type(x) == {:u, 64}, do: Nx.type(x), else: {:s, 64}
+    t = Nx.tensor(for(j <- j0..j1, do: 1 <<< j), type: type, backend: Nx.BinaryBackend)
+    x |> Nx.as_type(type) |> Nx.greater_equal(t) |> Nx.as_type(:s32) |> Nx.sum()
+  end
+
+  @doc """
+  First and last flags of frames of the given lengths, for the Nx reference
+  of a kernel with `frame: true`: `{firsts, lasts}`, one 0/1 per item.
+
+      iex> ExHdl.DSP.frame_flags([2, 1, 3])
+      {[1, 0, 1, 1, 0, 0], [0, 1, 1, 0, 0, 1]}
+  """
+  def frame_flags(lengths) do
+    flags =
+      Enum.flat_map(lengths, fn n when n >= 1 ->
+        for i <- 0..(n - 1), do: {if(i == 0, do: 1, else: 0), if(i == n - 1, do: 1, else: 0)}
+      end)
+
+    {Enum.map(flags, &elem(&1, 0)), Enum.map(flags, &elem(&1, 1))}
+  end
+
+  # `frame: true`: the sample is a tuple whose last element is `{first, last}`.
+  defp frame_leaves(layout, opts) do
+    case Keyword.get(opts, :frame, false) do
+      false ->
+        {:ok, nil}
+
+      true ->
+        sample = Enum.find(layout, &(&1.role == :sample))
+
+        with %{leaves: leaves} when length(leaves) >= 3 <- sample,
+             [first, last] = Enum.take(leaves, -2),
+             true <- first.shape == {} and last.shape == {} do
+          {:ok, %{first: first.index, last: last.index}}
+        else
+          _ ->
+            {:error,
+             "stream_scan: frame: true needs the sample {data..., {first, last}} with scalar flags after at least one data leaf"}
+        end
+
+      other ->
+        {:error, "stream_scan: frame: must be true or false, got #{inspect(other)}"}
+    end
+  end
+
+  @doc false
+  # Port name and leaf of every parameter leaf, in order: `param_names` per
+  # argument, `<name>_<i>` for the leaves of a container argument.
+  def param_leaf_names(layout, names) do
+    layout
+    |> Enum.filter(&(&1.role == :param))
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {arg, k} ->
+      base = Enum.at(names, k) || "param#{arg.arg}"
+
+      case arg.leaves do
+        [leaf] ->
+          [{base, base, leaf}]
+
+        leaves ->
+          leaves |> Enum.with_index() |> Enum.map(fn {l, i} -> {base, "#{base}_#{i}", l} end)
+      end
+    end)
+  end
+
+  defp flatten_ids(t) when is_tuple(t), do: t |> Tuple.to_list() |> Enum.flat_map(&flatten_ids/1)
+  defp flatten_ids(id) when is_integer(id), do: [id]
 
   @doc """
   Analyses a stream kernel (`analyze_scan/3`) and generates its
