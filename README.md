@@ -14,19 +14,43 @@ generated as SystemVerilog, bit-identical.
 | **ex_hdl** (this one) | hardware: protocol DSL, SystemVerilog, scheduling and timing, co-simulation |
 | [elixir_type_laws](../elixir_type_laws) | set-theoretic laws checked against Elixir's type system |
 
+ExHdl only provides the basics: describing, simulating and building
+hardware. Function lives in the hardware library set built on it:
+
+| Library | Scope |
+|---|---|
+| [ex_hdl_cores](../ex_hdl_cores) | generic IP: FIFOs, CRC, arbiters, AXI4-Stream plumbing |
+| [ex_hdl_xilinx](../ex_hdl_xilinx) | Xilinx primitives, constraints, boards, Vivado |
+| [ex_net](../ex_net) | Ethernet MAC, PCS, VLAN/IPv4/UDP/IGMP |
+| [ex_ptp](../ex_ptp) | IEEE 1588: timestamping, wallclock, servo, BMCA |
+| [ex_aes67](../ex_aes67) | RTP streams, jitter buffer, SAP/SDP, RTSP, mDNS, NMOS |
+| [ex_audio](../ex_audio) | audio DSP kernels: EQ, dynamics, matrix mixer, meters |
+| [ex_pcie](../ex_pcie) | PCIe DMA and BAR access, host side over vfio |
+
 ## Status
 
 | Area | State |
 |---|---|
 | `ExHdl.Protocol`: `defpacket` DSL, BEAM codecs, AXI4-Stream parser/emitter in SystemVerilog | done |
+| Header chains (`defheader`, `layer`, `next:`): VLAN stacks, IPv4 options, lengths and checksums, runtime match tables, payload realigned from any byte lane | done |
 | Verilator co-simulation (`ExHdl.Sim.Verilator`) | done |
 | Stateful streams: recurrence analysis, `ii:`/`channels:`, Zynq timing model (`ExHdl.DSP.analyze_scan/3`, on top of nx_fixed's width check) | done |
 | Stream kernels to SystemVerilog (`ExHdl.Backends.SystemVerilog.Scan`): AXI4-Stream module per kernel, bit-identical with the Nx reference | done |
 | FIRs as transposed DSP48E1 chains with pre-adder folding, running sums, delay lines in LUT RAM / block RAM (`ExHdl.Backends.SystemVerilog.Fir`) | done |
 | Blocks from `%NxFixed.Block{}` descriptions (`ExHdl.Block`), variable-rate outputs; 46 ex_sdr stream blocks co-simulated | done |
-| Resource estimates with Yosys `synth_xilinx` (`ExHdl.Synth.Yosys`, `mix ex_hdl.gen.sv --synth`) | done |
+| Many channels on one pipeline: state in LUT RAM, block RAM or UltraRAM (`state_mem:`), per-channel parameters from a double-buffered memory with a host write port (`channel_params:`), `tid` and `tuser` through the pipeline | done |
+| Feedback loops per state group (a cascade of k filters has the loop of one), kernel composition (`ExHdl.DSP.cascade/1`) | done |
+| Resource estimates with Yosys `synth_xilinx` (`ExHdl.Synth.Yosys`, `mix ex_hdl.gen.sv --synth`, 7-series and UltraScale+) | done |
+| `ExHdl.RTL`: RTL DSL with explicit widths, clock domains and a domain-crossing check, FSMs, interface bundles (AXI4-Stream, AXI4-Lite, memory port), inferred memories, black boxes ([design note](docs/rtl_dsl.md)) | done |
+| RTL to SystemVerilog (`ExHdl.Backends.SystemVerilog.RTL`), lint-clean under `verilator -Wall` | done |
+| BEAM RTL simulator with multiple clocks and VCD (`ExHdl.RTL.Sim`), port-level Verilator co-simulation (`ExHdl.RTL.Cosim`), ports of any width | done |
+| Cycle-by-cycle check of RTL against an Elixir step function or a recorded trace, BEAM and Verilator, with a mismatch report (`ExHdl.RTL.Cosim.check_model/4`) | done |
+| One-hot FSM encoding, indexed part select `part/3` | done |
+| CDC cells (`ExHdl.RTL.CDC`: synchroniser, pulse, reset, handshake) and wrappers for protocol and stream-kernel modules (`ExHdl.RTL.Wrap`) | done |
 | Retiming, `accelerator` DSL | planned |
 | openXC7 bitstream builder, Zynq runtime | planned |
+| `defregs` register maps (`ExHdl.Regs`): AXI4-Lite slave with rw/ro/wo/w1c/w1s/rc fields, arrays, strobes and RAM windows; host encode/decode, C header, Markdown; BEAM AXI4-Lite master (`ExHdl.Regs.SimDriver`) | done |
+| Timing families (`ExHdl.Target.Timing`): Zynq-7000 and UltraScale+ (DSP48E2, URAM, -1/-2 delays), from `ExHdlXilinx.Device` data | done |
 
 ## Development
 
@@ -37,6 +61,83 @@ mix test --only yosys         # resource checks
 mix ex_hdl.gen.sv MyApp.Protocol --out hdl/generated
 mix ex_hdl.gen.sv MyApp.Kernels --out hdl/generated --synth   # stream kernels, ex_hdl_kernels/0
 ```
+
+## Packets in hardware
+
+`defpacket` describes a header chain once; it becomes a BEAM codec and an
+AXI4-Stream parser and emitter. The AES67 receive chain:
+
+```elixir
+defheader :eth do
+  field :dst, 48
+  field :src, 48
+  field :ethertype, 16, type: {:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800}
+end
+
+defheader :vlan do
+  field :pcp, 3
+  field :dei, 1, type: :flag
+  field :vid, 12
+  field :ethertype, 16, type: {:enum, vlan: 0x8100, ipv4: 0x0800}
+end
+
+defheader :ipv4 do
+  field :version, 4, assert: 4, error: :not_ipv4
+  field :ihl, 4, header_length: 4
+  field :dscp_ecn, 8
+  field :total_length, 16, length: :total
+  field :id, 16
+  field :flags_frag, 16
+  field :ttl, 8
+  field :protocol, 8
+  field :checksum, 16, checksum: :header
+  field :src, 32
+  field :dst, 32
+  field :options, :bytes
+end
+
+defheader :udp do
+  field :src_port, 16
+  field :dst_port, 16, match: 4
+  field :length, 16, length: :total
+  field :checksum, 16, checksum: :segment, optional: true,
+    pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
+end
+
+defpacket :udp_rx, bus_width: 64 do
+  layer :eth, next: {:ethertype, vlan: :vlan, qinq: :vlan, ipv4: :ipv4}
+  layer :vlan, max: 2, next: {:ethertype, vlan: :vlan, ipv4: :ipv4}
+  layer :ipv4, next: {:protocol, %{17 => :udp}}
+  layer :udp
+  payload :data, type: :bytes
+end
+```
+
+`encode_udp_rx(%{eth: ..., vlan: [...], ipv4: ..., udp: ...}, payload)`
+fills in EtherTypes, IHL, lengths and checksums; `decode_udp_rx/2` checks
+them, cuts Ethernet padding and returns `{:ok, header, payload}` or an
+`{:error, {kind, {layer, field}, value}}` (`ExHdl.Protocol.Codec`);
+`decode_udp_rx_header/2` stops after the headers.
+
+The parser matches every header layout (here 33: 0-2 tags times 11 IHL
+values) in parallel against a byte register of the header, decides in the
+beat holding the last header byte, and shifts the payload to lane 0 with
+one register of the previous beat. It accepts one beat per cycle on 8 to
+64-bit buses, also across packet boundaries. Header errors drop the packet
+(`dropped_packets`); a packet shorter than its length field or with a bad
+UDP checksum is forwarded with `m_axis_tuser` on its last beat, since that
+is only known at the end. The emitter computes lengths (from a
+`payload_bytes` input) and the IPv4 checksum; the UDP checksum over the
+payload is an input (or 0), as computing it would need store-and-forward.
+Co-simulation drives random packets (good, padded, truncated, every kind of
+bad header) through the parser and a parser -> emitter loopback under random
+backpressure (test/protocol_chain_cosim_test.exs).
+
+Yosys `synth_xilinx` for this chain (33 layouts, 90-byte header register,
+40 bytes of IPv4 options as meta output): parser 3635 LUT / 1681 FF at
+64 bits and 2876 LUT / 1634 FF at 8 bits, emitter about 3000 LUT / 100 FF.
+Variable layouts multiply: every header-length value and repeat count is
+one layout, at most 4096.
 
 ## Stream kernels in hardware
 
@@ -59,6 +160,10 @@ so no ready path is combinational. `p_load` captures new parameter values,
 which apply once the samples accepted before have left the pipeline.
 Feedback loops longer than one cycle run with `ii: n` (one sample every n
 cycles) or `channels: n` (n interleaved streams at one sample per cycle).
+The state leaves are split into groups (strongly connected parts of "next
+value of leaf i depends on leaf j"), each read and written at its own
+stages, so only a group's own loop counts: one biquad section has a loop
+of 8 cycles (Zynq timing model at 150 MHz), and so has a cascade of four.
 
 Structures recognised on the lowered kernel (`ExHdl.Backends.SystemVerilog.Fir`),
 from value keys `{delay, base}` that see through the kernel's delay line:
@@ -78,6 +183,49 @@ directly (sample templates from the block's item type and format). Blocks
 with `rate: {:variable, max}` get `max` output lanes and a count; the
 output buffer sends the valid ones one per beat. test/support/block_cases.ex
 lists the co-simulated ex_sdr blocks, one line each.
+
+### Many channels
+
+An audio mixer runs 1024 channels through one pipeline at one sample per
+cycle. With `channels: n` the state of every channel can live in a memory
+instead of registers, and parameters can come per channel from a
+coefficient memory the host rewrites at run time:
+
+```elixir
+spec = ExHdl.DSP.cascade(for k <- 1..4, do: [fun: &MyAudio.biquad/3, args: args,
+  state: 1, init: zero, param_ranges: ranges, param_names: ["coef"], name: "eq#{k}"])
+
+{:ok, design} =
+  ExHdl.DSP.scan_to_sv(spec[:fun], spec[:args],
+    Keyword.drop(spec, [:fun, :args]) ++
+      [name: "eq4", channels: 1024, state_mem: :block, channel_params: :all,
+       tid: true, tuser: 16])
+```
+
+  * `state_mem: :distributed | :block | :ultra`: one memory word per channel
+    and state group (groups read in the same stage share a word), read
+    `ram_latency` cycles ahead (1, or 2 for UltraRAM) and written back at the
+    group's write stage. No forwarding: the analysis requires `channels` of
+    at least the loop latency plus the read latency and reports the
+    shortest valid `channels:` otherwise. After reset the memory is cleared
+    to `:init`, one word per cycle, while `busy` is high;
+    `state_init: :initial` puts `:init` into the initial contents instead.
+  * `channel_params: [name] | :all`: those parameter arguments come from a
+    memory with two banks of a word per channel, each leaf read at the stage
+    of its first use. The host writes the inactive bank (`pc_addr`,
+    `pc_data`, `pc_we`, optionally on its own clock with
+    `pc_clock: :separate`) and pulses `pc_swap`; the banks swap at the next
+    frame boundary (the next sample is channel 0), so every frame sees one
+    coefficient set, and `pc_pending` stays high until no sample reading the
+    old bank is left in the pipeline.
+  * `m_axis_tid` gives every output's channel; `tid: true` takes the channel
+    from `s_axis_tid` instead of the arrival order (a frame then starts
+    where the channel does not increase); `tuser: bits` carries a sideband
+    through the pipeline.
+
+`ExHdl.DSP.cascade/1` composes kernels into one (outputs feed the next
+stage's sample, states and parameters are concatenated, port names get the
+stage's name as prefix): one pipeline with one clock enable.
 
 Yosys `synth_xilinx` for Q15 instances (synthesis only, no I/O buffers,
 no timing); latency includes the output buffer:
@@ -99,6 +247,32 @@ no timing); latency includes the output buffer:
 
 The FIR chains' remaining flip-flops are the kernel's delay line (needed
 by the pre-adder) and the partial sums of zero taps.
+
+ex_audio's direct form I biquad (24-bit samples, 32-bit coefficients and
+history, error feedback; a copy is in test/support/audio_kernels.ex), same
+flow; with `channels: 1024` both the state and the per-channel coefficient
+banks are in RAM. Pipeline delays become SRL shift registers (about 430 per
+section, not counted as LUT):
+
+| Kernel | latency | ii | LUT | FF | DSP48E1 | RAMB18 |
+|---|---|---|---|---|---|---|
+| biquad, `ii: :auto` | 16 | 8 | 816 | 477 | 20 | 0 |
+| biquad, `channels: 10`, state in registers | 16 | 1 | 1718 | 2543 | 20 | 0 |
+| biquad, `channels: 1024`, `state_mem: :block`, `channel_params: :all` | 17 | 1 | 800 | 267 | 20 | 28 |
+| 4 biquads (`ExHdl.DSP.cascade/1`), `ii: :auto` | 61 | 8 | 3218 | 1881 | 80 | 0 |
+| 4 biquads, `channels: 1024`, block RAM | 62 | 1 | 3149 | 909 | 80 | 112 |
+
+The same for UltraScale+ (`family: "xcup"`) with `clock_mhz: 250` (loop of
+10 cycles per section):
+
+| Kernel | latency | LUT | FF | DSP48E2 | RAMB18 | URAM |
+|---|---|---|---|---|---|---|
+| biquad, `channels: 1024`, block RAM | 21 | 1010 | 739 | 20 | 28 | 0 |
+| biquad, `channels: 1024`, `state_mem: :ultra` | 22 | 1010 | 874 | 20 | 20 | 3 |
+| 4 biquads, `channels: 1024`, `state_mem: :ultra` | 79 | 3993 | 3325 | 80 | 80 | 12 |
+
+The wide products (32 x 24 and 32 x 32 bit) take 4 DSP slices each; see
+ex_audio's NEEDS.md on splitting them.
 
 The sibling libraries are path dependencies (`../nx_fixed`, and
 `../ex_sdr` for integration tests); `scripts/checkout_siblings.sh` clones

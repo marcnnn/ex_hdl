@@ -1,6 +1,6 @@
 defmodule ExHdl.Target.Timing do
   @moduledoc """
-  Coarse delay and latency model for Zynq-7000 fabric (speed grade -1).
+  Coarse delay and latency model of an FPGA family, for scheduling.
 
   Each IR node costs either combinational delay (`{:comb, ns}`) or a fixed
   number of register stages (`{:reg, cycles, kind}`). Widths come from the
@@ -9,23 +9,62 @@ defmodule ExHdl.Target.Timing do
 
   The numbers are deliberately simple and only meant for scheduling
   decisions (where to put registers, how long a feedback loop is). Real
-  timing closure is decided by place and route. All fields can be
-  overridden through options.
+  timing closure is decided by place and route.
+
+  ## Families
+
+    * `:zynq7` (default) - Zynq-7000 / 7-series, speed grade `"-1"`:
+      DSP48E1 (25 x 18 multiplier, 25-bit pre-adder, 48-bit accumulator),
+      RAMB36E1, no URAM. `lut_ns` (0.6) includes routing; the flip-flop
+      and net delays are 0 and folded into `margin` (0.75).
+    * `:ultrascale_plus` - Kintex/Virtex/Zynq UltraScale+, speed grades
+      `"-1"` (default) and `"-2"`: DSP48E2 (27 x 18 multiplier, 27-bit
+      pre-adder, 48-bit accumulator), RAMB36E2, URAM288 (4096 x 72, 2
+      cycles with output register). Delays are typical routed values
+      (`lut_ns` 0.12/0.10 cell delay plus `net_typ_ns` 0.35/0.30 per
+      level, `ff_clk_to_q_ns` and `ff_setup_ns` subtracted from the
+      period), `margin` 0.85. The family names of `ExHdlXilinx.Device`
+      (`:kintex_ultrascale_plus`, ...) are accepted.
+
+  `new/1` takes `family:`, `speed_grade:` and overrides for every field;
+  `from_device/3` builds the model from device data in the shape of
+  `ExHdlXilinx.Device` (family, `dsp`, `bram`, `uram`, `delays`,
+  `fmax_mhz`, `resources`). Unknown keys are ignored, so the options of a
+  stream kernel (`:ii`, `:channels`, ...) can be passed through.
+
+  Fields: `clock_mhz`, `margin` (fraction of the period available to
+  logic), `lut_ns`, `net_typ_ns` (routing per logic level), `carry_ns_per_bit`,
+  `ff_clk_to_q_ns`, `ff_setup_ns`, `dsp_latency` (A/B, M and P
+  registers), `dsp_multiplier` (`{a_bits, b_bits}` signed), `dsp_preadder_bits`,
+  `dsp_accumulator_bits`, `bram_latency` (with output register),
+  `uram_latency` (nil without URAM), `uram_min_bits` (memories at least
+  this large go to URAM in `memory_style/3`), `lut_rom_max` (tables up to
+  this many entries become LUT ROM), `fmax_mhz` (`%{dsp: mhz, bram: mhz,
+  uram: mhz}` for the grade), `resources` (`%{lut:, ff:, bram:, uram:,
+  dsp:, gt:}` of a device, or nil).
   """
 
   alias NxFixed.IntSet
 
-  defstruct clock_mhz: 150,
-            # fraction of the period available to logic (routing, setup)
+  defstruct family: :zynq7,
+            speed_grade: "-1",
+            clock_mhz: 150,
             margin: 0.75,
-            # DSP48E1 with A/B, M and P registers
             dsp_latency: 3,
-            # RAMB36E1 with output register
+            dsp_multiplier: {25, 18},
+            dsp_preadder_bits: 25,
+            dsp_accumulator_bits: 48,
             bram_latency: 2,
-            # tables up to this many entries become LUT ROM
+            uram_latency: nil,
+            uram_min_bits: nil,
             lut_rom_max: 64,
             lut_ns: 0.6,
-            carry_ns_per_bit: 0.03
+            net_typ_ns: 0.0,
+            carry_ns_per_bit: 0.03,
+            ff_clk_to_q_ns: 0.0,
+            ff_setup_ns: 0.0,
+            fmax_mhz: %{dsp: 464, bram: 388},
+            resources: nil
 
   @type t :: %__MODULE__{}
   @type cost :: {:comb, float()} | {:reg, pos_integer(), atom()}
@@ -34,11 +73,189 @@ defmodule ExHdl.Target.Timing do
   @adder ~w(add subtract negate equal not_equal less less_equal greater greater_equal)a
   @bitwise ~w(bitwise_and bitwise_or bitwise_xor)a
 
-  def new(opts \\ []),
-    do: struct!(__MODULE__, Keyword.take(opts, Map.keys(%__MODULE__{}) -- [:__struct__]))
+  @ultrascale_plus %{
+    common: [
+      margin: 0.85,
+      dsp_latency: 3,
+      dsp_multiplier: {27, 18},
+      dsp_preadder_bits: 27,
+      dsp_accumulator_bits: 48,
+      bram_latency: 2,
+      uram_latency: 2,
+      # four RAMB36 worth of bits
+      uram_min_bits: 147_456
+    ],
+    grades: %{
+      "-1" => [
+        lut_ns: 0.12,
+        carry_ns_per_bit: 0.012,
+        ff_clk_to_q_ns: 0.10,
+        ff_setup_ns: 0.03,
+        net_typ_ns: 0.35,
+        fmax_mhz: %{dsp: 645, bram: 650, uram: 600}
+      ],
+      "-2" => [
+        lut_ns: 0.10,
+        carry_ns_per_bit: 0.010,
+        ff_clk_to_q_ns: 0.09,
+        ff_setup_ns: 0.03,
+        net_typ_ns: 0.30,
+        fmax_mhz: %{dsp: 775, bram: 737, uram: 650}
+      ]
+    }
+  }
 
-  @doc "Combinational budget per clock cycle in ns."
-  def period_ns(%__MODULE__{clock_mhz: mhz, margin: m}), do: 1000 / mhz * m
+  @us_plus_aliases [
+    :ultrascale_plus,
+    :kintex_ultrascale_plus,
+    :virtex_ultrascale_plus,
+    :zynq_ultrascale_plus,
+    :artix_ultrascale_plus
+  ]
+
+  @doc """
+  The model for `family:` and `speed_grade:` with any field overridden
+  by `opts`. Raises for unknown families or grades.
+  """
+  @spec new(keyword()) :: t()
+  def new(opts \\ []) do
+    family = family!(Keyword.get(opts, :family, :zynq7))
+    grade = Keyword.get(opts, :speed_grade, "-1")
+    base = defaults(family, grade)
+    fields = Map.keys(%__MODULE__{}) -- [:__struct__, :family, :speed_grade]
+    over = Keyword.take(opts, fields)
+
+    struct!(
+      __MODULE__,
+      base |> Keyword.merge(over) |> Keyword.merge(family: family, speed_grade: grade)
+    )
+  end
+
+  defp family!(f) when f in @us_plus_aliases, do: :ultrascale_plus
+  defp family!(f) when f in [:zynq7, :zynq7000, :series7], do: :zynq7
+
+  defp family!(f),
+    do: raise(ArgumentError, "unknown family #{inspect(f)}; use :zynq7 or :ultrascale_plus")
+
+  defp defaults(:zynq7, "-1"), do: []
+
+  defp defaults(:ultrascale_plus, grade) do
+    case @ultrascale_plus.grades do
+      %{^grade => g} -> @ultrascale_plus.common ++ g
+      _ -> grade_error(:ultrascale_plus, grade, Map.keys(@ultrascale_plus.grades))
+    end
+  end
+
+  defp defaults(family, grade), do: grade_error(family, grade, ["-1"])
+
+  defp grade_error(family, grade, known),
+    do:
+      raise(
+        ArgumentError,
+        "no delays for #{family} speed grade #{inspect(grade)}; known: #{Enum.join(known, ", ")}"
+      )
+
+  @doc """
+  The model from device data shaped like `ExHdlXilinx.Device` (`family`,
+  `delays` per grade, `dsp`, `bram`, `uram`, `fmax_mhz`, `resources`) for
+  speed grade `grade`; `opts` override fields (`clock_mhz:`, ...).
+  """
+  @spec from_device(map(), String.t(), keyword()) :: t()
+  def from_device(%{family: fam, delays: delays} = d, grade, opts \\ []) do
+    g =
+      Map.get(delays, grade) ||
+        grade_error(fam, grade, Map.keys(delays))
+
+    dsp = Map.get(d, :dsp) || %{}
+    bram = Map.get(d, :bram) || %{}
+    uram = Map.get(d, :uram)
+
+    fmax =
+      for {k, key} <- [dsp: :dsp48e2_all_regs, bram: :bram_all_regs, uram: :uram],
+          by_grade = get_in(d, [Access.key(:fmax_mhz, %{}), Access.key(key, %{})]),
+          Map.has_key?(by_grade, grade),
+          into: %{},
+          do: {k, by_grade[grade]}
+
+    from_data =
+      [
+        family: fam,
+        speed_grade: grade,
+        lut_ns: g[:lut_ns],
+        carry_ns_per_bit: g[:carry_ns_per_bit],
+        ff_clk_to_q_ns: g[:ff_clk_to_q_ns],
+        ff_setup_ns: g[:ff_setup_ns],
+        net_typ_ns: g[:net_typ_ns],
+        dsp_multiplier: dsp[:multiplier],
+        dsp_preadder_bits: dsp[:preadder_bits],
+        dsp_accumulator_bits: dsp[:accumulator_bits],
+        dsp_latency: dsp[:latency_full],
+        bram_latency: bram[:latency_with_output_reg],
+        uram_latency: uram && uram[:latency_with_output_reg],
+        fmax_mhz: if(fmax == %{}, do: nil, else: fmax),
+        resources: device_resources(Map.get(d, :resources))
+      ]
+      |> Enum.reject(fn {_, v} -> v == nil end)
+
+    new(from_data ++ [speed_grade: grade] ++ opts)
+  end
+
+  defp device_resources(nil), do: nil
+
+  defp device_resources(r) do
+    %{
+      lut: r[:clb_luts],
+      ff: r[:clb_ffs],
+      bram: r[:bram36],
+      uram: r[:uram288] || 0,
+      dsp: r[:dsp],
+      gt: r[:gty] || r[:gth] || r[:gtx] || 0
+    }
+  end
+
+  @doc "Combinational budget per clock cycle in ns (flip-flop overhead subtracted)."
+  def period_ns(%__MODULE__{clock_mhz: mhz, margin: m} = t),
+    do: 1000 / mhz * m - t.ff_clk_to_q_ns - t.ff_setup_ns
+
+  @doc "Delay of one logic level (LUT plus typical routing)."
+  def level_ns(%__MODULE__{lut_ns: l, net_typ_ns: n}), do: l + n
+
+  @doc """
+  Warnings when `clock_mhz` exceeds the maximum frequency of a primitive
+  for the grade (`fmax_mhz`).
+  """
+  @spec warnings(t()) :: [String.t()]
+  def warnings(%__MODULE__{fmax_mhz: nil}), do: []
+
+  def warnings(%__MODULE__{} = t) do
+    for {kind, f} <- Enum.sort(t.fmax_mhz), t.clock_mhz > f do
+      "#{t.clock_mhz} MHz exceeds the #{kind} maximum of #{f} MHz for #{t.family} #{t.speed_grade}"
+    end
+  end
+
+  @doc """
+  Where a memory of `width` x `depth` bits belongs: `:distributed` up to
+  `lut_rom_max` words, `:ultra` when the family has URAM and the memory
+  has at least `uram_min_bits`, `:block` otherwise. The result is an
+  `ExHdl.RTL` memory `style:`.
+  """
+  @spec memory_style(t(), pos_integer(), pos_integer()) :: :distributed | :block | :ultra
+  def memory_style(%__MODULE__{} = t, width, depth) do
+    cond do
+      depth <= t.lut_rom_max ->
+        :distributed
+
+      t.uram_latency != nil and t.uram_min_bits != nil and width * depth >= t.uram_min_bits ->
+        :ultra
+
+      true ->
+        :block
+    end
+  end
+
+  @doc "True when a signed `a` x `b` bit product fits one DSP multiplier."
+  def dsp_fits?(%__MODULE__{dsp_multiplier: {ma, mb}}, a, b),
+    do: (a <= ma and b <= mb) or (a <= mb and b <= ma)
 
   @doc "Cost of `node` in `graph` (whose nodes carry ranges)."
   @spec cost(map(), NxFixed.Dataflow.t(), t()) :: cost()
@@ -50,36 +267,38 @@ defmodule ExHdl.Target.Timing do
   end
 
   def cost(%{op: op} = node, graph, t) when op in [:min, :max, :abs] do
-    {:comb, cost_ns(cost(%{node | op: :subtract}, graph, t)) + t.lut_ns}
+    {:comb, cost_ns(cost(%{node | op: :subtract}, graph, t)) + level_ns(t)}
   end
 
   # Both bounds compare in parallel, then two mux levels.
   def cost(%{op: :clip, inputs: [x | _]}, graph, t),
-    do: {:comb, adder(t, width(graph, x) + 1) + 2 * t.lut_ns}
+    do: {:comb, adder(t, width(graph, x) + 1) + 2 * level_ns(t)}
 
   def cost(%{op: op} = node, graph, t) when op in @bitwise do
-    if Enum.any?(node.inputs, &constant?(graph, &1)), do: {:comb, 0.0}, else: {:comb, t.lut_ns}
+    if Enum.any?(node.inputs, &constant?(graph, &1)),
+      do: {:comb, 0.0},
+      else: {:comb, level_ns(t)}
   end
 
   def cost(%{op: op, inputs: [_, k]}, graph, t) when op in [:right_shift, :left_shift] do
-    if constant?(graph, k), do: {:comb, 0.0}, else: {:comb, 3 * t.lut_ns}
+    if constant?(graph, k), do: {:comb, 0.0}, else: {:comb, 3 * level_ns(t)}
   end
 
-  def cost(%{op: :select}, _graph, t), do: {:comb, t.lut_ns}
+  def cost(%{op: :select}, _graph, t), do: {:comb, level_ns(t)}
 
   def cost(%{op: op}, _graph, t) when op in [:logical_and, :logical_or, :logical_not],
-    do: {:comb, t.lut_ns}
+    do: {:comb, level_ns(t)}
 
   def cost(%{op: :multiply, inputs: [a, b]}, graph, t) do
     cond do
       power_of_two?(graph, a) or power_of_two?(graph, b) ->
         {:comb, 0.0}
 
-      dsp_fits?(signed_width(graph, a), signed_width(graph, b)) ->
+      dsp_fits?(t, signed_width(graph, a), signed_width(graph, b)) ->
         {:reg, t.dsp_latency, :dsp48}
 
       true ->
-        # Cascade of two DSP48E1 slices.
+        # Cascade of two DSP slices.
         {:reg, t.dsp_latency + 2, :dsp48_cascade}
     end
   end
@@ -88,7 +307,7 @@ defmodule ExHdl.Target.Timing do
     size = graph.nodes[table].shape |> elem(0)
 
     if size <= t.lut_rom_max,
-      do: {:comb, t.lut_ns * (div(ceil_log2(size), 6) + 1)},
+      do: {:comb, level_ns(t) * (div(ceil_log2(size), 6) + 1)},
       else: {:reg, t.bram_latency, :bram}
   end
 
@@ -106,7 +325,7 @@ defmodule ExHdl.Target.Timing do
     end
   end
 
-  def cost(_node, _graph, t), do: {:comb, t.lut_ns}
+  def cost(_node, _graph, t), do: {:comb, level_ns(t)}
 
   @doc "Short human description of a cost."
   def describe({:comb, ns}) when ns == 0, do: "wiring"
@@ -115,10 +334,7 @@ defmodule ExHdl.Target.Timing do
 
   defp cost_ns({:comb, ns}), do: ns
 
-  defp adder(t, bits), do: t.lut_ns + t.carry_ns_per_bit * bits
-
-  # 25x18 signed multiplier.
-  defp dsp_fits?(a, b), do: (a <= 25 and b <= 18) or (a <= 18 and b <= 25)
+  defp adder(t, bits), do: level_ns(t) + t.carry_ns_per_bit * bits
 
   defp width(graph, id) do
     {_, bits} = IntSet.bit_width(graph.nodes[id].range)
