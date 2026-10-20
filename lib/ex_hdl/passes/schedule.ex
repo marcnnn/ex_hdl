@@ -19,9 +19,12 @@ defmodule ExHdl.Passes.Schedule do
   timing model's cost of single nodes (`%{id => cost}`), e.g. for a dot
   product the generator maps onto a DSP cascade.
 
+  `starts` delays single nodes: `%{id => cycle}` makes the node start in
+  that cycle at the earliest (a multiply waiting for a shared DSP).
+
   Returns `%{id => %{at: arrival, cost: cost, from: critical_input | nil}}`.
   """
-  def asap(graph, ids, %Timing{} = timing, seeds \\ %{}, costs \\ %{}) do
+  def asap(graph, ids, %Timing{} = timing, seeds \\ %{}, costs \\ %{}, starts \\ %{}) do
     period = Timing.period_ns(timing)
 
     Enum.reduce(ids, %{}, fn id, sched ->
@@ -31,6 +34,12 @@ defmodule ExHdl.Passes.Schedule do
         node.inputs
         |> Enum.map(fn input -> {arrival(sched, seeds, input), input} end)
         |> Enum.max_by(fn {at, _} -> at end, fn -> {Map.get(seeds, id, {0, 0.0}), nil} end)
+
+      start =
+        case starts do
+          %{^id => s} -> max(start, {s, 0.0})
+          _ -> start
+        end
 
       cost = Map.get_lazy(costs, id, fn -> Timing.cost(node, graph, timing) end)
       Map.put(sched, id, %{at: advance(start, cost, period), cost: cost, from: from})

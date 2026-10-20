@@ -67,6 +67,51 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   `pc_data`, `pc_we`); `pc_swap` and `pc_pending` stay in the `clk` domain.
   `param_mem:` picks the memory style (default `:block`).
 
+  ## Memories
+
+  Parameters named in `memories:` (`ExHdl.IR.Memory`) are RAMs instead of
+  ports: `Nx.take(table, index)` with an index from the sample or the
+  state reads them, one read port per index element (a gather of 16 values
+  is 16 reads), each from its own copy of the memory, `latency` cycles in
+  the schedule. Each memory has a write port
+
+    * `<name>_waddr`, `<name>_wdata`, `<name>_we` (and `<name>_wclk` with
+      `clock: :separate`): one word, the row's values packed from bit 0 at
+      the width of their proven range (`Design.memories` has the widths);
+    * with `banks: 2` (default) the write goes to the inactive bank;
+      `<name>_swap` makes it active from the next accepted sample (with
+      `channels: n` from the next frame start, as for channel parameters),
+      and `<name>_pending` stays high until no sample reading the old bank
+      is left before its read stage. Write only while it is low.
+
+  So a mixer reads a crosspoint table at the row of the sample and the
+  samples of a frame memory at the sources it holds, while the host
+  rewrites the table and the strip stage writes the next frame.
+
+  ## Frame sideband
+
+  With `frame: true` the sample is `{data..., {first, last}}`: `last` is
+  `s_axis_tlast`, `first` is high for the first beat after reset and after
+  every beat with `tlast`. A kernel that reduces over a frame (the rows of
+  one output) uses them instead of counting, so frames have a runtime
+  length. `m_axis_tlast` carries `tlast` to the last item of each sample.
+
+  ## DSP products
+
+  Products that fit the family's multiplier (`ExHdl.Target.Timing`, 25 x 18
+  for DSP48E1, 27 x 18 for DSP48E2) are one slice with input, product and
+  output registers. Wider ones are cut into pieces of one slice each
+  (`Timing.dsp_split/3`), and a registered adder tree sums the shifted
+  partial products: a 32 x 24 product is two slices, 32 x 32 four.
+  `Design.dsp` counts the slices.
+
+  With `ii: n` (one channel) multiplies of the same size share a DSP unit
+  when no two samples can be at their stages at once: the stages of a unit
+  are distinct and within `n` of each other, and the unit's inputs are
+  multiplexed by the stage's valid bit. A multiply outside every feedback
+  loop is delayed by up to `n - 1` stages to join a unit (`share: false`
+  turns this off). The biquad at `ii: 8` needs 10 slices instead of 14.
+
   No ready path is combinational: `s_axis_tready` depends only on
   registers, `m_axis_tready` only on the two-entry output buffer.
 
@@ -77,9 +122,10 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   concatenations, reshapes) are wiring. The schedule
   (`ExHdl.Passes.Schedule`, `ExHdl.Target.Timing`) decides the pipeline
   stage of every node; values crossing stages go through pipeline
-  registers. Multiplies use the DSP48E1 register pattern (input, product
+  registers. Multiplies use the DSP register pattern (input, product
   and output registers), large tables become block RAM with a registered
-  read, small ones LUT ROM. Dot products of constant taps with a delay
+  read, small ones LUT ROM. Signed wraps are wiring and the leading-one
+  idiom a priority encoder (`ExHdl.Passes.Idioms`). Dot products of constant taps with a delay
   line become transposed DSP chains (`ExHdl.Backends.SystemVerilog.Fir`).
   All pipeline registers share one clock enable `ce`: the pipeline
   advances while the two-entry output buffer has room.
@@ -132,6 +178,14 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       * `params` - the parameter ports: `%{port:, index:, type:, shape:, bits:}`.
       * `in_width`, `out_width` - tdata widths.
       * `lanes` - `nil`, or the most items one sample can give (variable rate).
+      * `frame` - true when the module has `s_axis_tlast`/`m_axis_tlast`
+        (frame sideband, `frame: true`).
+      * `memories` - the memory parameters with their write ports:
+        `%{name:, depth:, row:, bits:, signed:, banks:, style:, latency:,
+        clock:, read_ports:, addr_bits:, data_bits:}`.
+      * `dsp` - DSP slices the module needs by the timing model's multiplier
+        size (split products count all pieces, a shared unit once), and
+        `shared` the number of units shared by several multiplies.
     """
     defstruct [
       :name,
@@ -154,7 +208,11 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       pc_width: 0,
       pc_clock: :shared,
       tid: false,
-      tuser: 0
+      tuser: 0,
+      frame: false,
+      memories: [],
+      dsp: 0,
+      shared: 0
     ]
   end
 
@@ -196,6 +254,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     * `:tid`, `:tuser` - channel input and sideband width.
     * `:channel_params`, `:param_mem`, `:param_ram_latency`, `:pc_clock` -
       per-channel parameters (see "Per-channel parameters").
+    * `:share` - `:auto` (default) or `false`: DSP sharing under `ii: n`.
 
   Returns a `%Design{}`; raises `UnsupportedError`.
   """
@@ -208,7 +267,8 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
     layout = layout(scan, opts)
     check_options!(scan, layout)
-    {stages, sched} = schedule(scan, timing, layout)
+    check_memories!(scan)
+    {stages, sched} = schedule(scan, timing, layout, scan.costs)
     c = context(scan, timing, layout, stages, sched, %{})
 
     # FIR dot products become DSP chains with their own latency: plan them
@@ -218,15 +278,29 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
         do: Fir.plan(Enum.reduce(graph.order, %{c | planning: true}, &lower/2), scan),
         else: %{}
 
+    costs = Map.merge(scan.costs, Fir.costs(fir))
+
     c =
       if fir == %{} do
         c
       else
-        {stages, sched} = schedule(scan, timing, layout, Fir.costs(fir))
+        {stages, sched} = schedule(scan, timing, layout, costs)
         context(scan, timing, layout, stages, sched, fir)
       end
 
+    # multiplies sharing DSP slices under ii: n
+    c =
+      case share_plan(scan, timing, layout, costs, c) do
+        nil ->
+          c
+
+        {starts, plan} ->
+          {stages, sched} = schedule(scan, timing, layout, costs, starts)
+          %{context(scan, timing, layout, stages, sched, fir) | share: plan}
+      end
+
     c = Enum.reduce(graph.order, c, &lower/2)
+    c = emit_units(c)
     {c, groups} = state_writes(c, scan)
 
     for g <- groups do
@@ -244,7 +318,13 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     write_stage = groups |> Enum.map(& &1.write_stage) |> Enum.max(fn -> 0 end)
 
     {c, latency, out_expr} = outputs(c, scan)
-    depth = Enum.max([latency, write_stage | Map.values(c.pc_stages)])
+
+    depth =
+      Enum.max(
+        [latency, write_stage | Map.values(c.pc_stages)] ++
+          Enum.map(c.mem_reads, & &1.stage) ++
+          Enum.flat_map(Map.values(c.units), fn ms -> Enum.map(ms, & &1.stage) end)
+      )
 
     source =
       emit(c, %{
@@ -276,6 +356,10 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       pc_clock: layout.pc_clock,
       tid: layout.tid,
       tuser: layout.tuser,
+      frame: layout.frame != nil,
+      memories: memory_ports(c),
+      dsp: c.dsp,
+      shared: c.share |> Map.values() |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> length(),
       in_width: layout.in_width,
       out_width: layout.out_width
     }
@@ -313,7 +397,13 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       elems: %{},
       roms: %{},
       fir: fir,
-      planning: false
+      planning: false,
+      # DSP slices, `{id, e} => unit` of shared multiplies, units' members
+      dsp: 0,
+      share: %{},
+      units: %{},
+      # memory reads: `%{mem:, copy:, stage:, addr:, q:}`
+      mem_reads: []
     }
 
     # per-channel parameters are read from their memory where first used
@@ -360,7 +450,9 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
                :concatenate,
                :take,
                :dot,
-               :sum
+               :sum,
+               :wrap,
+               :msb
              ] ++ @elementwise
 
   defp check_supported!(graph) do
@@ -399,8 +491,13 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     state = by_role |> Map.get(:state, []) |> Enum.flat_map(& &1.leaves)
     param_args = Map.get(by_role, :param, [])
     names = Keyword.get(opts, :param_names, [])
+    mem_indices = MapSet.new(scan.memories, & &1.index)
 
-    {inputs, in_bits} = fields(sample)
+    frame_indices =
+      if scan.frame, do: MapSet.new([scan.frame.first, scan.frame.last]), else: MapSet.new()
+
+    {inputs, in_bits} =
+      sample |> Enum.reject(&MapSet.member?(frame_indices, &1.index)) |> fields()
 
     lanes = Keyword.get(opts, :lanes)
     {value_ids, count_id} = output_ids(scan, lanes)
@@ -431,6 +528,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
             leaves |> Enum.with_index() |> Enum.map(fn {l, i} -> {"#{base}_#{i}", l, chan?} end)
         end
       end)
+      |> Enum.reject(fn {_n, leaf, _chan?} -> MapSet.member?(mem_indices, leaf.index) end)
       |> Enum.map(fn {n, leaf, chan?} ->
         {chan?, Map.merge(leaf, %{port: "p_#{n}", name: n, bits: type_bits(leaf.type)})}
       end)
@@ -483,6 +581,10 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       pc_clock: Keyword.get(opts, :pc_clock, :shared),
       tid: Keyword.get(opts, :tid, false),
       tuser: Keyword.get(opts, :tuser, 0),
+      frame: scan.frame,
+      memories: scan.memories,
+      mem_by_index: Map.new(scan.memories, &{&1.index, &1}),
+      share: Keyword.get(opts, :share, :auto),
       state_init: Keyword.get(opts, :state_init, :clear),
       params_by_index: params_by_index,
       inputs_by_index: inputs_by_index,
@@ -589,7 +691,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   # (in dependency order) is read in the stage where every non-static value
   # entering its loop is available, at least `ram_latency` (the state
   # memory's read is issued that much earlier).
-  defp schedule(scan, timing, layout, costs \\ %{}) do
+  defp schedule(scan, timing, layout, costs, starts \\ %{}) do
     graph = scan.graph
     static = static_nodes(graph, layout)
 
@@ -601,7 +703,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
     {seeds, stages} =
       Enum.reduce(scan.groups, {pc_seeds, []}, fn g, {seeds, stages} ->
-        sched = Schedule.asap(graph, graph.order, timing, seeds, costs)
+        sched = Schedule.asap(graph, graph.order, timing, seeds, costs, starts)
 
         entering =
           for(
@@ -625,7 +727,162 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     by_index = Map.new(scan.state_params, &{graph.nodes[&1].attrs, elem(seeds[&1], 0)})
 
     {%{by_index: by_index, groups: Enum.reverse(stages)},
-     Schedule.asap(graph, graph.order, timing, seeds, costs)}
+     Schedule.asap(graph, graph.order, timing, seeds, costs, starts)}
+  end
+
+  # -- DSP sharing under ii: n -----------------------------------------------------------
+
+  # With one sample every ii cycles a DSP unit can serve multiplies of
+  # different stages, as long as no two samples can be at two of them at
+  # once: samples are at least ii enabled cycles apart, so the stages of a
+  # unit must be distinct and within a window of ii. A unit's inputs are
+  # multiplexed by the valid bit of each member's stage. Multiplies are
+  # placed greedily in graph order; one outside every feedback loop may be
+  # delayed by up to ii - 1 stages to join a unit (latency, not loop time).
+  # Multiplies of different sizes (DSP pieces) do not share. Returns nil
+  # or `{starts, %{signal => {unit, swap?}}}`.
+  defp share_plan(scan, timing, layout, costs, c) do
+    if layout.share == false or scan.channels != 1 or scan.ii < 2 do
+      nil
+    else
+      graph = scan.graph
+      static = static_nodes(graph, layout)
+
+      cands =
+        for id <- graph.order,
+            node = graph.nodes[id],
+            node.op == :multiply,
+            not singleton?(node.range),
+            match?({:reg, _, _}, c.sched[id].cost),
+            not Enum.all?(node.inputs, &MapSet.member?(static, &1)),
+            do: id
+
+      {starts, units, plan} =
+        Enum.reduce(cands, {%{}, [], %{}}, fn id, {starts, units, plan} ->
+          node = graph.nodes[id]
+          {_, sched} = schedule(scan, timing, layout, costs, starts)
+          e0 = sched_exec(sched, id)
+          [wa, wb] = Enum.map(node.inputs, &Timing.signed_width(graph, &1))
+          swap = wb > wa
+          {wa, wb} = if swap, do: {wb, wa}, else: {wa, wb}
+          count = Timing.dsp_split(timing, wa, wb).count
+          n = size(node.shape)
+          last = if MapSet.member?(scan.recurrence, id), do: e0, else: e0 + scan.ii - 1
+          fits = fn s -> fitting_units(units, s, timing, count, wa, wb, scan.ii) end
+
+          {s, chosen} =
+            Enum.find_value(e0..last, fn s ->
+              fit = fits.(s)
+              if length(fit) >= n, do: {s, Enum.take(fit, n)}
+            end) || {e0, Enum.take(fits.(e0), n)}
+
+          fresh = Enum.to_list(length(units)..(length(units) + n - length(chosen) - 1)//1)
+          new = for _ <- fresh, do: %{stages: [], wa: wa, wb: wb, count: count, members: []}
+          units = units ++ new
+
+          units =
+            Enum.reduce(chosen ++ fresh, units, fn u, units ->
+              List.update_at(units, u, fn unit ->
+                %{
+                  unit
+                  | stages: [s | unit.stages],
+                    wa: max(unit.wa, wa),
+                    wb: max(unit.wb, wb),
+                    members: [id | unit.members]
+                }
+              end)
+            end)
+
+          plan =
+            (chosen ++ fresh)
+            |> Enum.with_index()
+            |> Enum.reduce(plan, fn {u, e}, plan ->
+              Map.put(plan, elem_name(node, e), {u, swap})
+            end)
+
+          starts = if s > e0, do: Map.put(starts, id, s), else: starts
+          {starts, units, plan}
+        end)
+
+      shared =
+        for {u, i} <- Enum.with_index(units), length(u.members) >= 2, into: MapSet.new(), do: i
+
+      plan = for {name, {u, _} = v} <- plan, MapSet.member?(shared, u), into: %{}, do: {name, v}
+      {_, sched} = schedule(scan, timing, layout, costs, starts)
+
+      ok? =
+        Enum.all?(shared, fn u ->
+          stages = units |> Enum.at(u) |> Map.fetch!(:members) |> Enum.map(&sched_exec(sched, &1))
+
+          length(Enum.uniq(stages)) == length(stages) and
+            Enum.max(stages) - Enum.min(stages) < scan.ii
+        end)
+
+      if plan != %{} and ok?, do: {starts, plan}
+    end
+  end
+
+  defp fitting_units(units, s, timing, count, wa, wb, ii) do
+    for {u, i} <- Enum.with_index(units),
+        u.count == count,
+        s not in u.stages,
+        Enum.max([s | u.stages]) - Enum.min([s | u.stages]) < ii,
+        Timing.dsp_split(timing, max(u.wa, wa), max(u.wb, wb)).count == count,
+        do: i
+  end
+
+  defp sched_exec(sched, id) do
+    case sched[id] do
+      %{at: {cycle, _}, cost: {:reg, k, _}} -> cycle - k
+      %{at: {cycle, _}} -> cycle
+    end
+  end
+
+  # A member of a shared unit: its operands go to the unit's input
+  # multiplexer (`emit_units/1`), its result is the unit's output in its
+  # own stage + k.
+  defp shared_product(c, name, {u, swap}, [a, b], stage, k, fmt) do
+    {a, b} = if swap, do: {b, a}, else: {a, b}
+    {c, xa, wa} = operand(c, a, stage)
+    {c, xb, wb} = operand(c, b, stage)
+    member = %{stage: stage, a: xa, wa: wa, b: xb, wb: wb, k: k}
+    c = %{c | units: Map.update(c.units, u, [member], &[member | &1])}
+    c = c |> new_sig(name, fmt, stage + k, true) |> assign(name, "#{bits(fmt)}'(u#{u}_r)")
+    {c, {:sig, name}}
+  end
+
+  defp emit_units(c) do
+    c.units
+    |> Enum.sort()
+    |> Enum.reduce(c, fn {u, members}, c ->
+      members = Enum.sort_by(members, & &1.stage)
+      wa = members |> Enum.map(& &1.wa) |> Enum.max()
+      wb = members |> Enum.map(& &1.wb) |> Enum.max()
+      k = hd(members).k
+
+      mux = fn key, w ->
+        {init, rest} = List.pop_at(members, -1)
+
+        rest
+        |> Enum.reverse()
+        |> Enum.reduce("#{w}'(#{Map.fetch!(init, key)})", fn m, acc ->
+          "#{valid(m.stage)} ? #{w}'(#{Map.fetch!(m, key)}) : #{acc}"
+        end)
+      end
+
+      ain = "u#{u}_ain"
+      bin = "u#{u}_bin"
+
+      c =
+        c
+        |> new_sig(ain, {:s, wa}, 0, false)
+        |> assign(ain, mux.(:a, wa))
+        |> new_sig(bin, {:s, wb}, 0, false)
+        |> assign(bin, mux.(:b, wb))
+
+      {c, _} = dsp_product(c, "u#{u}_r", [{:sig, ain}, {:sig, bin}], 0, k, {:s, wa + wb})
+      c
+    end)
   end
 
   defp available({c, t}) when t == 0, do: c
@@ -683,6 +940,16 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     fmt = IntSet.bit_width(node.range)
 
     cond do
+      Map.has_key?(l.mem_by_index, index) ->
+        # a memory: only its takes read it (`memory_read`)
+        {c, []}
+
+      l.frame && index in [l.frame.first, l.frame.last] ->
+        name = elem_name(node, 0)
+        src = if index == l.frame.first, do: "fr_first", else: "s_axis_tlast"
+        c = c |> new_sig(name, fmt, 0, false) |> assign(name, "#{bits(fmt)}'(#{src})")
+        {c, [{:sig, name}]}
+
       field = l.inputs_by_index[index] ->
         map_c(0..(size(node.shape) - 1), c, fn e, c ->
           name = elem_name(node, e)
@@ -822,11 +1089,62 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     end)
   end
 
+  defp lower_op(:wrap, node, c) do
+    [x] = node.inputs
+    stage = exec_stage(c, node.id)
+    fmt = IntSet.bit_width(node.range)
+    w = bits(fmt)
+
+    c.elems[x]
+    |> Tuple.to_list()
+    |> Enum.with_index()
+    |> map_c(c, fn
+      {{:lit, v}, _e}, c ->
+        half = 1 <<< (node.attrs - 1)
+        {c, {:lit, band(v + half, (1 <<< node.attrs) - 1) - half}}
+
+      {ref, e}, c ->
+        name = elem_name(node, e)
+        {c, x} = raw(c, ref, stage)
+        s = if static?(c, ref), do: :static, else: stage
+        # the low bits of x, sign-extended from bit attrs - 1
+        c =
+          c
+          |> new_sig(name, fmt, s, false)
+          |> assign(name, "#{w}'($signed(#{node.attrs}'(#{x})))")
+
+        {c, {:sig, name}}
+    end)
+  end
+
+  defp lower_op(:msb, node, c) do
+    [x] = node.inputs
+    {j0, j1} = node.attrs
+    stage = exec_stage(c, node.id)
+    fmt = IntSet.bit_width(node.range)
+    ref = elem(c.elems[x], 0)
+
+    case ref do
+      {:lit, v} ->
+        {c, [{:lit, Enum.count(j0..j1, &(v >= 1 <<< &1))}]}
+
+      _ ->
+        name = elem_name(node, 0)
+        s = if static?(c, ref), do: :static, else: stage
+        {c, expr} = priority_encoder(c, name, ref, ref_range(c, ref), j0, j1, stage)
+        c = c |> new_sig(name, fmt, s, false) |> assign(name, "#{bits(fmt)}'(#{expr})")
+        {c, [{:sig, name}]}
+    end
+  end
+
   defp lower_op(:take, node, c) do
     [table_id, _idx_id] = node.inputs
     table = Dataflow.constant_tensor(c.graph, table_id)
 
     cond do
+      mem = c.layout.mem_by_index[param_index(c.graph, table_id)] ->
+        memory_read(node, c, mem)
+
       table && tuple_size(table.shape) == 1 ->
         rom_take(node, c, table)
 
@@ -969,6 +1287,204 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     end)
   end
 
+  # A take from a memory parameter: one read port (and memory copy) per
+  # index element, the address registered into the RAM in the take's stage,
+  # the word `latency` stages later. Every value of the row is a slice.
+  defp memory_read(node, c, mem) do
+    [_table_id, idx_id] = node.inputs
+    stage = exec_stage(c, node.id)
+    fmt = IntSet.bit_width(node.range)
+    aw = max(1, ceil_log2(mem.depth))
+    {_, mb} = mem.fmt
+    word = mem.row * mb
+
+    {c, parts} =
+      c.elems[idx_id]
+      |> Tuple.to_list()
+      |> Enum.with_index()
+      |> map_c(c, fn {ref, j}, c ->
+        copy = Enum.count(c.mem_reads, &(&1.mem == mem.name))
+        q = "n#{node.id}_q#{j}"
+        {c, a} = raw(c, ref, stage)
+        read = %{mem: mem.name, copy: copy, stage: stage, addr: "#{aw}'(#{a})", q: q}
+        c = %{c | mem_reads: c.mem_reads ++ [read]}
+        c = new_sig(c, q, {:u, word}, stage + 1, true)
+        {c, qd} = at(c, q, stage + mem.latency)
+
+        map_c(0..(mem.row - 1), c, fn r, c ->
+          name = elem_name(node, j * mem.row + r)
+          slice = "#{qd}[#{r * mb} +: #{mb}]"
+          slice = if elem(mem.fmt, 0) == :s, do: "$signed(#{slice})", else: slice
+
+          c =
+            c
+            |> new_sig(name, fmt, stage + mem.latency, true)
+            |> assign(name, "#{bits(fmt)}'(#{slice})")
+
+          {c, {:sig, name}}
+        end)
+      end)
+
+    {c, List.flatten(parts)}
+  end
+
+  defp check_memories!(scan) do
+    for mem <- scan.memories, id <- mem.takes do
+      [_, idx] = scan.graph.nodes[id].inputs
+      {lo, hi} = IntSet.bounds(scan.graph.nodes[idx].range)
+
+      if lo < 0 or hi > mem.depth - 1,
+        do:
+          raise(
+            UnsupportedError,
+            "scan: the index of #{mem.name} (node #{idx}) is proven in #{lo}..#{hi}, " <>
+              "outside the memory's 0..#{mem.depth - 1}; clamp it or declare its range"
+          )
+    end
+  end
+
+  # The memories of the design for `Design.memories`.
+  defp memory_ports(c) do
+    Enum.map(c.layout.memories, fn m ->
+      {kind, mb} = m.fmt
+
+      %{
+        name: m.name,
+        depth: m.depth,
+        row: m.row,
+        bits: mb,
+        signed: kind == :s,
+        banks: m.banks,
+        style: m.style,
+        latency: m.latency,
+        clock: m.clock,
+        read_ports: Enum.count(c.mem_reads, &(&1.mem == m.name)),
+        addr_bits: max(1, ceil_log2(m.depth)),
+        data_bits: m.row * mb
+      }
+    end)
+  end
+
+  defp memory_port_decls(c) do
+    Enum.map(memory_ports(c), fn m ->
+      [
+        if(m.clock == :separate, do: "  input  logic #{m.name}_wclk,\n", else: []),
+        "  input  logic [#{m.addr_bits - 1}:0] #{m.name}_waddr,\n",
+        "  input  logic [#{m.data_bits - 1}:0] #{m.name}_wdata,\n",
+        "  input  logic #{m.name}_we,\n",
+        if(m.banks == 2,
+          do: "  input  logic #{m.name}_swap,\n  output logic #{m.name}_pending,\n",
+          else: []
+        )
+      ]
+    end)
+  end
+
+  # Memories: one copy per read port, all written by the write port. With
+  # two banks the host writes the inactive one; `<name>_swap` makes it
+  # active for the next sample (with channels: n at the next frame start),
+  # and `<name>_pending` stays high until no sample reading the old bank
+  # is left before its read stage.
+  defp memory_logic(c) do
+    l = c.layout
+    n = c.channels
+    cw = max(1, bit_len(n - 1))
+
+    Enum.map(memory_ports(c), fn m ->
+      reads = Enum.filter(c.mem_reads, &(&1.mem == m.name))
+      last_read = reads |> Enum.map(& &1.stage) |> Enum.max(fn -> 0 end)
+      marks = max(1, last_read)
+      wclk = if m.clock == :separate, do: "#{m.name}_wclk", else: "clk"
+      x = m.name
+      depth = if m.banks == 2, do: 2 * pow2(m.depth), else: m.depth
+      waddr = if m.banks == 2, do: "{~#{x}_active, #{x}_waddr}", else: "#{x}_waddr"
+      style = ram_style(m.style)
+
+      frame_start =
+        cond do
+          n == 1 -> "1'b1"
+          l.tid -> "#{x}_fresh || (vld_0 && s_axis_tid <= #{x}_last)"
+          true -> "#{ch(0)} == #{cw}'d0"
+        end
+
+      banks =
+        if m.banks == 2 do
+          [
+            "  logic #{x}_active, #{x}_req, #{x}_flip;\n",
+            Enum.map(0..last_read, &"  logic #{x}_bank_#{&1};\n"),
+            "  logic [#{marks}:1] #{x}_mark;\n",
+            if(l.tid and n > 1,
+              do: "  logic #{x}_fresh;\n  logic [#{cw - 1}:0] #{x}_last;\n",
+              else: []
+            ),
+            "  assign #{x}_flip = ce && #{x}_req && (#{frame_start});\n",
+            "  assign #{x}_bank_0 = #{x}_active ^ #{x}_flip;\n",
+            "  assign #{x}_pending = #{x}_req || (#{x}_mark != '0);\n",
+            "  always_ff @(posedge clk) begin\n",
+            "    if (!rst_n) begin\n",
+            "      #{x}_active <= 1'b0;\n",
+            "      #{x}_req <= 1'b0;\n",
+            "      #{x}_mark <= '0;\n",
+            if(l.tid and n > 1,
+              do: "      #{x}_fresh <= 1'b1;\n      #{x}_last <= '0;\n",
+              else: []
+            ),
+            "    end else begin\n",
+            "      if (#{x}_flip) #{x}_active <= ~#{x}_active;\n",
+            "      if (#{x}_flip) #{x}_req <= 1'b0;\n",
+            "      else if (#{x}_swap) #{x}_req <= 1'b1;\n",
+            "      if (ce) #{x}_mark <= #{if marks == 1, do: "#{x}_flip", else: "{#{x}_mark[#{marks - 1}:1], #{x}_flip}"};\n",
+            if(l.tid and n > 1,
+              do: [
+                "      if (ce && vld_0) begin\n",
+                "        #{x}_fresh <= 1'b0;\n",
+                "        #{x}_last <= s_axis_tid;\n",
+                "      end\n"
+              ],
+              else: []
+            ),
+            "    end\n",
+            "  end\n",
+            if(last_read > 0,
+              do: [
+                "  always_ff @(posedge clk) begin\n",
+                "    if (ce) begin\n",
+                Enum.map(1..last_read//1, &"      #{x}_bank_#{&1} <= #{x}_bank_#{&1 - 1};\n"),
+                "    end\n",
+                "  end\n"
+              ],
+              else: []
+            )
+          ]
+        else
+          []
+        end
+
+      copies =
+        Enum.map(reads, fn r ->
+          mem = "#{x}_c#{r.copy}"
+          addr = if m.banks == 2, do: "{#{x}_bank_#{r.stage}, #{r.addr}}", else: r.addr
+
+          [
+            "  (* ram_style = \"#{style}\" *) logic [#{m.data_bits - 1}:0] #{mem} [#{depth}];\n",
+            "  always_ff @(posedge #{wclk}) begin\n",
+            "    if (#{x}_we) #{mem}[#{waddr}] <= #{x}_wdata;\n",
+            "  end\n",
+            "  always_ff @(posedge clk) begin\n",
+            "    if (ce) #{r.q} <= #{mem}[#{addr}];\n",
+            "  end\n"
+          ]
+        end)
+
+      [
+        "  // memory #{x}: #{m.depth} x #{m.row} values of #{m.bits} bits, #{m.banks} bank#{if m.banks > 1, do: "s"}, ",
+        "#{length(reads)} read port#{if length(reads) != 1, do: "s"} (one copy each), read latency #{m.latency}\n",
+        banks,
+        copies
+      ]
+    end)
+  end
+
   # A data-dependent take from computed values: a multiplexer.
   defp mux_take(node, c) do
     [table_id, idx_id] = node.inputs
@@ -1011,6 +1527,63 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
         delayed_result(c, name, "#{name}_m", fmt, stage, c.sched[node.id].cost)
     end)
+  end
+
+  # Number of j in j0..j1 with x >= 2^j: for x >= 0 the position of the
+  # leading one of x[j1:j0] (bits above j1 folded into bit j1) plus one, 0
+  # for negative x. A tree over halves: valid = |half, index = which half.
+  defp priority_encoder(c, name, ref, range, j0, j1, stage) do
+    {c, x} = raw(c, ref, stage)
+    {:sig, sname} = ref
+    sig = c.sigs[sname]
+    w = if sig.signed, do: sig.bits - 1, else: sig.bits
+    k = j1 - j0 + 1
+    {lo, _} = IntSet.bounds(range)
+
+    bit = fn j -> if j < w, do: "#{x}[#{j}]", else: "1'b0" end
+
+    top =
+      if j1 < w - 1,
+        do: "(|#{x}[#{w - 1}:#{j1}])",
+        else: bit.(j1)
+
+    z = for(i <- 0..(k - 2)//1, do: bit.(j0 + i)) ++ [top]
+    leaves = pow2(max(2, k))
+    z = z ++ List.duplicate("1'b0", leaves - k)
+
+    {c, {v, i}} = pe_tree(c, "#{name}_pe", Enum.map(z, &{&1, nil}), 0)
+    rw = bit_len(k)
+    neg = if sig.signed and lo < 0, do: "#{x}[#{sig.bits - 1}] ? #{rw}'d0 : ", else: ""
+    {c, "(#{neg}(#{v} ? #{rw}'(#{i}) + #{rw}'d1 : #{rw}'d0))"}
+  end
+
+  defp pe_tree(c, _name, [single], _level), do: {c, single}
+
+  defp pe_tree(c, name, nodes, level) do
+    {c, next} =
+      nodes
+      |> Enum.chunk_every(2)
+      |> Enum.with_index()
+      |> map_c(c, fn {[{vl, il}, {vh, ih}], j}, c ->
+        v = "#{name}_v#{level}_#{j}"
+        i = "#{name}_i#{level}_#{j}"
+
+        idx =
+          if level == 0,
+            do: vh,
+            else: "#{vh} ? {1'b1, #{ih}} : {1'b0, #{il}}"
+
+        c =
+          c
+          |> raw_decl("  logic #{v};\n")
+          |> raw_decl("  logic [#{level}:0] #{i};\n")
+          |> assign(v, "#{vh} | #{vl}")
+          |> assign(i, idx)
+
+        {c, {v, i}}
+      end)
+
+    pe_tree(c, name, next, level + 1)
   end
 
   defp delayed_result(c, name, sig, fmt, stage, cost) do
@@ -1571,17 +2144,112 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     {c, "#{bits(fmt)}'(#{Enum.join(xs, " + ")})"}
   end
 
-  # A DSP48E1 multiply of k cycles: input registers (k >= 2), the product,
-  # then output registers.
+  # A DSP multiply of k cycles: input registers (k >= 2), the product, then
+  # output registers. Products wider than one DSP multiplier are cut into
+  # pieces (`Timing.dsp_split/3`), one slice each, whose shifted partial
+  # products a registered adder tree sums in the last `levels` cycles.
+  # Members of a shared unit (`share_plan/5`) take the unit's result.
   defp product(c, name, [a, b], stage, k, fmt) do
-    {c, {pa, wa}} = mul_input(c, "#{name}_a", a, stage, k)
-    {c, {pb, wb}} = mul_input(c, "#{name}_b", b, stage, k)
-    mul_stage = if k >= 2, do: stage + 1, else: stage
-    p = "#{name}_p"
-    c = c |> new_sig(p, {:s, wa + wb}, mul_stage, false) |> assign(p, "#{pa} * #{pb}")
-    {c, pd} = at(c, p, stage + k)
-    c = c |> new_sig(name, fmt, stage + k, true) |> assign(name, "#{bits(fmt)}'(#{pd})")
-    {c, {:sig, name}}
+    case c.share do
+      %{^name => u} -> shared_product(c, name, u, [a, b], stage, k, fmt)
+      _ -> dsp_product(c, name, [a, b], stage, k, fmt)
+    end
+  end
+
+  defp dsp_product(c, name, [a, b], stage, k, fmt) do
+    wa = operand_width(c, a)
+    wb = operand_width(c, b)
+    split = Timing.dsp_split(c.timing, wa, wb)
+    c = %{c | dsp: c.dsp + split.count}
+
+    if split.count == 1 do
+      {c, {pa, wa}} = mul_input(c, "#{name}_a", a, stage, k)
+      {c, {pb, wb}} = mul_input(c, "#{name}_b", b, stage, k)
+      mul_stage = if k >= 2, do: stage + 1, else: stage
+      p = "#{name}_p"
+      c = c |> new_sig(p, {:s, wa + wb}, mul_stage, false) |> assign(p, "#{pa} * #{pb}")
+      {c, pd} = at(c, p, stage + k)
+      c = c |> new_sig(name, fmt, stage + k, true) |> assign(name, "#{bits(fmt)}'(#{pd})")
+      {c, {:sig, name}}
+    else
+      if k < split.levels + 1,
+        do:
+          raise(
+            UnsupportedError,
+            "scan: a #{wa} x #{wb} bit product needs #{split.levels + 1} cycles, the schedule gives #{k}"
+          )
+
+      dl = k - split.levels
+      {c, ea} = split_input(c, "#{name}_a", a, stage, dl, split.a)
+      {c, eb} = split_input(c, "#{name}_b", b, stage, dl, split.b)
+      mul_stage = if dl >= 2, do: stage + 1, else: stage
+
+      {c, terms} =
+        for({xa, sa, ra} <- ea, {xb, sb, rb} <- eb, do: {xa, sa, ra, xb, sb, rb})
+        |> Enum.with_index()
+        |> map_c(c, fn {{xa, sa, ra, xb, sb, rb}, i}, c ->
+          range = IntSet.multiply(ra, rb)
+          pw = signed_bits(IntSet.bit_width(range))
+          pp = "#{name}_pp#{i}"
+          # the assignment context extends both signed operands to pw bits
+          c = c |> new_sig(pp, {:s, pw}, mul_stage, false) |> assign(pp, "#{xa} * #{xb}")
+          {c, ppd} = at(c, pp, stage + dl)
+          shifted = IntSet.multiply(range, IntSet.singleton(1 <<< (sa + sb)))
+          sw = signed_bits(IntSet.bit_width(shifted))
+          sh = "#{name}_sh#{i}"
+
+          c =
+            c
+            |> new_sig(sh, {:s, sw}, stage + dl, false)
+            |> assign(sh, "#{sw}'(#{sw}'(#{ppd}) <<< #{sa + sb})")
+
+          {c, {{:sig, sh}, shifted}}
+        end)
+
+      adder_tree(c, name, terms, stage + dl, split.levels, fmt)
+    end
+  end
+
+  defp operand_width(_c, {:lit, v}), do: lit_bits(v)
+
+  defp operand_width(c, {:sig, name}) do
+    s = c.sigs[name]
+    if s.signed, do: s.bits, else: s.bits + 1
+  end
+
+  # The pieces of one operand: `[{expr, shift, range}]`, from a named
+  # (registered for k >= 2) copy of the operand.
+  defp split_input(c, _reg, {:lit, v}, _stage, _k, pieces) do
+    {c,
+     Enum.map(pieces, fn {lsb, n, signed?} ->
+       x = if signed?, do: v >>> lsb, else: band(v >>> lsb, (1 <<< n) - 1)
+       {lit(x, lit_bits(x)), lsb, IntSet.singleton(x)}
+     end)}
+  end
+
+  defp split_input(c, reg, ref, stage, k, pieces) do
+    {c, x, sw} = operand(c, ref, stage)
+
+    {c, x} =
+      cond do
+        k >= 2 and not static?(c, ref) ->
+          {c |> new_sig(reg, {:s, sw}, stage + 1, true) |> ff(reg, x), reg}
+
+        true ->
+          s = if static?(c, ref), do: :static, else: stage
+          {c |> new_sig(reg, {:s, sw}, s, false) |> assign(reg, x), reg}
+      end
+
+    {c,
+     Enum.map(pieces, fn {lsb, n, signed?} ->
+       hi = min(lsb + n, sw) - 1
+
+       if signed?,
+         do: {"$signed(#{x}[#{sw - 1}:#{lsb}])", lsb, IntSet.of_type({:s, sw - lsb})},
+         else:
+           {"$signed({1'b0, #{x}[#{hi}:#{lsb}]})", lsb,
+            IntSet.range(0, (1 <<< (hi - lsb + 1)) - 1)}
+     end)}
   end
 
   defp mul_input(c, _reg, {:lit, v}, _stage, _k), do: {c, {lit(v, lit_bits(v)), lit_bits(v)}}
@@ -1600,7 +2268,16 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   # Sum of products for one dot output: zero terms dropped, positive powers
   # of two as shifts, the rest DSP multiplies, then a registered adder tree.
   defp reduce_products(c, name, pairs, stage, k, fmt) do
-    dl = min(c.timing.dsp_latency, k)
+    levels =
+      pairs
+      |> Enum.reject(fn {a, b} -> static?(c, a) and static?(c, b) end)
+      |> Enum.reject(fn {a, b} -> power_of_two?(a) or power_of_two?(b) end)
+      |> Enum.map(fn {a, b} ->
+        Timing.dsp_split(c.timing, operand_width(c, a), operand_width(c, b)).levels
+      end)
+      |> Enum.max(fn -> 0 end)
+
+    dl = min(c.timing.dsp_latency + levels, k)
 
     {c, terms} =
       pairs
@@ -1671,7 +2348,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     acc = "#{name}_acc"
 
     c =
-      c
+      %{c | dsp: c.dsp + 1}
       |> new_sig(diff, {:s, dw}, stage + 1, true)
       |> ff(diff, "#{dw}'(#{dw}'(#{x}) - #{dw}'(#{y}))")
       |> new_sig(acc, {:s, w}, stage + 2, true)
@@ -1698,6 +2375,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
             if h == 0 do
               {c, nil, IntSet.singleton(0)}
             else
+              c = %{c | dsp: c.dsp + 1}
               fir_product(c, "#{name}_#{k}", g, {x, xw, x_range}, h, second, stage)
             end
 
@@ -1993,13 +2671,15 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     in_side =
       [
         if(l.tid, do: "  input  logic [#{cw - 1}:0] s_axis_tid,\n", else: []),
-        if(l.tuser > 0, do: "  input  logic [#{l.tuser - 1}:0] s_axis_tuser,\n", else: [])
+        if(l.tuser > 0, do: "  input  logic [#{l.tuser - 1}:0] s_axis_tuser,\n", else: []),
+        if(l.frame, do: "  input  logic s_axis_tlast,\n", else: [])
       ]
 
     out_side =
       [
         if(n > 1, do: "  output logic [#{cw - 1}:0] m_axis_tid,\n", else: []),
-        if(l.tuser > 0, do: "  output logic [#{l.tuser - 1}:0] m_axis_tuser,\n", else: [])
+        if(l.tuser > 0, do: "  output logic [#{l.tuser - 1}:0] m_axis_tuser,\n", else: []),
+        if(l.frame, do: "  output logic m_axis_tlast,\n", else: [])
       ]
 
     state_regs =
@@ -2122,6 +2802,33 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
         []
       end
 
+    frame =
+      if l.frame do
+        regs = Enum.map(1..d.latency, &"  logic last_#{&1};\n")
+
+        pipe =
+          Enum.map(1..d.latency, fn k ->
+            "      last_#{k} <= #{if k == 1, do: "s_axis_tlast", else: "last_#{k - 1}"};\n"
+          end)
+
+        [
+          "  // frame sideband: first and last of each frame from tlast\n",
+          "  logic fr_first;\n",
+          regs,
+          "  always_ff @(posedge clk) begin\n",
+          "    if (!rst_n) fr_first <= 1'b1;\n",
+          "    else if (ce && vld_0) fr_first <= s_axis_tlast;\n",
+          "  end\n",
+          "  always_ff @(posedge clk) begin\n",
+          "    if (ce) begin\n",
+          pipe,
+          "    end\n",
+          "  end\n"
+        ]
+      else
+        []
+      end
+
     {state_decls, state_logic} = state_logic(c, d.groups, n, busy)
     sample_logic = sample_logic(c)
 
@@ -2138,8 +2845,19 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
           ]
       end
 
+    # tlast on the last item a sample pushes
+    lanes = length(elem(d.out_expr, 0))
+
+    last_of = fn j ->
+      cond do
+        lanes == 1 -> "last_#{d.latency}"
+        true -> "(last_#{d.latency} && ob_n == #{bit_len(lanes)}'d#{j + 1})"
+      end
+    end
+
     side =
       [
+        if(l.frame, do: {last_of, "m_axis_tlast", 1}),
         if(l.tuser > 0, do: {"user_#{d.latency}", "m_axis_tuser", l.tuser}),
         if(n > 1, do: {ch(d.latency), "m_axis_tid", cw})
       ]
@@ -2159,6 +2877,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       "  input  logic rst_n,\n",
       params,
       pc_ports,
+      memory_port_decls(c),
       if(busy, do: "  output logic busy,\n", else: []),
       "  input  logic [#{l.in_width - 1}:0] s_axis_tdata,\n",
       in_side,
@@ -2173,6 +2892,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       throttle,
       channel,
       user,
+      frame,
       param_logic(l.params),
       channel_param_logic(c, cw),
       "\n",
@@ -2185,6 +2905,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       ffs,
       Enum.reverse(c.combs),
       "\n",
+      memory_logic(c),
       state_logic,
       sample_logic,
       "\n",
@@ -2205,7 +2926,12 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     cw = bit_len(n)
     word = width + (side |> Enum.map(&elem(&1, 2)) |> Enum.sum())
     side_exprs = side |> Enum.map(&elem(&1, 0)) |> Enum.reverse()
-    pack = fn x -> "{" <> Enum.join(side_exprs ++ [x], ", ") <> "}" end
+
+    pack = fn x, j ->
+      exprs = Enum.map(side_exprs, fn e -> if is_function(e), do: e.(j), else: e end)
+      "{" <> Enum.join(exprs ++ [x], ", ") <> "}"
+    end
+
     ports = (side |> Enum.map(&elem(&1, 1)) |> Enum.reverse()) ++ ["m_axis_tdata"]
 
     writes =
@@ -2214,7 +2940,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       |> Enum.map(fn {x, j} ->
         guard = if count, do: "if (ob_n > #{cw}'d#{j}) ", else: ""
 
-        "        #{guard}ob_mem[#{aw}'(ob_wp + #{aw}'d#{j})] <= #{if side == [], do: x, else: pack.(x)};\n"
+        "        #{guard}ob_mem[#{aw}'(ob_wp + #{aw}'d#{j})] <= #{if side == [], do: x, else: pack.(x, j)};\n"
       end)
 
     [

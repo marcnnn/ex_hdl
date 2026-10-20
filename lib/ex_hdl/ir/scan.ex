@@ -25,6 +25,11 @@ defmodule ExHdl.IR.Scan do
     * `args` - the kernel's arguments in order, each
       `%{arg: i, role: :sample | :state | :param | :opts, leaves: [%{index:, type:, shape:}]}`
       where `index` is the Nx parameter index of the tensor leaf.
+    * `memories` - parameter leaves that are RAMs read by `take`
+      (`ExHdl.IR.Memory`), and `costs` the schedule costs of their reads
+      (`%{take_id => cost}`).
+    * `frame` - `nil`, or `%{first: index, last: index}`: the sample leaves
+      that come from the stream's frame sideband (`frame: true`).
   """
   defstruct [
     :graph,
@@ -42,7 +47,10 @@ defmodule ExHdl.IR.Scan do
     :timing,
     state_mem: :registers,
     ram_latency: 0,
-    args: []
+    args: [],
+    memories: [],
+    costs: %{},
+    frame: nil
   ]
 end
 
@@ -87,6 +95,7 @@ defmodule ExHdl.Passes.Recurrence do
   """
   def run(%Dataflow{} = graph, leaf_params, outputs, next_state, opts) do
     timing = Timing.new(opts)
+    costs = Keyword.get(opts, :node_costs, %{})
     next_ids = flatten(next_state)
     state_params = Enum.reject(leaf_params, &is_nil/1)
 
@@ -94,12 +103,12 @@ defmodule ExHdl.Passes.Recurrence do
       groups =
         graph
         |> groups(leaf_params, next_ids)
-        |> Enum.map(&group_loop(graph, &1, timing))
+        |> Enum.map(&group_loop(graph, &1, timing, costs))
 
       worst = Enum.max_by(groups, & &1.loop_latency, fn -> nil end)
       loop_latency = if worst, do: worst.loop_latency, else: 1
 
-      full = Schedule.asap(graph, graph.order, timing)
+      full = Schedule.asap(graph, graph.order, timing, %{}, costs)
 
       pipeline_latency =
         outputs
@@ -283,9 +292,9 @@ defmodule ExHdl.Passes.Recurrence do
     end)
   end
 
-  defp group_loop(graph, group, timing) do
+  defp group_loop(graph, group, timing, costs) do
     rec_order = Enum.filter(graph.order, &MapSet.member?(group.recurrence, &1))
-    sched = Schedule.asap(graph, rec_order, timing)
+    sched = Schedule.asap(graph, rec_order, timing, %{}, costs)
 
     {loop_latency, worst} =
       group.next

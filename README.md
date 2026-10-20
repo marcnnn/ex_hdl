@@ -51,6 +51,9 @@ hardware. Function lives in the hardware library set built on it:
 | openXC7 bitstream builder, Zynq runtime | planned |
 | `defregs` register maps (`ExHdl.Regs`): AXI4-Lite slave with rw/ro/wo/w1c/w1s/rc fields, arrays, strobes and RAM windows; host encode/decode, C header, Markdown; BEAM AXI4-Lite master (`ExHdl.Regs.SimDriver`) | done |
 | Timing families (`ExHdl.Target.Timing`): Zynq-7000 and UltraScale+ (DSP48E2, URAM, -1/-2 delays), from `ExHdlXilinx.Device` data | done |
+| Gathers: parameters that are RAMs read by `Nx.take` at computed addresses, a read port per index element, write port and bank swap (`memories:`); frame sideband from `tlast` (`frame: true`) | done |
+| Products wider than a DSP multiplier split into slices per family (`Timing.dsp_split/3`), DSP sharing under `ii: n`, slice count per design | done |
+| Idioms: signed wraps as wiring (`ExHdl.DSP.wrap/2`: accumulators without a clamp, one adder in the loop), leading one as a priority encoder (`ExHdl.DSP.msb/2`, `count_leading_zeros/2`) | done |
 
 ## Development
 
@@ -227,6 +230,78 @@ spec = ExHdl.DSP.cascade(for k <- 1..4, do: [fun: &MyAudio.biquad/3, args: args,
 stage's sample, states and parameters are concatenated, port names get the
 stage's name as prefix): one pipeline with one clock enable.
 
+### Gathers and the mixer
+
+A crosspoint mixer reads, for every row of an output, `p` source channels
+and gains from a table and the samples of those sources from a frame
+written by the strip stage. Both are parameters on the BEAM and memories
+in hardware (abbreviated; the whole kernel is `ExHdl.Test.Mixer` in
+test/support/mixer_kernels.ex):
+
+```elixir
+defn xmix({row, {first, last}}, acc, src, gain, frame) do
+  x = Nx.take(frame, Nx.take(src, row))          # p reads of the frame
+  part = Nx.dot(Nx.as_type(x, :s64), Nx.as_type(Nx.take(gain, row), :s64))
+  acc2 = ExHdl.DSP.wrap(Nx.select(first, 0, acc) + part, 48)
+  y = shift_round(acc2, 15)
+  {{{saturated(y), clip(y)}, last}, acc2}       # one output per frame
+end
+
+ExHdl.DSP.scan_to_sv(&xmix/5, args,
+  state: 1, param_names: ["src", "gain", "frame"],
+  memories: ["src", "gain", "frame"], frame: true, lanes: 1,
+  family: :ultrascale_plus, clock_mhz: 250)
+```
+
+  * `memories: [name | {name, opts}]` (`ExHdl.IR.Memory`): the parameter
+    (`{depth}` or `{depth, row...}`) becomes a RAM, every `Nx.take` element
+    a read port with its own copy, `latency:` cycles in the schedule
+    (default from the style: LUT RAM 1, block RAM and URAM 2). The write
+    port `<name>_waddr`/`_wdata`/`_we` (own clock with `clock: :separate`)
+    writes the inactive bank; `<name>_swap` activates it for the next
+    sample, `<name>_pending` until the old bank's readers are gone
+    (`banks: 1` for a single bank).
+  * `frame: true`: the sample ends in `{first, last}`; `last` is
+    `s_axis_tlast`, `first` follows it, `m_axis_tlast` marks the output.
+    A reduction over a runtime number of rows needs no counter;
+    `ExHdl.DSP.frame_flags/1` builds the flags for the reference.
+  * `ExHdl.DSP.wrap(x, bits)` is the signed wrap of NxFixed's `wrap/2` for
+    any width: the width check proves the accumulator without a clamp,
+    and the hardware is wiring, so the loop is one adder and the mixer
+    takes one row per cycle. Saturation happens at the output.
+
+The mixer of the AES67 card: 1024 outputs of up to 64 crosspoints, 16 per
+row, so a full frame is 4096 rows (of 5208 cycles at 48 kHz and 250 MHz);
+outputs with fewer sources take fewer rows. Yosys for UltraScale+:
+
+| Kernel | latency | ii | LUT | FF | DSP48E2 | RAMB18 | URAM |
+|---|---|---|---|---|---|---|---|
+| mixer, 1024 x 64 crosspoints, 16 per row, 1024 sources | 14 | 1 | 1210 | 3068 | 16 | 48 | 13 |
+
+The tables (two banks of 4096 rows of 16 x 10-bit sources and 16 x 18-bit
+gains) are URAM, the 16 copies of the double-buffered frame block RAM.
+test/gather_cosim_test.exs runs a small instance (16 sources, 6 outputs
+of 1 to 3 rows) with bank swaps of tables and frame mid-stream, against
+the Nx reference and an integer model of the mix.
+
+### DSP slices
+
+Products that fit the family's multiplier (25 x 18 on DSP48E1, 27 x 18 on
+DSP48E2) take one slice. Wider ones are cut into pieces of one slice each
+and summed by a registered adder tree (`Timing.dsp_split/3`): 32 x 24 is
+two slices, 32 x 32 four, on both families; the schedule uses the tree's
+latency. `Design.dsp` counts the slices; Yosys agrees on every kernel
+below. With `ii: n` multiplies of the same size share a unit when their
+stages are distinct and within `n` of each other (the unit's inputs are
+multiplexed by the stage's valid bit); a multiply outside the feedback
+loops is delayed by up to `n - 1` stages to join one (`share: false`
+turns it off).
+
+`ExHdl.DSP.msb/2` and `count_leading_zeros/2` (nx_fixed has no
+`Nx.count_leading_zeros`) are written as the number of powers of two the
+value reaches; that idiom, also ex_audio's `log2_q16`, becomes a priority
+encoder instead of comparators and an adder tree.
+
 Yosys `synth_xilinx` for Q15 instances (synthesis only, no I/O buffers,
 no timing); latency includes the output buffer:
 
@@ -251,28 +326,30 @@ by the pre-adder) and the partial sums of zero taps.
 ex_audio's direct form I biquad (24-bit samples, 32-bit coefficients and
 history, error feedback; a copy is in test/support/audio_kernels.ex), same
 flow; with `channels: 1024` both the state and the per-channel coefficient
-banks are in RAM. Pipeline delays become SRL shift registers (about 430 per
-section, not counted as LUT):
+banks are in RAM. Pipeline delays become SRL shift registers (not counted
+as LUT). The products are split (3 of 32 x 24, 2 of 32 x 32: 14 slices)
+and the error feedback's wrap is wiring, so a section's loop is 8 cycles
+at 150 MHz and at 250 MHz:
 
 | Kernel | latency | ii | LUT | FF | DSP48E1 | RAMB18 |
 |---|---|---|---|---|---|---|
-| biquad, `ii: :auto` | 16 | 8 | 816 | 477 | 20 | 0 |
-| biquad, `channels: 10`, state in registers | 16 | 1 | 1718 | 2543 | 20 | 0 |
-| biquad, `channels: 1024`, `state_mem: :block`, `channel_params: :all` | 17 | 1 | 800 | 267 | 20 | 28 |
-| 4 biquads (`ExHdl.DSP.cascade/1`), `ii: :auto` | 61 | 8 | 3218 | 1881 | 80 | 0 |
-| 4 biquads, `channels: 1024`, block RAM | 62 | 1 | 3149 | 909 | 80 | 112 |
+| biquad, `ii: :auto` (3 multiplies on one unit) | 17 | 8 | 817 | 1133 | 10 | 0 |
+| biquad, `channels: 10`, state in registers | 15 | 1 | 1822 | 3028 | 14 | 0 |
+| biquad, `channels: 1024`, `state_mem: :block`, `channel_params: :all` | 16 | 1 | 823 | 751 | 14 | 28 |
+| 4 biquads (`ExHdl.DSP.cascade/1`), `ii: :auto` | 62 | 8 | 3214 | 4358 | 40 | 0 |
+| 4 biquads, `channels: 1024`, block RAM | 58 | 1 | 3240 | 3013 | 56 | 112 |
 
-The same for UltraScale+ (`family: "xcup"`) with `clock_mhz: 250` (loop of
-10 cycles per section):
+The same for UltraScale+ (`family: "xcup"`) with `clock_mhz: 250`:
 
 | Kernel | latency | LUT | FF | DSP48E2 | RAMB18 | URAM |
 |---|---|---|---|---|---|---|
-| biquad, `channels: 1024`, block RAM | 21 | 1010 | 739 | 20 | 28 | 0 |
-| biquad, `channels: 1024`, `state_mem: :ultra` | 22 | 1010 | 874 | 20 | 20 | 3 |
-| 4 biquads, `channels: 1024`, `state_mem: :ultra` | 79 | 3993 | 3325 | 80 | 80 | 12 |
+| biquad, `channels: 1024`, block RAM | 16 | 817 | 1643 | 14 | 28 | 0 |
+| biquad, `channels: 1024`, `state_mem: :ultra` | 17 | 818 | 1817 | 14 | 20 | 3 |
+| 4 biquads, `channels: 1024`, `state_mem: :ultra` | 59 | 3224 | 6998 | 56 | 80 | 12 |
 
-The wide products (32 x 24 and 32 x 32 bit) take 4 DSP slices each; see
-ex_audio's NEEDS.md on splitting them.
+The split costs flip-flops: the adder trees of the pieces are registered
+per level (about 60 bits each), where Yosys's own mapping used 20 slices
+and fewer registers.
 
 The sibling libraries are path dependencies (`../nx_fixed`, and
 `../ex_sdr` for integration tests); `scripts/checkout_siblings.sh` clones

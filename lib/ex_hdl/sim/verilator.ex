@@ -282,8 +282,11 @@ defmodule ExHdl.Sim.Verilator do
       design.in_width > @wide or design.out_width > @wide ->
         {:error, "stream simulation supports tdata up to #{@wide} bits"}
 
-      param_bits > @wide or design.pc_width > @wide or design.tuser > @wide ->
+      param_bits > @wide or design.pc_width > @wide or design.tuser + frame_bit(design) > @wide ->
         {:error, "stream simulation supports up to #{@wide} parameter, pc_data and tuser bits"}
+
+      Enum.any?(memories(design), &(&1.data_bits > @wide or &1.addr_bits > 28)) ->
+        {:error, "stream simulation supports memory words up to #{@wide} bits, 2^28 deep"}
 
       true ->
         sources = %{
@@ -309,6 +312,25 @@ defmodule ExHdl.Sim.Verilator do
     params = if d.params == [], do: params, else: params ++ ["    .p_load(params_load),\n"]
     cw = max(1, bit_len(d.channels - 1))
     multi = d.channels > 1
+    mems = memories(d)
+    # pc_addr[31:28] selects the channel parameters (0) or memory k (k + 1)
+    sel = fn k -> if mems == [], do: "pc_we", else: "pc_we && pc_addr[31:28] == 4'd#{k}" end
+
+    mem_ports =
+      mems
+      |> Enum.with_index(1)
+      |> Enum.map(fn {m, k} ->
+        [
+          "    .#{m.name}_waddr(pc_addr[#{m.addr_bits - 1}:0]),\n",
+          "    .#{m.name}_wdata(pc_data[#{m.data_bits - 1}:0]),\n",
+          "    .#{m.name}_we(#{sel.(k)}),\n",
+          if(m.banks == 2,
+            do: "    .#{m.name}_swap(pc_swap),\n    .#{m.name}_pending(pend[#{k}]),\n",
+            else: []
+          ),
+          if(m.clock == :separate, do: "    .#{m.name}_wclk(clk),\n", else: [])
+        ]
+      end)
 
     ports =
       [
@@ -316,11 +338,17 @@ defmodule ExHdl.Sim.Verilator do
           do: [
             "    .pc_addr(pc_addr[#{cw - 1}:0]),\n",
             "    .pc_data(pc_data[#{d.pc_width - 1}:0]),\n",
-            "    .pc_we(pc_we),\n",
+            "    .pc_we(#{sel.(0)}),\n",
             "    .pc_swap(pc_swap),\n",
-            "    .pc_pending(pc_pending),\n",
+            "    .pc_pending(pend[0]),\n",
             if(d.pc_clock == :separate, do: "    .pc_clk(clk),\n", else: [])
           ],
+          else: []
+        ),
+        mem_ports,
+        if(frame_bit(d) == 1,
+          do:
+            "    .s_axis_tlast(s_axis_tuser[#{d.tuser}]),\n    .m_axis_tlast(m_axis_tuser[#{d.tuser}]),\n",
           else: []
         ),
         if(d.busy, do: "    .busy(busy),\n", else: []),
@@ -339,11 +367,22 @@ defmodule ExHdl.Sim.Verilator do
           true -> nil
         end,
         cond do
-          d.tuser == 0 -> "  assign m_axis_tuser = '0;\n"
-          d.tuser < @wide -> "  assign m_axis_tuser[#{@wide - 1}:#{d.tuser}] = '0;\n"
-          true -> nil
+          d.tuser + frame_bit(d) == 0 ->
+            "  assign m_axis_tuser = '0;\n"
+
+          d.tuser + frame_bit(d) < @wide ->
+            "  assign m_axis_tuser[#{@wide - 1}:#{d.tuser + frame_bit(d)}] = '0;\n"
+
+          true ->
+            nil
         end,
-        if(d.channel_params == [], do: "  assign pc_pending = 1'b0;\n"),
+        if(d.channel_params == [], do: "  assign pend[0] = 1'b0;\n"),
+        for(
+          {m, k} <- Enum.with_index(mems, 1),
+          m.banks == 1,
+          do: "  assign pend[#{k}] = 1'b0;\n"
+        ),
+        "  assign pc_pending = |pend;\n",
         if(!d.busy, do: "  assign busy = 1'b0;\n")
       ]
       |> Enum.reject(&is_nil/1)
@@ -373,6 +412,7 @@ defmodule ExHdl.Sim.Verilator do
       output logic pc_pending,
       output logic busy
     );
+      logic [#{length(mems)}:0] pend;
       #{d.name} dut (
         .clk(clk),
         .rst_n(rst_n),
@@ -390,6 +430,10 @@ defmodule ExHdl.Sim.Verilator do
 
   defp bit_len(0), do: 0
   defp bit_len(v), do: 1 + bit_len(v >>> 1)
+
+  # Designs from before memories and frames have no such fields.
+  defp memories(d), do: Map.get(d, :memories) || []
+  defp frame_bit(d), do: if(Map.get(d, :frame), do: 1, else: 0)
 
   @doc """
   Streams samples through a stream kernel simulation with randomized input
@@ -415,6 +459,13 @@ defmodule ExHdl.Sim.Verilator do
       `pc_swap` in the cycle that accepts sample `k - 1`, and
       `{:write_after_swap, channel, values}` writes once that swap's
       `pc_pending` is low, one per cycle, while the stream runs.
+      Memories (`Design.memories`) are written with `{:mem, name, addr,
+      values}` (before the stream) and `{:mem_after_swap, name, addr,
+      values}`, `values` the row of the word; the wrapper selects the
+      memory with `pc_addr[31:28]`, `pc_swap` swaps every banked memory
+      and `pc_pending` is high while any of them is pending.
+    * `tlast:` - one 0/1 per sample for designs with a frame sideband; the
+      result then has `:tlast`, one per output.
   """
   @spec run_stream(StreamSim.t(), [Nx.Tensor.t() | list()], list(), run_opts()) ::
           {:ok,
@@ -423,12 +474,29 @@ defmodule ExHdl.Sim.Verilator do
   def run_stream(%StreamSim{design: d} = sim, inputs, params \\ [], opts \\ []) do
     words = pack_samples(d.inputs, inputs)
     n = length(words)
+    hex = &Integer.to_string(&1, 16)
     seed = Keyword.get(opts, :seed, :rand.uniform(1 <<< 32))
     valid_pct = Keyword.get(opts, :valid_pct, 100)
     ready_pct = Keyword.get(opts, :ready_pct, 100)
     max_cycles = Keyword.get(opts, :max_cycles, 1000 + n * 200 + 2 * d.channels)
     users = Keyword.get(opts, :tuser) || List.duplicate(0, n)
     ids = Keyword.get(opts, :tid) || List.duplicate(0, n)
+
+    # frame sideband: tlast travels above the design's tuser bits
+    users =
+      case Keyword.get(opts, :tlast) do
+        nil -> users
+        lasts -> Enum.zip_with(users, lasts, fn u, l -> u ||| l <<< d.tuser end)
+      end
+
+    mem_index =
+      d |> memories() |> Enum.with_index(1) |> Map.new(fn {m, k} -> {m.name, {k, m}} end)
+
+    mem_write = fn op, name, addr, values ->
+      {k, m} = Map.fetch!(mem_index, to_string(name))
+      word = pack_elems(%{bits: m.bits}, ints(values))
+      [op, " ", hex.(k <<< 28 ||| addr), " ", hex.(word), ?\n]
+    end
 
     param_word = param_word(d.params, params)
 
@@ -437,8 +505,6 @@ defmodule ExHdl.Sim.Verilator do
         nil -> {0, param_word}
         {k, params2} -> {k, param_word(d.params, params2)}
       end
-
-    hex = &Integer.to_string(&1, 16)
 
     commands =
       opts
@@ -455,6 +521,12 @@ defmodule ExHdl.Sim.Verilator do
 
         {:write_after_swap, ch, values} ->
           ["p ", hex.(ch), " ", hex.(param_word(d.channel_params, values)), ?\n]
+
+        {:mem, name, addr, values} ->
+          mem_write.("w", name, addr, values)
+
+        {:mem_after_swap, name, addr, values} ->
+          mem_write.("p", name, addr, values)
       end)
 
     tmp = Path.join(System.tmp_dir!(), "ex_hdl_stream_#{System.unique_integer([:positive])}")
@@ -485,12 +557,26 @@ defmodule ExHdl.Sim.Verilator do
         ])
 
       case System.cmd(sim.path, args, stderr_to_stdout: true) do
-        {_, 0} -> {:ok, parse_stream(File.read!(out_file), d.outputs)}
+        {_, 0} -> {:ok, split_tlast(parse_stream(File.read!(out_file), d.outputs), d)}
         {log, 2} -> {:error, {:cycle_limit, String.trim(log)}}
         {log, status} -> {:error, {:exit, status, log}}
       end
     after
       File.rm_rf!(tmp)
+    end
+  end
+
+  defp split_tlast(res, d) do
+    if frame_bit(d) == 1 do
+      mask = (1 <<< d.tuser) - 1
+
+      %{
+        res
+        | tuser: Enum.map(res.tuser, &(&1 &&& mask))
+      }
+      |> Map.put(:tlast, Enum.map(res.tuser, &(&1 >>> d.tuser &&& 1)))
+    else
+      res
     end
   end
 
