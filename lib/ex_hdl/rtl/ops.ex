@@ -10,7 +10,9 @@ defmodule ExHdl.RTL.Ops do
 
   `if`/`unless` with a hardware condition record a conditional statement
   (inside `comb`/`sync` only); with an Elixir value they behave as usual.
-  `and`/`or`/`not`/`&&`/`||`/`!` work on 1-bit values. `target <~ value`
+  `and`/`or`/`not`/`&&`/`||`/`!` work on 1-bit values. `==` and `!=`
+  with `nil` on either side are always the Elixir comparison (`acc == nil`
+  in a fold is `true` or `false`, never hardware). `target <~ value`
   assigns; it binds tighter than comparisons, `and`/`or` and the bitwise
   operators, so write `x <~ (a == b)` (forgetting the parentheses raises).
   """
@@ -79,6 +81,14 @@ defmodule ExHdl.RTL.Ops do
 
   for {op, f} <- [==: :eq, !=: :ne, <: :lt, <=: :le, >: :gt, >=: :ge] do
     def unquote(op)(%Assigned{} = a, _b), do: Assigned.raise!(a)
+
+    # nil is never hardware: `acc == nil` on a generator accumulator keeps its
+    # Elixir meaning.
+    Kernel.if Kernel.in(op, [:==, :!=]) do
+      def unquote(op)(nil, b), do: Kernel.unquote(op)(nil, b)
+      def unquote(op)(a, nil), do: Kernel.unquote(op)(a, nil)
+    end
+
     def unquote(op)(%Expr{} = a, b), do: Expr.unquote(f)(a, b)
     def unquote(op)(a, %Expr{} = b), do: Expr.unquote(f)(a, b)
     def unquote(op)(a, b), do: Kernel.unquote(op)(a, b)

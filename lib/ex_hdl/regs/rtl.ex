@@ -255,6 +255,61 @@ defmodule ExHdl.Regs.RTL do
     end
   end
 
+  @internal ~w(clk rst_n aw_rdy ar_rdy bvalid_r bresp_r rvalid_r rresp_r rdata_r prio_rd wr_go
+    rd_go waddr_w raddr_w win_pipe win_sel rd_pend idle want_w want_r rd_reg_hit rd_win_start
+    rd_val win_done win_rdata)a
+
+  @doc false
+  # Every signal name the slave of `m` declares, with what it comes from, so
+  # `ExHdl.Regs` can reject keywords and clashes when the map is defined.
+  def names(%Regs{} = m) do
+    axil =
+      for {f, _, _} <- Interface.axi_lite().fields, do: {:"s_axil_#{f}", "the AXI4-Lite slave"}
+
+    fixed = for n <- @internal, do: {n, "the slave logic"}
+
+    regs =
+      for r <- m.registers, {_, i, _} <- Regs.instances(r) do
+        pre = prefix(r, i)
+        what = "register #{pre}"
+
+        hits = [{:"whit_#{pre}", what}, {:"rhit_#{pre}", what}]
+
+        strobes =
+          for {kind, suffix} <- [write: "wr", read: "rd"],
+              r.strobe in [kind, :both],
+              do: {:"#{pre}_#{suffix}", "the #{kind} strobe of #{what}"}
+
+        fields =
+          Enum.flat_map(r.fields, fn f ->
+            base = :"#{pre}_#{f.name}"
+            fw = "field #{f.name} of #{what}"
+
+            case f.access do
+              :ro when f.const != nil -> []
+              a when a in [:w1c, :rc] -> [{base, fw}, {:"#{base}_set", fw}]
+              :w1s -> [{base, fw}, {:"#{base}_clr", fw}]
+              _ -> [{base, fw}]
+            end
+          end)
+
+        hits ++ strobes ++ fields
+      end
+
+    wins =
+      for w <- m.windows do
+        what = "window #{w.name}"
+
+        ports =
+          for {f, _, _} <- Interface.mem_port(addr: 1, data: 32, be: true).fields,
+              do: {:"#{w.name}_#{f}", what}
+
+        [{:"whit_#{w.name}", what}, {:"rhit_#{w.name}", what} | ports]
+      end
+
+    axil ++ fixed ++ List.flatten(regs) ++ List.flatten(wins)
+  end
+
   @doc false
   def prefix(r, nil), do: "#{r.name}"
   def prefix(r, i), do: "#{r.name}_#{i}"

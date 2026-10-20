@@ -29,6 +29,13 @@ defmodule ExHdl.RTL.FSM do
 
   The handle (`%ExHdl.RTL.FSM{}`) works with `ExHdl.RTL.in_state/2` and as
   a `switch` subject with state atoms as case values.
+
+  `in_state(:ctrl, :run)` takes the FSM by name and may come before the
+  `fsm :ctrl` declaration: logic the state bodies depend on (a memory read
+  port enabled in one state, whose data a state body tests) is declared
+  first. A forward reference is a 1-bit wire `<fsm>_in_<state>` that the
+  FSM drives when it is declared; an FSM that never appears raises at the
+  end of `module/3`.
   """
   alias ExHdl.RTL.{Builder, ElaborationError, Expr}
 
@@ -76,6 +83,9 @@ defmodule ExHdl.RTL.FSM do
     reg = Builder.reg(:"#{name}_state", width, reset: codes[reset], domain: dom)
     fsm = %__MODULE__{name: name, state: reg, states: codes, domain: dom, encoding: encoding}
     Builder.add_fsm(fsm)
+
+    for {state, w} <- Builder.take_fsm_forwards(name),
+        do: Builder.assign(w, in_state(fsm, state))
 
     Builder.push_fsm(%{fsm: fsm})
 
@@ -135,6 +145,13 @@ defmodule ExHdl.RTL.FSM do
   end
 
   @doc false
+  def in_state(fsm, state) when is_atom(fsm) do
+    case Enum.find(Builder.current!().fsms, &(&1.name == fsm)) do
+      nil -> Builder.fsm_forward(fsm, state)
+      f -> in_state(f, state)
+    end
+  end
+
   def in_state(%__MODULE__{state: s, states: states} = f, name) do
     code =
       Keyword.get(states, name) ||

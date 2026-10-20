@@ -143,6 +143,8 @@ defmodule ExHdl.RTL.Check do
       default_domain: default_domain(b),
       params: Keyword.get(b.opts, :params, []),
       sources: Keyword.get(b.opts, :sources, %{}),
+      sim_sources: Keyword.get(b.opts, :sim_sources, %{}),
+      clock_outputs: b.clock_outputs,
       model: Keyword.get(b.opts, :model),
       comb_paths: comb_paths,
       bundles: b.bundles
@@ -253,6 +255,14 @@ defmodule ExHdl.RTL.Check do
     for stmts <- stmt_lists, n <- Stmt.reads(stmts), b.signals[n].kind in [:clock, :clock_int] do
       raise ElaborationError, "#{b.name}: clock #{n} used as data"
     end
+
+    for e <- all_exprs(b), n <- Expr.reads(e), b.signals[n].kind == :inout do
+      raise ElaborationError,
+            "#{b.name}: inout #{n} is read by logic; inouts only connect to inout ports of " <>
+              "instances (drive and sample the pad through an IOBUF black box)"
+    end
+
+    :ok
   end
 
   defp undriven!(b, procs, sync_targets) do

@@ -32,6 +32,9 @@ defmodule ExHdl.RTL.Builder do
     use uwire var vectored virtual void wait wait_order wand weak weak0 weak1 while wildcard wire
     with within wor xnor xor)
 
+  @doc false
+  def sv_keyword?(name), do: to_string(name) in @sv_keywords
+
   # -- lifecycle -------------------------------------------------------------------------
 
   def build(kind, name, opts, fun) do
@@ -52,7 +55,9 @@ defmodule ExHdl.RTL.Builder do
       memories: [],
       bundles: [],
       fsms: [],
-      fsm_stack: []
+      fsm_stack: [],
+      fsm_forwards: %{},
+      clock_outputs: []
     }
 
     stack = Process.get(@key, [])
@@ -61,6 +66,7 @@ defmodule ExHdl.RTL.Builder do
     try do
       fun.()
       [b | _] = Process.get(@key)
+      forwards_resolved!(b)
       Check.finalize(b)
     after
       Process.put(@key, stack)
@@ -120,7 +126,11 @@ defmodule ExHdl.RTL.Builder do
     b = current!()
 
     if Map.has_key?(b.signals, name) or Enum.any?(b.memories, &(&1.name == name)),
-      do: raise(ElaborationError, "#{b.name}: #{name} is declared twice")
+      do:
+        raise(
+          ElaborationError,
+          "#{b.name}: #{name} is declared twice" <> twice_hint(b, name, extra)
+        )
 
     sig =
       Map.merge(
@@ -130,6 +140,20 @@ defmodule ExHdl.RTL.Builder do
 
     b = put(%{b | signals: Map.put(b.signals, name, sig), decls: b.decls ++ [name]})
     handle(b, name)
+  end
+
+  # Instance port wires are `<inst>_<port>`; say which instance a clash comes from.
+  defp twice_hint(b, name, extra) do
+    inst_hint = fn {i, p} ->
+      "; #{name} is the wire of port #{p} of instance #{i} (instance ports are " <>
+        "<instance>_<port>), rename the instance (e.g. u_#{i}) or the signal"
+    end
+
+    case {b.signals[name], extra} do
+      {%{inst: inst}, _} -> inst_hint.(inst)
+      {_, %{inst: inst}} -> inst_hint.(inst)
+      _ -> ""
+    end
   end
 
   defp add_port(name, dir, type, role, opts) do
@@ -173,6 +197,7 @@ defmodule ExHdl.RTL.Builder do
 
   def output(name, type, opts) do
     check_domain_opt!(opts)
+    if Keyword.get(opts, :clock, false), do: clock_output!(name, type)
 
     if Keyword.get(opts, :reg, false) or Keyword.has_key?(opts, :reset) do
       dom = reg_domain(opts)
@@ -193,6 +218,40 @@ defmodule ExHdl.RTL.Builder do
       add_port(name, :output, type, :data, opts)
       e
     end
+  end
+
+  defp clock_output!(name, type) do
+    b = current!()
+
+    unless b.kind == :black_box,
+      do:
+        raise(
+          ElaborationError,
+          "#{b.name}: output #{name}: clock: true marks black-box outputs (BUFG O, MMCM " <>
+            "CLKOUT); a module drives an internal clock with domain(..., clock_port: false)"
+        )
+
+    unless Expr.type!(type) == {:u, 1},
+      do: raise(ElaborationError, "#{b.name}: clock output #{name} must be 1 bit")
+
+    update(&%{&1 | clock_outputs: &1.clock_outputs ++ [name]})
+  end
+
+  @doc false
+  # Bidirectional port: no logic may read or drive it; it connects to inout
+  # ports of instances (an IOBUF black box, a child passing it through).
+  def inout(name, type, opts) do
+    for k <- Keyword.keys(opts) -- [:domain],
+        do: raise(ElaborationError, "inout #{name}: unknown option #{inspect(k)}")
+
+    d = Keyword.get(opts, :domain)
+
+    unless d in [nil, :async],
+      do: raise(ElaborationError, "inout #{name}: an inout belongs to no domain (domain: :async)")
+
+    e = add_signal(name, type, :inout, %{port: :inout})
+    add_port(name, :inout, type, :data, domain: nil)
+    e
   end
 
   def reg(name, type, opts) do
@@ -264,12 +323,31 @@ defmodule ExHdl.RTL.Builder do
   end
 
   def wire(name, %Expr{} = e, opts) do
-    w = add_signal(name, e.type, :wire, %{domain: opts[:domain]})
+    w = add_signal(name, e.type, :wire, %{domain: opts[:domain], attrs: wire_attrs(name, opts)})
     assign(w, e)
     w
   end
 
-  def wire(name, type, opts), do: add_signal(name, type, :wire, %{domain: opts[:domain]})
+  def wire(name, type, opts),
+    do: add_signal(name, type, :wire, %{domain: opts[:domain], attrs: wire_attrs(name, opts)})
+
+  # `rom_style:` for a wire defined by a `mux(sel, list)` table.
+  defp wire_attrs(name, opts) do
+    style =
+      case Keyword.get(opts, :rom_style) do
+        nil ->
+          []
+
+        s when s in [:distributed, :block] ->
+          [rom_style: Atom.to_string(s)]
+
+        other ->
+          raise ElaborationError,
+                "wire #{name}: rom_style must be :distributed or :block, got #{inspect(other)}"
+      end
+
+    style ++ Keyword.get(opts, :attrs, [])
+  end
 
   def signal(name) do
     b = current!()
@@ -496,6 +574,8 @@ defmodule ExHdl.RTL.Builder do
   def assign(target, _),
     do: raise(ElaborationError, "cannot assign to #{inspect(target)}; targets are signals")
 
+  defp kind_name(:inout), do: "an inout port (inouts only connect to inout ports of instances)"
+
   defp kind_name(:input), do: "an input"
   defp kind_name(:inst_out), do: "an instance output"
   defp kind_name(:mem_data), do: "a memory read port"
@@ -504,12 +584,27 @@ defmodule ExHdl.RTL.Builder do
   defp kind_name(:reset), do: "a reset input"
   defp kind_name(k), do: "a #{k}"
 
+  @if_hint "inside module/3 and rtl/1, `if` on a hardware value is a hardware conditional; " <>
+             "for a decision at elaboration time on a generator value (an accumulator that " <>
+             "may be nil, an option) use case, is_nil/1 or Kernel.if/2"
+
   def if_(%Expr{} = c, then, other) do
-    c = Expr.bit!(c, "if condition")
+    unless match?(%Expr{type: {:u, 1}}, c),
+      do:
+        raise(
+          ExHdl.RTL.WidthError,
+          "if condition: needs a 1-bit unsigned value, got #{Expr.fmt(c.type)}; " <>
+            "compare with != 0. Note: " <> @if_hint
+        )
+
     b = current!()
 
     if frame_kind(b) == :top,
-      do: raise(ElaborationError, "#{b.name}: hardware if outside a comb or sync block")
+      do:
+        raise(
+          ElaborationError,
+          "#{b.name}: hardware if outside a comb or sync block; " <> @if_hint
+        )
 
     t = capture(then)
     e = capture(other)
@@ -604,9 +699,10 @@ defmodule ExHdl.RTL.Builder do
 
     params = Keyword.merge(mod.params, params)
     dmap = domain_map(b, name, mod, Keyword.get(opts, :domains, []))
+    {inout_ports, other_ports} = Enum.split_with(mod.ports, &(&1.dir == :inout))
 
     conns =
-      Enum.map(mod.ports, fn p ->
+      Enum.map(other_ports, fn p ->
         case p.role do
           :clock ->
             cd = Enum.find(mod.domains, &(&1.clock_port and port_name(&1.clock) == p.name))
@@ -639,13 +735,29 @@ defmodule ExHdl.RTL.Builder do
         end
       end)
 
-    inst = %{name: name, module: mod, params: params, conns: conns, domains: dmap}
+    inout_types = Map.new(inout_ports, &{&1.name, &1.type})
+    {inout_conns, connect} = Keyword.split(Keyword.get(opts, :connect, []), Map.keys(inout_types))
+
+    inouts =
+      Enum.map(inout_ports, fn p ->
+        {p.name, inout_conn(b, name, p, Keyword.get(inout_conns, p.name))}
+      end)
+
+    inst = %{
+      name: name,
+      module: mod,
+      params: params,
+      conns: conns,
+      domains: dmap,
+      inouts: inouts
+    }
+
     b = update(&%{&1 | instances: &1.instances ++ [inst]})
 
     handles =
       for {port, {:wire, w}} <- conns, into: %{__instance__: name}, do: {port, handle(b, w)}
 
-    for {port, v} <- Keyword.get(opts, :connect, []) do
+    for {port, v} <- connect do
       case handles do
         %{^port => h} -> assign(h, v)
         _ -> raise ElaborationError, "instance #{name}: #{mod.name} has no data port #{port}"
@@ -660,6 +772,32 @@ defmodule ExHdl.RTL.Builder do
 
   def instance(_name, other, _opts),
     do: raise(ElaborationError, "instance expects an ExHdl.RTL.Module, got #{inspect(other)}")
+
+  defp inout_conn(_b, _inst, _p, nil), do: nil
+
+  defp inout_conn(b, inst, p, %Expr{op: :sig, args: [n, owner]}) when owner == b.owner do
+    case b.signals[n] do
+      %{kind: :inout, type: t} when t == p.type ->
+        n
+
+      %{kind: :inout, type: t} ->
+        raise ElaborationError,
+              "instance #{inst}: inout #{p.name} is #{Expr.fmt(p.type)}, #{n} is #{Expr.fmt(t)}"
+
+      _ ->
+        raise ElaborationError,
+              "instance #{inst}: inout #{p.name} connects to an inout port of #{b.name}, " <>
+                "#{n} is not one"
+    end
+  end
+
+  defp inout_conn(b, inst, p, other),
+    do:
+      raise(
+        ElaborationError,
+        "instance #{inst}: inout #{p.name} connects to an inout port of #{b.name}, " <>
+          "got #{inspect(other)}"
+      )
 
   defp port_name(%Expr{args: [n | _]}), do: n
 
@@ -857,4 +995,40 @@ defmodule ExHdl.RTL.Builder do
   end
 
   def update_fsm(f), do: update(fn %{fsm_stack: [_ | r]} = b -> %{b | fsm_stack: [f | r]} end)
+
+  # `in_state(:fsm, :state)` before `fsm :fsm` exists: a 1-bit wire that the
+  # FSM drives once it is declared.
+  def fsm_forward(fsm, state) do
+    b = current!()
+
+    case b.fsm_forwards do
+      %{{^fsm, ^state} => name} ->
+        handle(b, name)
+
+      _ ->
+        name = name!(:"#{fsm}_in_#{state}")
+        w = wire(name, 1, [])
+        update(&%{&1 | fsm_forwards: Map.put(&1.fsm_forwards, {fsm, state}, name)})
+        w
+    end
+  end
+
+  def take_fsm_forwards(fsm) do
+    b = current!()
+    {mine, rest} = Enum.split_with(b.fsm_forwards, fn {{f, _}, _} -> f == fsm end)
+    put(%{b | fsm_forwards: Map.new(rest)})
+    for {{_, state}, name} <- mine, do: {state, handle(b, name)}
+  end
+
+  defp forwards_resolved!(b) do
+    case Enum.sort(Map.keys(b.fsm_forwards)) do
+      [] ->
+        :ok
+
+      [{fsm, state} | _] ->
+        raise ElaborationError,
+              "#{b.name}: in_state(#{inspect(fsm)}, #{inspect(state)}) refers to an fsm " <>
+                "#{fsm} that is never declared"
+    end
+  end
 end
