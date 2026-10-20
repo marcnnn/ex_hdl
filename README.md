@@ -46,6 +46,9 @@ hardware. Function lives in the hardware library set built on it:
 | BEAM RTL simulator with multiple clocks and VCD (`ExHdl.RTL.Sim`), port-level Verilator co-simulation (`ExHdl.RTL.Cosim`), ports of any width | done |
 | Cycle-by-cycle check of RTL against an Elixir step function or a recorded trace, BEAM and Verilator, with a mismatch report (`ExHdl.RTL.Cosim.check_model/4`) | done |
 | One-hot FSM encoding, indexed part select `part/3` | done |
+| BEAM simulator compiled to BEAM code (100x to 1000x faster on large designs), interpreter kept as reference | done |
+| Closed-loop Verilator sessions (`ExHdl.RTL.Cosim.open/2`), agent testbench on both simulators (`ExHdl.RTL.Bench`), Verilator VCD of replays, Verilator flags | done |
+| BEAM models for wrapped stream kernels (`Wrap.scan(design, model: ...)`), signed kernel ports, black-box models with instance parameters, co-simulation of designs with internal (MMCM) clocks | done |
 | CDC cells (`ExHdl.RTL.CDC`: synchroniser, pulse, reset, handshake) and wrappers for protocol and stream-kernel modules (`ExHdl.RTL.Wrap`) | done |
 | Retiming, `accelerator` DSL | planned |
 | openXC7 bitstream builder, Zynq runtime | planned |
