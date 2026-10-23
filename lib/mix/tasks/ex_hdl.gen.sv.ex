@@ -2,6 +2,7 @@ defmodule Mix.Tasks.ExHdl.Gen.Sv do
   @shortdoc "Writes SystemVerilog for the packets and stream kernels of modules"
   @moduledoc """
       mix ex_hdl.gen.sv MySDR.Protocol MySDR.Kernels [--out hdl/generated] [--synth]
+      mix ex_hdl.gen.sv MySDR.Kernels --pnr --clock-mhz 200 [--bitstream] [--seed 1]
 
   For a module that `use`s `ExHdl.Protocol`, writes `<packet>_parser.sv`,
   `<packet>_emitter.sv` and `<packet>_loopback.sv` for every `defpacket`.
@@ -29,6 +30,13 @@ defmodule Mix.Tasks.ExHdl.Gen.Sv do
   prints LUT, FF, DSP48E1 and RAMB18 counts (needs `yosys` in `PATH`);
   `--family` picks the Yosys family (default `xc7`, `xcup` for
   UltraScale+).
+
+  `--pnr` places and routes each kernel and RTL top for the Zynq-7020
+  (`xc7z020clg400-1`) with Yosys and nextpnr-xilinx (`ExHdl.Synth.PnR`, needs
+  podman and the image of `priv/pnr/Containerfile`) and prints Fmax, slack
+  and utilisation against `--clock-mhz` (default 100). The clock is also
+  the scheduling target of the generated kernels. `--bitstream` writes
+  `<out>/<name>.bit` too; `--seed` is the placer seed.
   """
   use Mix.Task
 
@@ -37,7 +45,16 @@ defmodule Mix.Tasks.ExHdl.Gen.Sv do
   @impl true
   def run(args) do
     {opts, mods} =
-      OptionParser.parse!(args, strict: [out: :string, synth: :boolean, family: :string])
+      OptionParser.parse!(args, strict: [
+          out: :string,
+          synth: :boolean,
+          family: :string,
+          pnr: :boolean,
+          clock_mhz: :integer,
+          bitstream: :boolean,
+          seed: :integer
+        ]
+      )
 
     out = Keyword.get(opts, :out, "hdl/generated")
 
@@ -64,7 +81,7 @@ defmodule Mix.Tasks.ExHdl.Gen.Sv do
             do: write(out, file, src)
       end
 
-      if kernels?, do: Enum.each(mod.ex_hdl_kernels(), &kernel(&1, out, opts[:synth]))
+      if kernels?, do: Enum.each(mod.ex_hdl_kernels(), &kernel(&1, out, opts))
       if rtl?, do: Enum.each(mod.ex_hdl_rtl(), &rtl(&1, out, opts))
     end
   end
@@ -81,6 +98,8 @@ defmodule Mix.Tasks.ExHdl.Gen.Sv do
         {:error, msg} -> Mix.shell().error("  yosys: #{msg}")
       end
     end
+
+    if opts[:pnr], do: pnr(files, top.name, top.name, out, opts)
   end
 
   defp rtl(other, _out, _opts),
@@ -91,12 +110,12 @@ defmodule Mix.Tasks.ExHdl.Gen.Sv do
       "#{u.bram18} RAMB18, #{u.uram} URAM, #{u.carry} CARRY, #{u.srl} SRL, #{u.lutram} LUTRAM"
   end
 
-  defp kernel(spec, out, synth?) do
+  defp kernel(spec, out, opts) do
     name = Keyword.fetch!(spec, :name)
     fun = Keyword.fetch!(spec, :fun)
     args = Keyword.fetch!(spec, :args)
 
-    case ExHdl.DSP.scan_to_sv(fun, args, Keyword.drop(spec, [:fun, :args])) do
+    case ExHdl.DSP.scan_to_sv(fun, args, Keyword.drop(spec, [:fun, :args]) ++ timing(opts)) do
       {:ok, d} ->
         write(out, "#{name}.sv", d.source)
 
@@ -105,7 +124,8 @@ defmodule Mix.Tasks.ExHdl.Gen.Sv do
             "tdata #{d.in_width} -> #{d.out_width} bits"
         )
 
-        if synth?, do: synth(d)
+        if opts[:synth], do: synth(d)
+        if opts[:pnr], do: pnr(%{"#{d.name}.sv" => d.source}, d.name, name, out, opts)
 
       {:error, error} ->
         Mix.raise("#{name}: " <> Exception.message(error))
@@ -119,6 +139,35 @@ defmodule Mix.Tasks.ExHdl.Gen.Sv do
 
       {:error, msg} ->
         Mix.shell().error("  yosys: #{msg}")
+    end
+  end
+
+  defp timing(opts), do: if(opts[:clock_mhz], do: [clock_mhz: opts[:clock_mhz]], else: [])
+
+  defp pnr(sources, top, name, out, opts) do
+    mhz = Keyword.get(opts, :clock_mhz, 100)
+
+    pnr_opts =
+      [clock_mhz: mhz, bitstream: opts[:bitstream] || false] ++
+        if(opts[:seed], do: [seed: opts[:seed]], else: [])
+
+    pnr_opts =
+      if opts[:bitstream], do: [workdir: Path.join(out, "#{name}_pnr")] ++ pnr_opts, else: pnr_opts
+
+    case ExHdl.Synth.PnR.run(sources, top, pnr_opts) do
+      {:ok, r} ->
+        fmax = if r.fmax_mhz, do: "#{Float.round(r.fmax_mhz, 1)} MHz", else: "n/a"
+
+        Mix.shell().info(
+          "  nextpnr xc7z020: Fmax #{fmax} at target #{mhz} MHz, " <>
+            "#{if r.met, do: "met", else: "NOT met"}, " <>
+            Enum.map_join(r.utilization, ", ", fn {k, {u, _}} -> "#{k} #{u}" end)
+        )
+
+        if r.bitstream, do: Mix.shell().info("  bitstream #{r.bitstream}")
+
+      {:error, msg} ->
+        Mix.shell().error("  pnr: #{msg}")
     end
   end
 
