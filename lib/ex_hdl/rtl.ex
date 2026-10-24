@@ -122,6 +122,8 @@ defmodule ExHdl.RTL do
     switch: 2,
     instance: 2,
     instance: 3,
+    expose: 1,
+    expose: 2,
     memory: 2,
     read_port: 2,
     write_port: 2,
@@ -416,6 +418,20 @@ defmodule ExHdl.RTL do
   `params:` black-box parameters; `connect:`.
   """
   def instance(name, module, opts \\ []), do: Builder.instance(name, module, opts)
+
+  @doc """
+  Re-exports the data ports of an instance as ports of the current module:
+  each child output `p` becomes an output `<prefix>p` driven by the
+  instance, each child input an input `<prefix>p` driving it (connect
+  inputs either here or with `connect:`, not both). Hosting a user-supplied
+  module in a top is `instance(:u, mod) |> expose()`.
+
+  Options: `prefix:` (default `""`), `only:` and `except:` (lists of child
+  port names), `dirs:` (default `[:input, :output]`). Port domains follow
+  the instance's domain mapping. Returns a map from child port name to the
+  handle of the new port.
+  """
+  def expose(handles, opts \\ []), do: Builder.expose(handles, opts)
 
   @doc """
   A memory. Options: `width:`, `depth:` (required), `init:` (list or

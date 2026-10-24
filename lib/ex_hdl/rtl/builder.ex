@@ -773,6 +773,62 @@ defmodule ExHdl.RTL.Builder do
   def instance(_name, other, _opts),
     do: raise(ElaborationError, "instance expects an ExHdl.RTL.Module, got #{inspect(other)}")
 
+  def expose(%{__instance__: inst} = handles, opts) do
+    b = current!()
+    %{module: mod} = Enum.find(b.instances, &(&1.name == inst))
+    prefix = to_string(Keyword.get(opts, :prefix, ""))
+    only = Keyword.get(opts, :only)
+    except = Keyword.get(opts, :except, [])
+    dirs = Keyword.get(opts, :dirs, [:input, :output])
+
+    data = for p <- mod.ports, p.role == :data, p.dir != :inout, do: p.name
+
+    for n <- (only || []) ++ except,
+        n not in data,
+        do: raise(ElaborationError, "expose: instance #{inst} has no data port #{n}")
+
+    ports =
+      for p <- mod.ports,
+          p.role == :data,
+          p.dir in dirs,
+          p.dir != :inout,
+          only == nil or p.name in only,
+          p.name not in except,
+          do: p
+
+    for p <- ports, into: %{} do
+      name = :"#{prefix}#{p.name}"
+      wire = handles[p.name]
+      dom = current!().signals[hd(wire.args)].domain
+
+      if Map.has_key?(current!().signals, name) do
+        raise ElaborationError,
+              "expose: #{name} for port #{p.name} of instance #{inst} is declared already" <>
+                if(name == hd(wire.args),
+                  do: " as the instance wire; pass a prefix: other than \"#{inst}_\"",
+                  else: "; pass prefix: or except:"
+                )
+      end
+
+      port_opts = if dom, do: [domain: dom], else: []
+
+      case p.dir do
+        :input ->
+          h = input(name, p.type, port_opts)
+          assign(wire, h)
+          {p.name, h}
+
+        :output ->
+          h = output(name, p.type, port_opts)
+          assign(h, wire)
+          {p.name, h}
+      end
+    end
+  end
+
+  def expose(other, _opts),
+    do: raise(ElaborationError, "expose expects instance handles, got #{inspect(other)}")
+
   defp inout_conn(_b, _inst, _p, nil), do: nil
 
   defp inout_conn(b, inst, p, %Expr{op: :sig, args: [n, owner]}) when owner == b.owner do
