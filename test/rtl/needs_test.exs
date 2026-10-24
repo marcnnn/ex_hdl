@@ -201,7 +201,7 @@ defmodule ExHdl.RTL.NeedsTest do
       bb =
         black_box "inv_stub",
           sim_sources: %{
-            "inv_stub.sv" =>
+            "sim/inv_stub.sv" =>
               "module inv_stub (input logic [7:0] a, output logic [7:0] y);\n" <>
                 "  assign y = ~a;\nendmodule\n"
           } do

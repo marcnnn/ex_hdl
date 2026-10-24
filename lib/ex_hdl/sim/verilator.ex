@@ -105,7 +105,8 @@ defmodule ExHdl.Sim.Verilator do
 
     sv_files =
       for {name, src} <- Enum.sort(sources) do
-        path = Path.join(tmp, name)
+        path = Path.join([tmp, "src", name])
+        File.mkdir_p!(Path.dirname(path))
         File.write!(path, src)
         path
       end
