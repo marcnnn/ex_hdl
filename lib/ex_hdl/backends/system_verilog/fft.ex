@@ -82,45 +82,67 @@ defmodule ExHdl.Backends.SystemVerilog.FFT do
 
   # -- one SDF stage ------------------------------------------------------------------
 
+  # Stages with at least this many words per half keep first halves and
+  # differences in one memory.
+  @share_min 256
+
   defp stage(%FFT{} = spec, s) do
-    n = spec.n
     sb = spec.stages
-    h = n >>> (s + 1)
+    h = spec.n >>> (s + 1)
     m = 1 <<< s
     b = spec.format.bits
     w2 = 2 * b
     hb = max(Stream.clog2(h), 1)
-    addr = fn var -> if h == 1, do: "1'b0", else: "#{var}[#{hb - 1}:0]" end
-    mem_index = fn var -> if h == 1, do: "0", else: var end
     halve? = s >= sb - spec.shifts
     i = s
-    next = s + 1
 
-    {bf_code, lb} =
+    # d: cycles from a partner's arrival to the write of its difference
+    {bf_code, d} =
       if s == 0, do: butterfly0(spec, i, halve?), else: butterfly(spec, i, halve?, m)
 
+    shared? = h >= @share_min and h > d
+
+    v = %{i: i, h: h, hb: hb, w2: w2, d: d, sb: sb, s: s}
+
     code = [
-      "\n  // stage #{s}: blocks of #{2 * h}, #{if s == 0, do: "no twiddles", else: "#{m} twiddles"}#{if halve?, do: ", halving", else: ""}\n",
+      "\n  // stage #{s}: blocks of #{2 * h}, ",
+      if(s == 0, do: "no twiddles", else: "#{m} twiddles"),
+      if(halve?, do: ", halving", else: ""),
+      if(shared?, do: ", one memory", else: ""),
+      "\n",
       "  logic [#{sb - 1}:0] c_#{i};\n",
       "  logic sh_#{i};\n",
       "  assign sh_#{i} = c_#{i}[#{sb - 1 - s}];\n",
       "  always_ff @(posedge clk)\n",
       "    if (!rst_n) c_#{i} <= '0;\n",
       "    else if (ce && iv_#{i}) c_#{i} <= c_#{i} + #{sb}'d1;\n",
-      "  logic [#{w2 - 1}:0] am_#{i} [#{h}];\n",
       "  logic [#{w2 - 1}:0] a1_#{i}, b1_#{i};\n",
       "  logic v1_#{i};\n",
-      "  always_ff @(posedge clk)\n",
-      "    if (ce && iv_#{i} && !sh_#{i}) am_#{i}[#{mem_index.(addr.("c_#{i}"))}] <= id_#{i};\n",
-      "  always_ff @(posedge clk)\n",
-      "    if (ce) begin\n",
-      "      a1_#{i} <= am_#{i}[#{mem_index.(addr.("c_#{i}"))}];\n",
-      "      b1_#{i} <= id_#{i};\n",
-      "    end\n",
+      "  always_ff @(posedge clk) if (ce) b1_#{i} <= id_#{i};\n",
       "  always_ff @(posedge clk)\n",
       "    if (!rst_n) v1_#{i} <= 1'b0;\n",
       "    else if (ce) v1_#{i} <= iv_#{i} && sh_#{i};\n",
-      bf_code,
+      if(shared?, do: shared_memory(v), else: two_memories(v)),
+      bf_code
+    ]
+
+    # cycles from a symbol's last input to its last output of this stage
+    %{code: code, latency: h + d + 1}
+  end
+
+  defp mem_addr(%{h: 1}, _var), do: "0"
+  defp mem_addr(%{hb: hb}, var), do: "#{var}[#{hb - 1}:0]"
+
+  # First halves in am (written on arrival), differences in bm (written as
+  # they leave the butterfly, read in the cycles after the block's last sum).
+  defp two_memories(%{i: i, h: h, hb: hb, w2: w2} = v) do
+    next = i + 1
+
+    [
+      "  logic [#{w2 - 1}:0] am_#{i} [#{h}];\n",
+      "  always_ff @(posedge clk)\n",
+      "    if (ce && iv_#{i} && !sh_#{i}) am_#{i}[#{mem_addr(v, "c_#{i}")}] <= id_#{i};\n",
+      "  always_ff @(posedge clk) if (ce) a1_#{i} <= am_#{i}[#{mem_addr(v, "c_#{i}")}];\n",
       "  // sums leave at once, differences after the block\n",
       "  logic [#{w2 - 1}:0] bm_#{i} [#{h}];\n",
       "  logic [#{hb - 1}:0] cw_#{i}, e_#{i};\n",
@@ -148,8 +170,8 @@ defmodule ExHdl.Backends.SystemVerilog.FFT do
       "    end\n",
       "  always_ff @(posedge clk)\n",
       "    if (ce) begin\n",
-      "      if (bfv_#{i}) bm_#{i}[#{mem_index.(addr.("cw_#{i}"))}] <= bfb_#{i};\n",
-      "      rd_#{i} <= bm_#{i}[#{mem_index.(addr.("e_#{i}"))}];\n",
+      "      if (bfv_#{i}) bm_#{i}[#{mem_addr(v, "cw_#{i}")}] <= bfb_#{i};\n",
+      "      rd_#{i} <= bm_#{i}[#{mem_addr(v, "e_#{i}")}];\n",
       "      top_#{i} <= bft_#{i};\n",
       "    end\n",
       "  logic iv_#{next};\n",
@@ -157,9 +179,60 @@ defmodule ExHdl.Backends.SystemVerilog.FFT do
       "  assign iv_#{next} = tv_#{i} || bv_#{i};\n",
       "  assign id_#{next} = tv_#{i} ? top_#{i} : rd_#{i};\n"
     ]
+  end
 
-    # cycles from a symbol's last input to its last output of this stage
-    %{code: code, latency: h + lb + 2}
+  # One memory of h words. A first half is written d cycles after it
+  # arrives, a difference d cycles after its partner arrived, so the one
+  # write port never sees both. The differences of a block are read in the
+  # h cycles after its last partner arrived (the next block's first halves
+  # come in meanwhile and overwrite them only later), and go out through
+  # d registers, so they leave after the block's sums and before the next
+  # block's. Needs h > d.
+  defp shared_memory(%{i: i, h: h, hb: hb, w2: w2, d: d} = v) do
+    next = i + 1
+
+    [
+      "  logic [#{w2 - 1}:0] mm_#{i} [#{h}];\n",
+      "  logic [#{w2 - 1}:0] ad_#{i} [#{d}];\n",
+      "  logic [#{hb - 1}:0] aa_#{i} [#{d}];\n",
+      "  logic [#{d - 1}:0] av_#{i};\n",
+      "  logic [#{hb - 1}:0] cw_#{i}, e_#{i};\n",
+      "  logic pe_#{i}, tv_#{i};\n",
+      "  logic [#{d}:0] ev_#{i};\n",
+      "  logic [#{w2 - 1}:0] er_#{i} [#{d}];\n",
+      "  logic [#{w2 - 1}:0] top_#{i};\n",
+      "  always_ff @(posedge clk)\n",
+      "    if (!rst_n) begin\n",
+      "      av_#{i} <= '0; ev_#{i} <= '0; cw_#{i} <= '0; e_#{i} <= '0; pe_#{i} <= 1'b0; tv_#{i} <= 1'b0;\n",
+      "    end else if (ce) begin\n",
+      "      av_#{i} <= {av_#{i}[#{d - 2}:0], iv_#{i} && !sh_#{i}};\n",
+      "      ev_#{i} <= {ev_#{i}[#{d - 1}:0], pe_#{i}};\n",
+      "      tv_#{i} <= bfv_#{i};\n",
+      "      if (bfv_#{i}) cw_#{i} <= cw_#{i} + #{hb}'d1;\n",
+      "      if (iv_#{i} && sh_#{i} && c_#{i}[#{hb - 1}:0] == #{hb}'d#{h - 1}) pe_#{i} <= 1'b1;\n",
+      "      else if (pe_#{i} && e_#{i} == #{hb}'d#{h - 1}) pe_#{i} <= 1'b0;\n",
+      "      if (pe_#{i}) e_#{i} <= e_#{i} + #{hb}'d1;\n",
+      "    end\n",
+      "  always_ff @(posedge clk)\n",
+      "    if (ce) begin\n",
+      "      ad_#{i}[0] <= id_#{i};\n",
+      "      aa_#{i}[0] <= #{mem_addr(v, "c_#{i}")};\n",
+      "      for (int k = 1; k < #{d}; k++) begin\n",
+      "        ad_#{i}[k] <= ad_#{i}[k - 1];\n",
+      "        aa_#{i}[k] <= aa_#{i}[k - 1];\n",
+      "      end\n",
+      "      if (av_#{i}[#{d - 1}]) mm_#{i}[aa_#{i}[#{d - 1}]] <= ad_#{i}[#{d - 1}];\n",
+      "      else if (bfv_#{i}) mm_#{i}[cw_#{i}] <= bfb_#{i};\n",
+      "      a1_#{i} <= mm_#{i}[pe_#{i} ? e_#{i} : #{mem_addr(v, "c_#{i}")}];\n",
+      "      er_#{i}[0] <= a1_#{i};\n",
+      "      for (int k = 1; k < #{d}; k++) er_#{i}[k] <= er_#{i}[k - 1];\n",
+      "      top_#{i} <= bft_#{i};\n",
+      "    end\n",
+      "  logic iv_#{next};\n",
+      "  logic [#{w2 - 1}:0] id_#{next};\n",
+      "  assign iv_#{next} = tv_#{i} || ev_#{i}[#{d}];\n",
+      "  assign id_#{next} = tv_#{i} ? top_#{i} : er_#{i}[#{d - 1}];\n"
+    ]
   end
 
   # Stage 0: w = 1, {a + b, a - b}; returns the code and its pipeline length.
