@@ -43,15 +43,28 @@ defmodule ExHdl.Synth.Yosys do
             "synth_xilinx -family #{family} -noiopad -top #{top}; " <>
             "tee -q -o #{stat} stat -json"
 
-        case System.cmd(yosys, ["-q", "-p", script], stderr_to_stdout: true) do
+        logfile = Path.join(tmp, "yosys.log")
+
+        case System.cmd(yosys, ["-q", "-l", logfile, "-p", script], stderr_to_stdout: true) do
           {_, 0} -> {:ok, summarize(stat |> File.read!() |> JSON.decode!())}
-          {log, status} -> {:error, "yosys exited with #{status}:\n#{log}"}
+          {out, status} -> {:error, failure(status, out, logfile)}
         end
       after
         File.rm_rf!(tmp)
       end
     end
   end
+
+  # `-q` hides everything but errors, so a crash can leave stdout empty; the
+  # `-l` log file still has the last pass that ran.
+  defp failure(status, out, logfile) do
+    log = if File.exists?(logfile), do: logfile |> File.read!() |> tail(40), else: ""
+    signal = if status > 128, do: " (signal #{status - 128}; killed, out of memory?)", else: ""
+    out = if String.trim(out) == "", do: "(no output)", else: out
+    "yosys exited with #{status}#{signal}:\n#{out}\nlast log lines:\n#{log}"
+  end
+
+  defp tail(text, n), do: text |> String.split("\n") |> Enum.take(-n) |> Enum.join("\n")
 
   defp summarize(%{"design" => %{"num_cells_by_type" => cells}}) do
     count = fn pred ->
