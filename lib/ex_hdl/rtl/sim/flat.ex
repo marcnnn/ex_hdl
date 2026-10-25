@@ -108,10 +108,8 @@ defmodule ExHdl.RTL.Sim.Flat do
       ir: {:model, state_key, model, inputs, outputs}
     }
 
-    doms =
-      for d <- m.domains, into: %{} do
-        {Map.fetch!(clocks, hd(d.clock.args)), d.name}
-      end
+    # {clock id, black box domain} pairs: several domains may share a clock
+    doms = for d <- m.domains, do: {Map.fetch!(clocks, hd(d.clock.args)), d.name}
 
     params = if params == [], do: m.params, else: params
 
