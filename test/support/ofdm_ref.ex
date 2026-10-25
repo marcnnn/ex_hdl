@@ -26,7 +26,9 @@ defmodule ExHdl.Test.OFDMRef do
       nil ->
         alias ExSdr.DVBT.{Channel, OFDM, TestSignal, Transmitter}
         o = [constellation: constellation, code_rate: {1, 2}, guard_interval: {1, 32}, cell_id: 0]
-        ts = TestSignal.ts_packets(168)
+
+        # whole 126-word blocks of the bit interleaver: 168 packets for QPSK and 16-QAM, 504 for 64-QAM
+        ts = TestSignal.ts_packets(if constellation == :qam64, do: 504, else: 168)
         x = ts |> Transmitter.symbols(o) |> Enum.take(symbols) |> OFDM.modulate(o)
         cfo = Keyword.get(opts, :cfo, 0.37)
         snr = Keyword.get(opts, :snr, 12.0)
