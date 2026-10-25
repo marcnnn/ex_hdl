@@ -219,13 +219,10 @@ defmodule ExHdl.Frame do
       else
         parsed = Enum.map(elems, &post/1)
 
-        case Enum.uniq_by(parsed, fn {_, shift, lo, hi} -> {shift, lo, hi} end) do
-          [{_, shift, lo, hi}] ->
-            lo = max(lo || tlo, tlo)
-            hi = min(hi || thi, thi)
-
+        case common(parsed, {tlo, thi}, ranges) do
+          {:ok, shift, lo, hi, const, raw} ->
             forms =
-              for {form, _, _, _} <- parsed do
+              for form <- raw do
                 for {key, coeff} <- form, into: %{} do
                   case key do
                     :c -> {:c, coeff}
@@ -234,34 +231,63 @@ defmodule ExHdl.Frame do
                 end
               end
 
-            consts = forms |> Enum.map(&Map.get(&1, :c, 0)) |> Enum.uniq()
+            o = %{type: type, forms: forms, const: const, shift: shift, lo: lo, hi: hi}
+            {:cont, {:ok, acc ++ [o]}}
 
-            # without a clip the value must fit the output type
-            fits =
-              Enum.all?(parsed, fn {form, s, clo, chi} ->
-                {a, b} = Linear.range(form, ranges)
-                (clo != nil and chi != nil) or (a >>> s >= tlo and b >>> s <= thi)
-              end)
-
-            cond do
-              length(consts) != 1 ->
-                {:halt, error("#{block.name}: different constants per output phase")}
-
-              not fits ->
-                {:halt,
-                 error("#{block.name}: an output can leave its type's range without saturation")}
-
-              true ->
-                o = %{type: type, forms: forms, const: hd(consts), shift: shift, lo: lo, hi: hi}
-                {:cont, {:ok, acc ++ [o]}}
-            end
-
-          _ ->
-            {:halt, error("#{block.name}: output phases round or saturate differently")}
+          {:error, why} ->
+            {:halt, error("#{block.name}: #{why}")}
         end
       end
     end)
   end
+
+  # One rounding for all output phases: the same shift, constant and
+  # saturation bounds. A phase whose clip the analysis dropped (its range
+  # fits) takes the others' bounds; a phase without inputs (all taps
+  # zero) is a constant, which must be what the common rounding gives.
+  defp common(parsed, {tlo, thi}, ranges) do
+    {consts, vars} = Enum.split_with(parsed, fn {form, _, _, _} -> constant?(form) end)
+
+    shifts = vars |> Enum.map(&elem(&1, 1)) |> Enum.uniq()
+    clips = for({_, _, lo, hi} <- vars, lo != nil, do: {lo, hi}) |> Enum.uniq()
+    k = vars |> Enum.map(fn {form, _, _, _} -> Map.get(form, :c, 0) end) |> Enum.uniq()
+
+    with {:ok, shift} <- one(shifts, 0, "output phases round differently"),
+         {:ok, clip} <- one(clips, nil, "output phases saturate differently"),
+         {:ok, const} <- one(k, 0, "different constants per output phase") do
+      {lo, hi} =
+        case clip do
+          nil -> {tlo, thi}
+          {lo, hi} -> {max(lo, tlo), min(hi, thi)}
+        end
+
+      fits =
+        Enum.all?(vars, fn {form, _, clo, _} ->
+          {a, b} = Linear.range(form, ranges)
+          clo != nil or (a >>> shift >= lo and b >>> shift <= hi)
+        end)
+
+      const_ok =
+        Enum.all?(consts, fn {form, _, _, _} ->
+          Map.get(form, :c, 0) == (const >>> shift) |> max(lo) |> min(hi)
+        end)
+
+      cond do
+        not fits -> {:error, "an output can leave its type's range without saturation"}
+        not const_ok -> {:error, "a constant output phase does not match the others' rounding"}
+        true -> {:ok, shift, lo, hi, const, Enum.map(parsed, &phase_form(&1, const))}
+      end
+    end
+  end
+
+  defp phase_form({form, _, _, _}, const),
+    do: if(constant?(form), do: %{c: const}, else: form)
+
+  defp constant?(form), do: Enum.all?(Map.keys(form), &(&1 == :c))
+
+  defp one([], default, _why), do: {:ok, default}
+  defp one([x], _default, _why), do: {:ok, x}
+  defp one(_, _default, why), do: {:error, why}
 
   defp post({:clip, inner, lo, hi}) do
     {form, shift, _, _} = post(inner)
