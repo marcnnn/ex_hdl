@@ -429,7 +429,7 @@ defmodule ExHdl.Backends.SystemVerilog.RTL do
   defp ex(%Expr{op: :muxn, type: t} = e, st) do
     {name, st} = fresh(st)
     {body, st} = case_table(name, e, "", st)
-    {name, st |> add_temp(name, t, body) |> use_all(name)}
+    {Atom.to_string(name), st |> add_temp(name, t, body) |> use_all(name)}
   end
 
   defp ex(%Expr{op: :cat, args: [items]}, st) do

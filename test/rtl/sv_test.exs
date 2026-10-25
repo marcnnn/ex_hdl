@@ -226,4 +226,21 @@ defmodule ExHdl.RTL.SVTest do
 
     assert {:ok, _} = ExHdl.Synth.Yosys.utilization(SV.generate(m), "inv_wrap")
   end
+
+  test "an indexed mux inside a cat generates" do
+    m =
+      module "cat_muxn" do
+        sel = input(:sel, 2)
+        y = output(:y, 8)
+        r = for i <- 0..3, do: reg(:"r#{i}", 4)
+
+        sync do
+          for x <- r, do: x <~ add_wrap(x, 1)
+        end
+
+        y <~ cat([mux(sel, r), const(0, 4)])
+      end
+
+    assert SV.generate(m)["cat_muxn.sv"] =~ ~r/assign y = \{_t\d+, 4'(d|h|b)0\}/
+  end
 end
