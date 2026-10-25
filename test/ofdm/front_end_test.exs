@@ -75,7 +75,7 @@ defmodule ExHdl.OFDM.FrontEndTest do
   test "QPSK with the hardware FFT (ExHdl.FFT) in the chain: the same bits, one stream from samples to code bits" do
     {d, bench} = check(:qpsk, 2, 12.0, :hardware, "fe_qpsk_hw")
     assert d.fft.latency > 4000
-    # eight symbols, the FFT's latency and one more symbol of processing
-    assert bench.cycle < (@symbols + 3) * 2112 + d.fft.latency + 3000
+    # the sink takes 0.8 bit per clock on average: 8 * 3024 bits, plus the FFT's latency
+    assert bench.cycle < round(@symbols * 3024 / 0.8) + d.fft.latency + 6000
   end
 end

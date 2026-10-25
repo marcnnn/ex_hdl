@@ -473,3 +473,79 @@ points the memories are 8 RAMB36 for the stages, 8 for the twiddle ROMs
 (the reference's table per stage, `n - 1` words in all) and 8 for the
 reorder buffer; the twiddle ROMs could shrink by sharing one table
 between stages or by symmetry where the quantized values allow it.
+
+## OFDM front end in hardware
+
+`ExHdl.OFDM.*` turns `ExSdr.Comm.OFDM.FixedFrontEnd` (DVB-T 2k, QPSK, 16-QAM
+and 64-QAM) into one AXI4-Stream pipeline, bit-exact: sc16 samples in,
+code bits out (hard decisions, as ex_sdr produces them; there are no soft
+bits in `FixedFrontEnd`).
+
+| Stage | Module | Structure |
+|---|---|---|
+| frequency correction | `Correct` | stream kernel, state `n * inc mod 2^32`, NCO table, 1 sample per clock |
+| guard removal | `Guard` | counter, `tlast` per symbol |
+| FFT | `ExHdl.FFT` (hdl/frame) | composition point below |
+| channel estimate, equaliser, decisions | `Equalise`, `Equaliser`, `Plan` | frame kernel, double-buffered symbol RAM |
+| symbol and bit deinterleaver | `Permute` | double-buffered RAM, address ROM, any gather table |
+| bit unpacking | `Unpack` | |
+
+`Permute` is the generic frame permutation (`ExSdr.Comm.Permutation`
+tables, several tables used in turn): one item per clock in and out, a
+bank is read while the other is written, `tlast` per block.
+
+The equaliser needs the whole symbol, so it is a stream kernel with a
+frame memory (`memories:`): a writer fills the inactive bank with the FFT
+output, a sequencer sends row numbers of a schedule (`Plan`) through the
+kernel, one per clock. The schedule walks a symbol in interpolation order
+(pilot, pilot, the data carriers between them, next pilot, ...), so every
+pilot's channel estimate is computed once and shifted through two state
+registers. The kernel uses the nx_fixed operations of `FixedFrontEnd`
+unchanged (same constants, rounding, saturation), the width check proves
+every width, and the loop is one cycle (`ii = 1`).
+
+test/ofdm: each stage against the stage of `FixedFrontEnd` cut out in
+test/support/ofdm_ref.ex (whose chain equals `FixedFrontEnd.run/4`, checked
+first), then the chain with the software FFT and with `ExHdl.FFT` in the
+design, on ExSdr's DVB-T transmitter output with a carrier offset and
+noise, random valid and ready.
+
+### FFT composition point
+
+Two AXI4-Stream connections, `tdata = {im[15:0], re[15:0]}` signed in the
+data format (q(16, 12)): `fft_in` carries the corrected symbol without
+guard (2048 beats, `tlast` on the last), `fft_out` takes the 2048 bins in
+natural order. The FFT must be `ExSdr.DSP.FFT.fft/2` with `shifts: 5`
+and q(16, 15) twiddles, which `ExHdl.FFT` is. `FrontEnd.build(spec, fft:
+:hardware)` instantiates it, `fft: nil` leaves the ports open.
+
+Yosys `synth_xilinx` (Zynq-7020), DVB-T 2k:
+
+| Block | latency | LUT | FF | DSP48E1 | RAMB18 |
+|---|---|---|---|---|---|
+| Correct | 8 | 269 | 261 | 4 | 4 |
+| Equaliser QPSK | 19 | 616 | 592 | 8 | 20 |
+| Equaliser 16-QAM | 23 | 831 | 763 | 14 | 20 |
+| Equaliser 64-QAM | 24 | 1055 | 844 | 18 | 20 |
+| Guard (2048 + 64) | 2 | 47 | 80 | 0 | 0 |
+| Cell deinterleaver (1512 x 2 bit, two tables) | n + 4 | 53 | 53 | 0 | 3 |
+| Bit deinterleaver QPSK / 16-QAM / 64-QAM | n + 4 | 54 / 87 / 286 | 47 / 51 / 55 | 0 | 1 |
+| Front end QPSK without FFT | | 1067 | 1044 | 12 | 28 |
+| Front end QPSK with `ExHdl.FFT` | | 4054 | 4237 | 52 | 40 |
+
+A symbol takes 1688 equaliser rows (176 pilots, 1512 data carriers) of
+the 2048 clocks of its FFT output.
+
+### Limits and what ex_sdr would need
+
+* The first sample after reset is the start of a guard interval of a
+  class 0 symbol (`FixedFrontEnd.run/4` has the same rule); cell tables
+  start with table 0. No synchroniser yet.
+* `FixedFrontEnd` exposes only the final bits. The tests copy its private
+  `graph/5` and `class_words/6` (test/support/ofdm_ref.ex). The minimal
+  ex_sdr refactor: make `nco/2`, `class_words/6` and `axis_index/3` public
+  (or a `stages/…` function returning corrected samples, FFT output and
+  words), so the hardware tests compare against the library instead of a
+  copy. `ExHdl.OFDM.Plan` rebuilds the pilot and weight constants from
+  `spec.ofdm` as `tables/3` does (float32 first); a public per-class table
+  function would remove that duplication. Nothing in ex_sdr was changed.
