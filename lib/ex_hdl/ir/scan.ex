@@ -21,7 +21,9 @@ defmodule ExHdl.IR.Scan do
     * `timing` - the `ExHdl.Target.Timing` model the schedule was made for.
     * `state_mem` - where the per-channel state lives (`:registers`,
       `:distributed`, `:block`, `:ultra`) and `ram_latency` its read latency
-      in cycles (0 for registers).
+      in cycles (0 for registers). `state_fold` is the number of memory
+      rows one channel's state word is spread over (1: one word per
+      channel); with `k > 1` the kernel accepts one sample every `k` cycles.
     * `args` - the kernel's arguments in order, each
       `%{arg: i, role: :sample | :state | :param | :opts, leaves: [%{index:, type:, shape:}]}`
       where `index` is the Nx parameter index of the tensor leaf.
@@ -47,6 +49,7 @@ defmodule ExHdl.IR.Scan do
     :timing,
     state_mem: :registers,
     ram_latency: 0,
+    state_fold: 1,
     args: [],
     memories: [],
     costs: %{},
@@ -78,6 +81,13 @@ defmodule ExHdl.Passes.Recurrence do
       per cycle. With the state in a memory (`state_mem:` other than
       `:registers`) the read is issued `ram_latency` cycles before the state
       is needed, so n >= L + ram_latency.
+    * `channels: n, state_fold: k` (state in a memory): each channel's state
+      word is spread over `k` rows of a `k` times narrower memory, read and
+      written one row per cycle, and the kernel accepts one sample every `k`
+      cycles (throughput `1/k`). The rows of one word are read in the `k`
+      cycles before the state is needed and written in the `k` cycles from
+      the write stage, so samples of one channel `n * k` cycles apart need
+      n * k >= L + ram_latency + k - 1.
     * otherwise: error, reporting the critical path.
   """
 
@@ -99,7 +109,8 @@ defmodule ExHdl.Passes.Recurrence do
     next_ids = flatten(next_state)
     state_params = Enum.reject(leaf_params, &is_nil/1)
 
-    with {:ok, style, ram_latency} <- state_mem(opts) do
+    with {:ok, style, ram_latency} <- state_mem(opts),
+         {:ok, fold} <- state_fold(opts, style) do
       groups =
         graph
         |> groups(leaf_params, next_ids)
@@ -133,7 +144,8 @@ defmodule ExHdl.Passes.Recurrence do
         pipeline_latency: pipeline_latency,
         timing: timing,
         state_mem: style,
-        ram_latency: ram_latency
+        ram_latency: ram_latency,
+        state_fold: fold
       }
 
       decide(scan, (worst && worst.sched) || %{}, opts)
@@ -165,6 +177,27 @@ defmodule ExHdl.Passes.Recurrence do
     end
   end
 
+  @doc """
+  The `:state_fold` of `opts` (default 1): `{:ok, k}`. Folding needs the
+  state in a memory.
+  """
+  def state_fold(opts, style) do
+    case Keyword.get(opts, :state_fold, 1) do
+      1 ->
+        {:ok, 1}
+
+      k when is_integer(k) and k > 1 and style != :registers ->
+        {:ok, k}
+
+      k when is_integer(k) and k > 1 ->
+        {:error,
+         "stream_scan: state_fold: needs the state in a memory (state_mem: other than :registers)"}
+
+      k ->
+        {:error, "stream_scan: state_fold: must be a positive integer, got #{inspect(k)}"}
+    end
+  end
+
   defp loop_cycles(sched, id) do
     case sched do
       %{^id => %{at: at}} -> Schedule.cycles_to_register(at)
@@ -173,7 +206,7 @@ defmodule ExHdl.Passes.Recurrence do
     end
   end
 
-  defp decide(%Scan{loop_latency: l, ram_latency: r} = scan, sched, opts) do
+  defp decide(%Scan{loop_latency: l, ram_latency: r, state_fold: k} = scan, sched, opts) do
     ii = Keyword.get(opts, :ii)
     channels = Keyword.get(opts, :channels)
 
@@ -197,6 +230,17 @@ defmodule ExHdl.Passes.Recurrence do
 
       is_integer(ii) and ii >= l ->
         {:ok, %{scan | ii: ii, channels: 1, throughput: 1 / ii}}
+
+      k > 1 and is_integer(channels) and channels * k >= l + r + k - 1 ->
+        {:ok, %{scan | ii: channels * k, channels: channels, throughput: 1 / k}}
+
+      k > 1 and is_integer(channels) ->
+        {:error,
+         message(
+           scan,
+           sched,
+           "needs #{l} cycles and the folded state memory #{r + k - 1} more, so more than channels: #{channels} times state_fold: #{k}"
+         )}
 
       is_integer(channels) and channels >= l + r ->
         {:ok, %{scan | ii: channels, channels: channels, throughput: 1.0}}

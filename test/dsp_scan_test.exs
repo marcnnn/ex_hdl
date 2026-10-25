@@ -154,6 +154,58 @@ defmodule ExHdl.DSPScanTest do
       assert msg =~ "state_mem: must be one of"
     end
 
+    test "a folded state memory takes one sample every state_fold cycles" do
+      {:ok, %{loop_latency: l}} = biquad(ii: :auto)
+      # n * k >= l + ram_latency + k - 1
+      n = div(l + 1 + 3 + 3, 4)
+
+      assert {:ok, %{channels: ^n, state_fold: 4, ii: ii, throughput: 0.25}} =
+               biquad(channels: n, state_mem: :block, state_fold: 4)
+
+      assert ii == 4 * n
+      assert {:error, %{message: msg}} = biquad(channels: n - 1, state_mem: :block, state_fold: 4)
+      assert msg =~ "folded state memory 4 more"
+      assert {:ok, %{state_fold: 1}} = biquad(channels: l + 1, state_mem: :block, state_fold: 1)
+      assert {:error, %{message: msg}} = biquad(channels: l, state_fold: 2)
+      assert msg =~ "state_fold: needs the state in a memory"
+      assert {:error, %{message: msg}} = biquad(channels: 20, state_mem: :block, state_fold: 0)
+      assert msg =~ "state_fold: must be a positive integer"
+    end
+
+    test "folded state memories merge while a row fits state_row_bits and the span fits" do
+      spec = DSP.cascade(for k <- 1..4, do: A.stage("eq#{k}"))
+
+      mems = fn extra ->
+        {:ok, d} =
+          DSP.scan_to_sv(
+            spec[:fun],
+            spec[:args],
+            Keyword.drop(spec, [:fun, :args]) ++
+              [state_mem: :ultra, channel_params: :all, state_fold: 4] ++ extra
+          )
+
+        d.state_memories
+      end
+
+      # one memory per stage that reads state: two per biquad
+      separate = mems.(channels: 64, state_row_bits: 0)
+      assert length(separate) == 8
+      assert Enum.all?(separate, &(&1.depth == 256 and &1.width == div(&1.bits + 3, 4)))
+      total = separate |> Enum.map(& &1.bits) |> Enum.sum()
+      biquad = div(total, 4)
+
+      # two biquads per 72-bit row
+      assert [%{bits: b, width: w}, %{bits: b, width: w}] = mems.(channels: 64)
+      assert b == 2 * biquad and w == div(b + 3, 4) and w <= 72
+
+      # with 6 channels a sample of the same channel follows after 24
+      # cycles: the span of two biquads does not fit, about one does
+      short = mems.(channels: 6)
+      assert length(short) == 4
+      assert short |> Enum.map(& &1.bits) |> Enum.sum() == total
+      assert Enum.all?(short, &(&1.bits < 2 * biquad))
+    end
+
     test "per-channel parameters, tid and unknown names are checked" do
       {:ok, scan} = biquad(ii: :auto)
       sv = ExHdl.Backends.SystemVerilog.Scan

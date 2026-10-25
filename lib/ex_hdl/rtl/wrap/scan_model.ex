@@ -11,7 +11,8 @@ defmodule ExHdl.RTL.Wrap.ScanModel do
       (2 entries, `2 * lanes` for variable rate, rounded up to a power of
       two) has room for a full push;
     * `s_axis_tready = ce and issue_ok`, `issue_ok` false between two
-      samples of an `ii: n` kernel (one sample every `n` enabled cycles),
+      samples of an `ii: n` kernel (one sample every `n` enabled cycles)
+      or of a kernel with a folded state memory (every `state_fold`),
       while new parameters are pending, and during the state clear after
       reset (`busy`);
     * an accepted sample's outputs enter the output buffer `latency - 1`
@@ -72,10 +73,11 @@ defmodule ExHdl.RTL.Wrap.ScanModel do
       param_ts: param_ts,
       init: init_state,
       l: l,
-      depth: max(max(l, d.write_stage || 0), 1),
+      depth: max(max(l, (d.write_stage || 0) + d.state_fold - 1), 1),
       ob_depth: ob_depth,
       nl: nl,
-      gap: d.channels == 1 and d.ii > 1,
+      gap: if(d.channels == 1, do: d.ii, else: d.state_fold),
+      clear_rows: d.channels * d.state_fold,
       clear_on_reset: d.state_mem == :registers or d.busy,
       out_type: Keyword.get(opts, :out_type, {:u, d.out_width})
     }
@@ -117,7 +119,7 @@ defmodule ExHdl.RTL.Wrap.ScanModel do
     %{
       st
       | pipe: List.duplicate(nil, cfg.depth),
-        gap: cfg.d.ii - 1,
+        gap: cfg.gap - 1,
         ch: 0,
         p_q: params(cfg, inputs),
         p_pending: false,
@@ -153,7 +155,7 @@ defmodule ExHdl.RTL.Wrap.ScanModel do
   defp put_if(map, false, _k, _v), do: map
 
   defp issue_ok?(st) do
-    gap_ok = not st.cfg.gap or st.gap == st.cfg.d.ii - 1
+    gap_ok = st.gap == st.cfg.gap - 1
     gap_ok and not st.p_pending and not st.st_clr
   end
 
@@ -193,7 +195,7 @@ defmodule ExHdl.RTL.Wrap.ScanModel do
       cond do
         not ce -> st.gap
         vld_0 -> 0
-        st.gap == cfg.d.ii - 1 -> st.gap
+        st.gap == cfg.gap - 1 -> st.gap
         true -> st.gap + 1
       end
 
@@ -214,7 +216,7 @@ defmodule ExHdl.RTL.Wrap.ScanModel do
     {st_clr, addr} =
       cond do
         not st.st_clr -> {false, 0}
-        st.st_clr_addr == cfg.d.channels - 1 -> {false, st.st_clr_addr + 1}
+        st.st_clr_addr == cfg.clear_rows - 1 -> {false, st.st_clr_addr + 1}
         true -> {true, st.st_clr_addr + 1}
       end
 

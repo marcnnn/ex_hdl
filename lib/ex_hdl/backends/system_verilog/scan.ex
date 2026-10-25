@@ -45,6 +45,31 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   and no sample is accepted; `state_init: :initial` puts `:init` into the
   memory's initial contents instead (no sweep, but reset does not clear).
 
+  `state_fold: k` spreads a channel's state word over `k` rows of a memory
+  `k` times narrower and `k` times deeper (row `r` of channel `ch` at
+  `ch * k + r`), for states wider than they are deep. The memory keeps one
+  port, so the kernel accepts one sample every `k` enabled cycles
+  (throughput `1/k`; `s_axis_tready` drops for `k - 1` cycles after each
+  sample). The rows are read one per cycle in the `k` stages before the
+  state stage and written one per cycle from the write stage on. The
+  datapath is not shared over the `k` cycles, so the DSP count does not
+  change; folding pays where the stream has the idle cycles anyway (a
+  1024 channel strip at 48 kHz on 250 MHz uses 1024 of 5208 cycles per
+  frame).
+
+  Every stage that reads state has its own memory, and a memory takes at
+  least one UltraRAM (72 bits) however narrow it is. So with folding,
+  consecutive memories merge while a row stays within `state_row_bits`
+  (default 72) and the merged read-to-write span fits `channels * k`
+  cycles; the later groups' state waits in pipeline registers from the
+  first group's stage, the earlier groups' next state until the last
+  write. ex_audio's strip (four biquads, gate, compressor: 636 bits in 13
+  memories, 17 UltraRAMs at 1024 channels) with `k = 4` becomes 3
+  memories of 66, 66 and 28 bits by 4096 rows, 3 UltraRAMs, for about
+  13500 more pipeline register bits (`state_row_bits: 36`: 5 UltraRAMs,
+  6200 bits; 0: no merging, 13 UltraRAMs). `Design.state_memories` has
+  the shapes.
+
   ## Per-channel parameters
 
   `channel_params: [name, ...]` (or `:all`) reads those parameter arguments
@@ -168,6 +193,11 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       * `state_mem` - where the state lives (`:registers`, `:distributed`,
         `:block`, `:ultra`); `busy` is true when the module has a `busy`
         output (state clear after reset).
+      * `state_fold` - memory rows per channel state word, and
+        `state_memories` the state memories as
+        `%{bits:, width:, depth:}` (`bits` of state per channel, `width`
+        and `depth` of the memory: `width * state_fold >= bits`,
+        `depth = channels * state_fold`).
       * `channel_params` - the per-channel parameter leaves
         `%{name:, index:, type:, shape:, bits:, offset:}` in the `pc_data`
         word of `pc_width` bits; `pc_clock` `:shared` or `:separate`.
@@ -204,6 +234,8 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       :out_width,
       state_groups: [],
       state_mem: :registers,
+      state_fold: 1,
+      state_memories: [],
       channel_params: [],
       pc_width: 0,
       pc_clock: :shared,
@@ -251,6 +283,8 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       `:tree` keeps multipliers and an adder tree.
     * `:state_init` - `:clear` (default) or `:initial`, for `state_mem:`
       other than `:registers` (see "State in memory").
+    * `:state_row_bits` - with `state_fold: k`, the row width up to which
+      state memories merge (default 72; 0 keeps one memory per stage).
     * `:tid`, `:tuser` - channel input and sideband width.
     * `:channel_params`, `:param_mem`, `:param_ram_latency`, `:pc_clock` -
       per-channel parameters (see "Per-channel parameters").
@@ -303,7 +337,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     c = emit_units(c)
     {c, groups} = state_writes(c, scan)
 
-    for g <- groups do
+    for g <- groups, scan.state_fold == 1 do
       loop = g.write_stage - g.state_stage + 1 + scan.ram_latency
 
       if loop > scan.ii do
@@ -314,6 +348,8 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       end
     end
 
+    check_folded!(c, groups, scan)
+
     state_stage = groups |> Enum.map(& &1.state_stage) |> Enum.min(fn -> 0 end)
     write_stage = groups |> Enum.map(& &1.write_stage) |> Enum.max(fn -> 0 end)
 
@@ -321,7 +357,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
 
     depth =
       Enum.max(
-        [latency, write_stage | Map.values(c.pc_stages)] ++
+        [latency, write_stage + scan.state_fold - 1 | Map.values(c.pc_stages)] ++
           Enum.map(c.mem_reads, & &1.stage) ++
           Enum.flat_map(Map.values(c.units), fn ms -> Enum.map(ms, & &1.stage) end)
       )
@@ -347,6 +383,8 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       write_stage: write_stage,
       state_groups: Enum.map(groups, &Map.take(&1, [:leaves, :state_stage, :write_stage])),
       state_mem: scan.state_mem,
+      state_fold: scan.state_fold,
+      state_memories: state_memories(c),
       busy: scan.state_mem != :registers and layout.state_init == :clear and groups != [],
       inputs: layout.inputs,
       outputs: layout.outputs,
@@ -383,6 +421,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       group_stages: stages.groups,
       state_mem: scan.state_mem,
       ram_latency: scan.ram_latency,
+      state_fold: scan.state_fold,
       pc_stages: %{},
       channels: scan.channels,
       sigs: %{},
@@ -586,6 +625,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       mem_by_index: Map.new(scan.memories, &{&1.index, &1}),
       share: Keyword.get(opts, :share, :auto),
       state_init: Keyword.get(opts, :state_init, :clear),
+      state_row_bits: Keyword.get(opts, :state_row_bits, 72),
       params_by_index: params_by_index,
       inputs_by_index: inputs_by_index,
       states: states,
@@ -673,6 +713,9 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
         l.state_init not in [:clear, :initial] ->
           "state_init: must be :clear or :initial"
 
+        not (is_integer(l.state_row_bits) and l.state_row_bits >= 0) ->
+          "state_row_bits: must be a non-negative integer"
+
         not (is_integer(l.tuser) and l.tuser >= 0) ->
           "tuser: must be a bit width"
 
@@ -719,7 +762,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
           |> Enum.reject(&(MapSet.member?(static, &1) or &1 in g.params))
           |> Enum.map(fn id -> available(sched[id].at) end)
           |> Enum.max(fn -> 0 end)
-          |> max(scan.ram_latency)
+          |> max(scan.ram_latency + scan.state_fold - 1)
 
         {Enum.reduce(g.params, seeds, &Map.put(&2, &1, {stage, 0.0})), [stage | stages]}
       end)
@@ -1758,9 +1801,11 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       cond do
         c.state_mem != :registers ->
           # a field of the group's memory word, read ahead (`state_logic`)
-          {g, offset} = state_field(c, node.id, e)
+          # (a merged folded memory at its first group's stage; pipeline
+          # registers carry the value to stage `s`)
+          {g, offset, s0} = state_field(c, node.id, e)
           w = bits(fmt)
-          c = c |> new_sig(name, fmt, s, false) |> assign(name, "st#{g}_q[#{offset} +: #{w}]")
+          c = c |> new_sig(name, fmt, s0, false) |> assign(name, "st#{g}_q[#{offset} +: #{w}]")
           {c, {:sig, name}}
 
         c.channels == 1 ->
@@ -1773,13 +1818,14 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     end)
   end
 
-  # Memory and bit offset of element `e` of state parameter `id`.
+  # Memory, bit offset and read stage of element `e` of state parameter `id`.
   defp state_field(c, id, e) do
     c
     |> state_words()
-    |> Enum.find_value(fn {u, _groups, fields} ->
+    |> Enum.find_value(fn {u, gis, fields} ->
       Enum.find_value(fields, fn {fid, fe, offset, _fmt} ->
-        if fid == id and fe == e, do: {u, offset}
+        if fid == id and fe == e,
+          do: {u, offset, gis |> Enum.map(&Enum.at(c.group_stages, &1)) |> Enum.min()}
       end)
     end)
   end
@@ -1810,6 +1856,54 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
         end)
 
       {u, Enum.map(members, &elem(&1, 1)), fields}
+    end)
+    |> merge_folded(c)
+  end
+
+  # With `state_fold: k` consecutive state memories (by stage) merge into
+  # one while a row stays within `state_row_bits` and the merged memory's
+  # read-to-write span (estimated from the groups' loop latencies) fits
+  # `channels * k` cycles. Later groups' fields then wait in pipeline
+  # registers from the first group's stage, and earlier groups' next state
+  # until the last write stage: registers for fewer, fuller memories.
+  defp merge_folded(units, %{state_fold: 1}), do: units
+
+  defp merge_folded(units, c) do
+    k = c.state_fold
+    limit = c.layout.state_row_bits
+    stage = fn gis -> gis |> Enum.map(&Enum.at(c.group_stages, &1)) |> Enum.min() end
+
+    last = fn gis ->
+      gis
+      |> Enum.map(&(Enum.at(c.group_stages, &1) + Enum.at(c.groups, &1).loop_latency - 1))
+      |> Enum.max()
+    end
+
+    fits? = fn gis, fields ->
+      span = last.(gis) - stage.(gis) + c.ram_latency + k
+      div(word_bits(fields) + k - 1, k) <= limit and span <= c.channels * k
+    end
+
+    units
+    |> Enum.sort_by(fn {_u, gis, _} -> stage.(gis) end)
+    |> Enum.reduce([], fn
+      {_u, gis, fields}, [{pgis, pfields} | rest] = acc ->
+        if fits?.(pgis ++ gis, pfields ++ fields),
+          do: [{pgis ++ gis, pfields ++ fields} | rest],
+          else: [{gis, fields} | acc]
+
+      {_u, gis, fields}, [] ->
+        [{gis, fields}]
+    end)
+    |> Enum.reverse()
+    |> Enum.with_index()
+    |> Enum.map(fn {{gis, fields}, u} ->
+      {fields, _} =
+        Enum.map_reduce(fields, 0, fn {id, e, _, fmt}, offset ->
+          {{id, e, offset, fmt}, offset + bits(fmt)}
+        end)
+
+      {u, gis, fields}
     end)
   end
 
@@ -2727,15 +2821,17 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       "  end\n"
     ]
 
+    gap = if n > 1, do: scan.state_fold, else: scan.ii
+
     throttle =
-      if n > 1 or scan.ii == 1 do
+      if gap == 1 do
         "  assign gap_ok = 1'b1;\n"
       else
-        gw = max(1, bit_len(scan.ii - 1))
-        last = "#{gw}'d#{scan.ii - 1}"
+        gw = max(1, bit_len(gap - 1))
+        last = "#{gw}'d#{gap - 1}"
 
         [
-          "  // one sample every #{scan.ii} enabled cycles\n",
+          "  // one sample every #{gap} enabled cycles\n",
           "  logic [#{gw - 1}:0] gap;\n",
           "  assign gap_ok = (gap == #{last});\n",
           "  always_ff @(posedge clk) begin\n",
@@ -2867,6 +2963,7 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
       "// Generated by ExHdl from a stream kernel. Do not edit.\n",
       "// #{d.name}: latency #{d.latency + 1}, ii #{scan.ii}, channels #{n}",
       if(scan.state_mem == :registers, do: "", else: ", state in #{scan.state_mem} RAM"),
+      if(scan.state_fold > 1, do: " folded over #{scan.state_fold} rows", else: ""),
       "\n",
       "// s_axis_tdata: #{describe_fields(l.inputs)}\n",
       "// m_axis_tdata: #{describe_fields(l.outputs)}\n",
@@ -3119,6 +3216,29 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     ]
   end
 
+  # A folded memory is read from `k + ram_latency - 1` stages before its
+  # first group's state stage to the end of its last write, which must not
+  # reach the next sample of the channel (`ii` cycles later).
+  defp check_folded!(%{state_fold: 1}, _groups, _scan), do: :ok
+
+  defp check_folded!(c, groups, scan) do
+    for {u, gis, _} <- state_words(c) do
+      members = Enum.map(gis, &Enum.at(groups, &1))
+      s = members |> Enum.map(& &1.state_stage) |> Enum.min()
+      w = members |> Enum.map(& &1.write_stage) |> Enum.max()
+      loop = w - s + scan.ram_latency + scan.state_fold
+
+      if loop > scan.ii do
+        raise UnsupportedError,
+              "scan: state memory #{u} (groups #{Enum.join(gis, ", ")}) needs #{loop} cycles from its " <>
+                "first read to its last write, more than channels * state_fold = #{scan.ii}; " <>
+                "use more channels or a smaller state_row_bits: (fewer memories merged)"
+      end
+    end
+
+    :ok
+  end
+
   defp ram_style(:ultra), do: "ultra"
   defp ram_style(:block), do: "block"
   defp ram_style(:distributed), do: "distributed"
@@ -3126,19 +3246,50 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
   # State per group: registers (one channel), register arrays indexed by
   # the channel, or a memory with a word per channel.
   defp state_logic(c, groups, n, busy) do
+    k = c.state_fold
+
+    units =
+      if c.state_mem == :registers,
+        do: [],
+        else:
+          Enum.map(state_words(c), fn {u, gis, fields} ->
+            members = Enum.map(gis, &Enum.at(groups, &1))
+            {u, members, fields, unit_init(members, fields)}
+          end)
+
+    # rows of a folded word whose initial values differ need the row count
+    by_row =
+      Enum.any?(units, fn {_, _, fields, init} ->
+        length(Enum.uniq(fold_rows(init, fields, k))) > 1
+      end)
+
     parts =
       if c.state_mem == :registers do
         Enum.map(groups, &group_state(c, &1, n))
       else
-        Enum.map(state_words(c), fn {u, gis, fields} ->
-          members = Enum.map(gis, &Enum.at(groups, &1))
-          memory_state(c, u, members, fields, n)
+        Enum.map(units, fn {u, members, fields, init} ->
+          if k == 1,
+            do: memory_state(c, u, members, fields, init, n),
+            else: folded_state(c, u, members, fields, init, n, by_row)
         end)
       end
 
     clear =
       if busy do
-        aw = max(1, bit_len(n - 1))
+        rows = n * k
+        aw = max(1, bit_len(rows - 1))
+        rw = max(1, bit_len(k - 1))
+
+        row =
+          if by_row,
+            do: [
+              "  logic [#{rw - 1}:0] st_clr_row;\n",
+              "  always_ff @(posedge clk) begin\n",
+              "    if (!rst_n || st_clr_row == #{rw}'d#{k - 1}) st_clr_row <= '0;\n",
+              "    else if (st_clr) st_clr_row <= st_clr_row + #{rw}'d1;\n",
+              "  end\n"
+            ],
+            else: []
 
         [
           "  // state clear after reset: one word per cycle, busy until done\n",
@@ -3150,9 +3301,10 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
           "      st_clr_addr <= '0;\n",
           "    end else if (st_clr) begin\n",
           "      st_clr_addr <= st_clr_addr + #{aw}'d1;\n",
-          "      if (st_clr_addr == #{aw}'d#{n - 1}) st_clr <= 1'b0;\n",
+          "      if (st_clr_addr == #{aw}'d#{rows - 1}) st_clr <= 1'b0;\n",
           "    end\n",
-          "  end\n"
+          "  end\n",
+          row
         ]
       else
         []
@@ -3208,25 +3360,47 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
     }
   end
 
-  defp memory_state(c, u, groups, fields, n) do
+  # The initial state word of a state memory (`fields` of `state_words/1`).
+  defp unit_init(groups, fields) do
+    groups
+    |> Enum.flat_map(& &1.writes)
+    |> Enum.zip(fields)
+    |> Enum.reduce(0, fn {{_, fmt, v, _}, {_, _, offset, _}}, acc ->
+      acc ||| band(v, (1 <<< bits(fmt)) - 1) <<< offset
+    end)
+  end
+
+  defp word_bits(fields), do: fields |> Enum.map(fn {_, _, _, fmt} -> bits(fmt) end) |> Enum.sum()
+
+  # `word` cut into `k` rows of `ceil(bits / k)` bits, row 0 the LSBs.
+  defp fold_rows(word, fields, k) do
+    rw = div(word_bits(fields) + k - 1, k)
+    for r <- 0..(k - 1), do: word >>> (r * rw) &&& (1 <<< rw) - 1
+  end
+
+  defp state_memories(%{state_mem: :registers}), do: []
+
+  defp state_memories(c) do
+    k = c.state_fold
+
+    Enum.map(state_words(c), fn {_u, _gis, fields} ->
+      b = word_bits(fields)
+      %{bits: b, width: div(b + k - 1, k), depth: c.channels * k}
+    end)
+  end
+
+  defp memory_state(c, u, groups, fields, init, n) do
     g = hd(groups)
     writes = Enum.flat_map(groups, & &1.writes)
     s = g.state_stage
     w = g.write_stage
     rl = c.ram_latency
-    ww = fields |> Enum.map(fn {_, _, _, fmt} -> bits(fmt) end) |> Enum.sum()
+    ww = word_bits(fields)
     aw = max(1, bit_len(n - 1))
     m = "st#{u}"
 
     what =
       "group#{if length(groups) > 1, do: "s"} " <> Enum.map_join(groups, ", ", &"#{&1.index}")
-
-    init =
-      writes
-      |> Enum.zip(fields)
-      |> Enum.reduce(0, fn {{_, fmt, v, _}, {_, _, offset, _}}, acc ->
-        acc ||| band(v, (1 <<< bits(fmt)) - 1) <<< offset
-      end)
 
     init_lit = "#{ww}'h#{Integer.to_string(init, 16)}"
     data = writes |> Enum.reverse() |> Enum.map_join(", ", fn {_, _, _, x} -> x end)
@@ -3280,6 +3454,143 @@ defmodule ExHdl.Backends.SystemVerilog.Scan do
         "  always_ff @(posedge clk) begin\n",
         "    if (ce) begin\n",
         reads,
+        "    end\n",
+        "  end\n"
+      ]
+    }
+  end
+
+  # A state memory folded over `k` rows per channel: row `r` of channel
+  # `ch` is at `ch * k + r`. The kernel accepts one sample every `k` enabled
+  # cycles, so at most one sample is in any `k` consecutive stages and one
+  # port serves all rows: row `r` is read in stage `s - rl - k + 1 + r`
+  # (rows 0 to k - 2 collect in a shift register, row k - 1 completes the
+  # word in stage `s`), written in stage `w + r` (rows 1 to k - 1 from a
+  # copy of the next state taken in stage `w`).
+  defp folded_state(c, u, groups, fields, init, n, by_row) do
+    writes = Enum.flat_map(groups, & &1.writes)
+    s = groups |> Enum.map(& &1.state_stage) |> Enum.min()
+    w = groups |> Enum.map(& &1.write_stage) |> Enum.max()
+    rl = c.ram_latency
+    k = c.state_fold
+    ww = word_bits(fields)
+    rw = div(ww + k - 1, k)
+    pad = rw * k - ww
+    rows = n * k
+    aw = max(1, bit_len(rows - 1))
+    m = "st#{u}"
+
+    what =
+      "group#{if length(groups) > 1, do: "s"} " <> Enum.map_join(groups, ", ", &"#{&1.index}")
+
+    row_lits = init |> fold_rows(fields, k) |> Enum.map(&"#{rw}'h#{Integer.to_string(&1, 16)}")
+    data = writes |> Enum.reverse() |> Enum.map_join(", ", fn {_, _, _, x} -> x end)
+    data = if pad > 0, do: "#{pad}'d0, #{data}", else: data
+    clear = c.layout.state_init == :clear
+
+    pow2 = band(k, k - 1) == 0
+
+    addr = fn stage, r ->
+      if pow2,
+        do: "{#{ch(stage)}, #{bit_len(k - 1)}'d#{r}}",
+        else: "(#{aw}'(#{ch(stage)}) * #{aw}'d#{k} + #{aw}'d#{r})"
+    end
+
+    # a priority mux over the `k` stages of a window: `{stage, value}` pairs
+    pick = fn pairs ->
+      {init_pairs, [{_, last}]} = Enum.split(pairs, -1)
+      Enum.map_join(init_pairs, "", fn {st, v} -> "#{valid(st)} ? #{v} : " end) <> last
+    end
+
+    first = s - rl - k + 1
+    ra = pick.(for r <- 0..(k - 1), do: {first + r, addr.(first + r, r)})
+    wa = pick.(for r <- 0..(k - 1), do: {w + r, addr.(w + r, r)})
+
+    wd =
+      pick.(
+        for r <- 0..(k - 1),
+            do:
+              {w + r,
+               if(r == 0, do: "#{m}_nw[#{rw - 1}:0]", else: "#{m}_hold[#{(r - 1) * rw} +: #{rw}]")}
+      )
+
+    any_w = Enum.map_join(0..(k - 1), " || ", &valid(w + &1))
+
+    clr_wd =
+      if by_row do
+        Enum.with_index(row_lits)
+        |> Enum.map(fn {l, r} -> {r, l} end)
+        |> then(fn pairs ->
+          {init_pairs, [{_, last}]} = Enum.split(pairs, -1)
+
+          Enum.map_join(init_pairs, "", fn {r, l} ->
+            "st_clr_row == #{max(1, bit_len(k - 1))}'d#{r} ? #{l} : "
+          end) <> last
+        end)
+        |> then(&"(#{&1})")
+      else
+        hd(row_lits)
+      end
+
+    regs = Enum.map(1..rl, &"  logic [#{rw - 1}:0] #{m}_r#{&1};\n")
+
+    reads =
+      Enum.map(1..rl, fn j ->
+        src = if j == 1, do: "#{m}_mem[#{m}_ra]", else: "#{m}_r#{j - 1}"
+        "      #{m}_r#{j} <= #{src};\n"
+      end)
+
+    hw = (k - 1) * rw
+    acc_next = if k == 2, do: "#{m}_r#{rl}", else: "{#{m}_r#{rl}, #{m}_acc[#{hw - 1}:#{rw}]}"
+
+    initial =
+      Enum.map(Enum.with_index(row_lits), fn {l, r} ->
+        "    for (int i = 0; i < #{n}; i++) #{m}_mem[i * #{k} + #{r}] = #{l};\n"
+      end)
+
+    {
+      [
+        "  // state of #{n} channels (#{what}) in #{c.state_mem} RAM, #{k} rows of #{rw} bits per ",
+        "channel: read in stages #{first}-#{s - rl} for stage #{s}, written in stages #{w}-#{w + k - 1}\n",
+        "  (* ram_style = \"#{ram_style(c.state_mem)}\" *) logic [#{rw - 1}:0] #{m}_mem [#{rows}];\n",
+        regs,
+        "  logic [#{aw - 1}:0] #{m}_ra;\n",
+        "  logic [#{hw - 1}:0] #{m}_acc;\n",
+        "  logic [#{k * rw - 1}:0] #{m}_word;\n",
+        "  logic [#{ww - 1}:0] #{m}_q;\n",
+        "  logic [#{k * rw - 1}:0] #{m}_nw;\n",
+        "  logic [#{hw - 1}:0] #{m}_hold;\n",
+        "  logic #{m}_we;\n",
+        "  logic [#{aw - 1}:0] #{m}_wa;\n",
+        "  logic [#{rw - 1}:0] #{m}_wd;\n",
+        "  assign #{m}_word = {#{m}_r#{rl}, #{m}_acc};\n",
+        "  assign #{m}_q = #{m}_word[#{ww - 1}:0];\n",
+        if(clear, do: [], else: ["  initial begin\n", initial, "  end\n"]),
+        "\n"
+      ],
+      [
+        "  assign #{m}_ra = #{ra};\n",
+        "  assign #{m}_nw = {#{data}};\n",
+        if(clear,
+          do: [
+            "  assign #{m}_we = st_clr || (ce && (#{any_w}));\n",
+            "  assign #{m}_wa = st_clr ? st_clr_addr : #{wa};\n",
+            "  assign #{m}_wd = st_clr ? #{clr_wd} : #{wd};\n"
+          ],
+          else: [
+            "  assign #{m}_we = ce && (#{any_w});\n",
+            "  assign #{m}_wa = #{wa};\n",
+            "  assign #{m}_wd = #{wd};\n"
+          ]
+        ),
+        "  always_ff @(posedge clk) begin\n",
+        "    if (#{m}_we) #{m}_mem[#{m}_wa] <= #{m}_wd;\n",
+        "  end\n",
+        "  always_ff @(posedge clk) begin\n",
+        "    if (ce) begin\n",
+        reads,
+        "      #{m}_acc <= #{acc_next};\n",
+        "      if (#{valid(w)}) #{m}_hold <= #{m}_nw[#{k * rw - 1}:#{rw}];\n",
         "    end\n",
         "  end\n"
       ]
