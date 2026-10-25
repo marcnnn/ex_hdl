@@ -51,7 +51,9 @@ defmodule ExHdl.Frame do
           error("#{block.name}: hardware needs a fixed-point :format")
 
         length(state_leaves) != n_in ->
-          error("#{block.name}: the state is not a delay line of the input (#{length(state_leaves)} state leaves, #{n_in} input leaves)")
+          error(
+            "#{block.name}: the state is not a delay line of the input (#{length(state_leaves)} state leaves, #{n_in} input leaves)"
+          )
 
         true ->
           build(block, d, l, in_leaves, state_leaves, leaves(out), out_v, next_v)
@@ -62,7 +64,24 @@ defmodule ExHdl.Frame do
   end
 
   def analyze(%Block{name: name, kind: kind, rate: rate}, _opts),
-    do: error("#{name}: #{inspect(kind)} block with rate #{inspect(rate)} is not a fixed-rate frame block")
+    do:
+      error(
+        "#{name}: #{inspect(kind)} block with rate #{inspect(rate)} is not a fixed-rate frame block"
+      )
+
+  @doc """
+  Generates the streaming module of a linear frame block: `analyze/2`,
+  then `ExHdl.Backends.SystemVerilog.Polyphase.generate/2` (options
+  `:name`, default the block name, and `:structure`). Returns
+  `{:ok, %ExHdl.Backends.SystemVerilog.Scan.Design{}}` or `{:error, %Error{}}`.
+  """
+  def to_sv(%Block{} = block, opts \\ []) do
+    opts = Keyword.put_new(opts, :name, Atom.to_string(block.name))
+
+    with {:ok, ir} <- analyze(block, opts) do
+      {:ok, ExHdl.Backends.SystemVerilog.Polyphase.generate(ir, opts)}
+    end
+  end
 
   defp error(message), do: {:error, %Error{message: message}}
 
@@ -71,7 +90,8 @@ defmodule ExHdl.Frame do
 
   defp linear(expr), do: {:ok, Linear.eval(expr)}
 
-  defp template(container), do: Nx.Defn.Composite.traverse(container, &Nx.to_template(Nx.tensor(&1)))
+  defp template(container),
+    do: Nx.Defn.Composite.traverse(container, &Nx.to_template(Nx.tensor(&1)))
 
   defp leaves(container), do: Nx.Defn.Composite.flatten_list([container])
 
@@ -116,7 +136,8 @@ defmodule ExHdl.Frame do
         Enum.map(outputs, fn o ->
           terms =
             for c <- 0..(n_in - 1),
-                taps = for(m <- 0..(l - 1), do: taps(Enum.at(o.forms, m), c, Enum.at(anchors, m), k)),
+                taps =
+                  for(m <- 0..(l - 1), do: taps(Enum.at(o.forms, m), c, Enum.at(anchors, m), k)),
                 Enum.any?(taps, fn t -> Enum.any?(t, &(&1 != 0)) end),
                 do: %{input: c, taps: taps}
 
@@ -148,7 +169,8 @@ defmodule ExHdl.Frame do
        }}
     end
   catch
-    {:param, p} -> error("#{block.name}: the output depends on parameter #{p}, which is not input or state")
+    {:param, p} ->
+      error("#{block.name}: the output depends on parameter #{p}, which is not input or state")
   end
 
   defp state_init_leaves(block), do: leaves(block.init) |> Enum.map(&Nx.tensor/1)
@@ -177,7 +199,10 @@ defmodule ExHdl.Frame do
 
     if ok,
       do: :ok,
-      else: error("#{block.name}: the next state is not the input's delay line (newest items of line and frame)")
+      else:
+        error(
+          "#{block.name}: the next state is not the input's delay line (newest items of line and frame)"
+        )
   end
 
   # every output element: clip(shr(affine, k), lo, hi), parts optional
@@ -189,7 +214,8 @@ defmodule ExHdl.Frame do
       {tlo, thi} = type_range(type)
 
       if length(elems) != l do
-        {:halt, error("#{block.name}: output leaf has #{length(elems)} items per period, rate says #{l}")}
+        {:halt,
+         error("#{block.name}: output leaf has #{length(elems)} items per period, rate says #{l}")}
       else
         parsed = Enum.map(elems, &post/1)
 
@@ -214,7 +240,7 @@ defmodule ExHdl.Frame do
             fits =
               Enum.all?(parsed, fn {form, s, clo, chi} ->
                 {a, b} = Linear.range(form, ranges)
-                (clo != nil and chi != nil) or ((a >>> s) >= tlo and (b >>> s) <= thi)
+                (clo != nil and chi != nil) or (a >>> s >= tlo and b >>> s <= thi)
               end)
 
             cond do
@@ -222,7 +248,8 @@ defmodule ExHdl.Frame do
                 {:halt, error("#{block.name}: different constants per output phase")}
 
               not fits ->
-                {:halt, error("#{block.name}: an output can leave its type's range without saturation")}
+                {:halt,
+                 error("#{block.name}: an output can leave its type's range without saturation")}
 
               true ->
                 o = %{type: type, forms: forms, const: hd(consts), shift: shift, lo: lo, hi: hi}
@@ -245,7 +272,8 @@ defmodule ExHdl.Frame do
   defp post(%{} = form), do: {form, 0, nil, nil}
 
   defp post(other),
-    do: raise(Linear.NotLinear, "output is not one rounding of a sum: #{inspect(other, limit: 5)}")
+    do:
+      raise(Linear.NotLinear, "output is not one rounding of a sum: #{inspect(other, limit: 5)}")
 
   # Anchor of output m: its newest input with a non-zero tap over all
   # components, at least 0 (no output before the first input of its
@@ -254,7 +282,9 @@ defmodule ExHdl.Frame do
     newest =
       for m <- 0..(l - 1) do
         outputs
-        |> Enum.flat_map(fn o -> Enum.at(o.forms, m) |> Map.keys() |> Enum.reject(&(&1 == :c)) end)
+        |> Enum.flat_map(fn o ->
+          Enum.at(o.forms, m) |> Map.keys() |> Enum.reject(&(&1 == :c))
+        end)
         |> Enum.map(fn {_, t} -> t end)
         |> Enum.max(fn -> nil end)
       end

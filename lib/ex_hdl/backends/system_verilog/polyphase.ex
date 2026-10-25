@@ -110,7 +110,8 @@ defmodule ExHdl.Backends.SystemVerilog.Polyphase do
           field: f,
           xb: Stream.field_bits(f),
           roms: roms,
-          bound: Enum.sum(Enum.map(taps, &abs/1)) * max(abs(f_lo(ir, t.input)), abs(f_hi(ir, t.input)))
+          bound:
+            Enum.sum(Enum.map(taps, &abs/1)) * max(abs(f_lo(ir, t.input)), abs(f_hi(ir, t.input)))
         }
       end
 
@@ -192,7 +193,7 @@ defmodule ExHdl.Backends.SystemVerilog.Polyphase do
       "  logic ce;\n",
       decl_inputs,
       "  logic [#{pw - 1}:0] ph, s0, s1, s2;\n",
-      "  logic v0, v1, v2, v3, v4;\n",
+      "  logic v0, v1, v2, v3, v4, v5;\n",
       Enum.with_index(sum_bits, fn b, oi -> "  logic signed [#{b - 1}:0] sum_#{oi};\n" end),
       "  assign s_axis_tready = ce;\n",
       "  // input phase within the period; the period ends with phase #{d - 1}\n",
@@ -201,13 +202,14 @@ defmodule ExHdl.Backends.SystemVerilog.Polyphase do
       "    else if (ce && s_axis_tvalid) ph <= ph == #{pw}'d#{d - 1} ? '0 : ph + #{pw}'d1;\n",
       "  always_ff @(posedge clk)\n",
       "    if (!rst_n) begin\n",
-      "      v0 <= 1'b0; v1 <= 1'b0; v2 <= 1'b0; v3 <= 1'b0; v4 <= 1'b0;\n",
+      "      v0 <= 1'b0; v1 <= 1'b0; v2 <= 1'b0; v3 <= 1'b0; v4 <= 1'b0; v5 <= 1'b0;\n",
       "    end else if (ce) begin\n",
       "      v0 <= s_axis_tvalid;\n",
       "      v1 <= v0;\n",
       "      v2 <= v1;\n",
       "      v3 <= v2 && s2 == #{pw}'d#{d - 1};\n",
       "      v4 <= v3;\n",
+      "      v5 <= v4;\n",
       "    end\n",
       "  always_ff @(posedge clk)\n",
       "    if (ce) begin\n",
@@ -221,14 +223,17 @@ defmodule ExHdl.Backends.SystemVerilog.Polyphase do
       term_code,
       sums,
       round_code,
-      Stream.out_buffer(data, out_width(out_fields), "v4")
+      Stream.out_buffer(data, out_width(out_fields), "v5")
     ]
 
-    {body, 6, count_mults(terms)}
+    {body, 7, count_mults(terms)}
   end
 
   defp count_mults(terms),
-    do: terms |> Enum.map(fn t -> Enum.count(t.roms, &Enum.any?(&1, fn c -> c != 0 end)) end) |> Enum.sum()
+    do:
+      terms
+      |> Enum.map(fn t -> Enum.count(t.roms, &Enum.any?(&1, fn c -> c != 0 end)) end)
+      |> Enum.sum()
 
   # -- direct form --------------------------------------------------------------------
 
@@ -249,7 +254,15 @@ defmodule ExHdl.Backends.SystemVerilog.Polyphase do
 
         # tap j over the phases: ROM of l entries
         roms = for j <- 0..(k - 1), do: Enum.map(t.taps, &Enum.at(&1, j))
-        %{out: oi, id: "t#{oi}_#{ti}", field: f, xb: Stream.field_bits(f), roms: roms, bound: bound * r}
+
+        %{
+          out: oi,
+          id: "t#{oi}_#{ti}",
+          field: f,
+          xb: Stream.field_bits(f),
+          roms: roms,
+          bound: bound * r
+        }
       end
 
     window =
@@ -381,14 +394,21 @@ defmodule ExHdl.Backends.SystemVerilog.Polyphase do
   end
 
   defp count_direct(terms),
-    do: terms |> Enum.map(fn t -> Enum.count(t.roms, &Enum.any?(&1, fn c -> c != 0 end)) end) |> Enum.sum()
+    do:
+      terms
+      |> Enum.map(fn t -> Enum.count(t.roms, &Enum.any?(&1, fn c -> c != 0 end)) end)
+      |> Enum.sum()
 
   defp delta(anchors, m, d) do
     l = length(anchors)
-    if m < l - 1, do: Enum.at(anchors, m + 1) - Enum.at(anchors, m), else: d + hd(anchors) - Enum.at(anchors, l - 1)
+
+    if m < l - 1,
+      do: Enum.at(anchors, m + 1) - Enum.at(anchors, m),
+      else: d + hd(anchors) - Enum.at(anchors, l - 1)
   end
 
-  defp unzip3(list), do: {Enum.map(list, &elem(&1, 0)), Enum.map(list, &elem(&1, 1)), Enum.map(list, &elem(&1, 2))}
+  defp unzip3(list),
+    do: {Enum.map(list, &elem(&1, 0)), Enum.map(list, &elem(&1, 1)), Enum.map(list, &elem(&1, 2))}
 
   # Registered binary adder tree over `{name, bits}` operands (strings with
   # the operand width); returns {code, result bits, depth}. The constant
@@ -398,7 +418,8 @@ defmodule ExHdl.Backends.SystemVerilog.Polyphase do
   end
 
   defp level(out, [{single, _}], bits, depth, code) when depth > 0 do
-    {[code, "  logic signed [#{bits - 1}:0] #{out};\n  assign #{out} = #{single};\n"], bits, depth}
+    {[code, "  logic signed [#{bits - 1}:0] #{out};\n  assign #{out} = #{single};\n"], bits,
+     depth}
   end
 
   defp level(out, operands, bits, depth, code) do
@@ -473,7 +494,10 @@ defmodule ExHdl.Backends.SystemVerilog.Polyphase do
         ]
       end
 
-    data = "{" <> (0..(length(out_fields) - 1) |> Enum.reverse() |> Enum.map_join(", ", &"y_#{&1}")) <> "}"
+    data =
+      "{" <>
+        (0..(length(out_fields) - 1) |> Enum.reverse() |> Enum.map_join(", ", &"y_#{&1}")) <> "}"
+
     pad = out_width(out_fields) - Enum.sum(Enum.map(out_fields, & &1.bits))
     data = if pad > 0, do: "{#{pad}'d0, #{String.slice(data, 1..-2//1)}}", else: data
     {code, data}

@@ -250,7 +250,12 @@ defmodule ExHdl.Frame.Linear do
 
   defp constant_tensor(%Nx.Tensor{type: type, shape: shape} = t) do
     check_type!(type, :tensor)
-    mk(shape, type, t |> Nx.backend_copy(Nx.BinaryBackend) |> Nx.to_flat_list() |> Enum.map(&prune(%{c: &1})))
+
+    mk(
+      shape,
+      type,
+      t |> Nx.backend_copy(Nx.BinaryBackend) |> Nx.to_flat_list() |> Enum.map(&prune(%{c: &1}))
+    )
   end
 
   defp check_type!({kind, _}, _op) when kind in [:s, :u], do: :ok
@@ -278,7 +283,8 @@ defmodule ExHdl.Frame.Linear do
     |> Enum.sort()
   end
 
-  defp flat(coord, strides), do: Enum.zip(coord, strides) |> Enum.map(fn {c, s} -> c * s end) |> Enum.sum()
+  defp flat(coord, strides),
+    do: Enum.zip(coord, strides) |> Enum.map(fn {c, s} -> c * s end) |> Enum.sum()
 
   defp slice(a, start, _lengths, strides, shape, type) do
     in_strides = strides_of(a.shape)
@@ -334,7 +340,10 @@ defmodule ExHdl.Frame.Linear do
     elems =
       for c <- coords(shape) do
         # output axis i is input axis axes[i]
-        src = for k <- 0..(tuple_size(a.shape) - 1)//1, do: Enum.at(c, Enum.find_index(axes, &(&1 == k)))
+        src =
+          for k <- 0..(tuple_size(a.shape) - 1)//1,
+              do: Enum.at(c, Enum.find_index(axes, &(&1 == k)))
+
         elem(a.elems, flat(src, in_strides))
       end
 
