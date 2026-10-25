@@ -357,3 +357,195 @@ and fewer registers.
 The sibling libraries are path dependencies (`../nx_fixed`, and
 `../ex_sdr` for integration tests); `scripts/checkout_siblings.sh` clones
 them. Requires Elixir 1.18+ and Verilator 5 for co-simulation.
+
+## Frame blocks in hardware
+
+### Polyphase rate change
+
+`ExHdl.Frame.to_sv/2` generates linear `:frame` blocks
+(`%NxFixed.Block{kind: :frame}`): decimating and interpolating FIRs,
+rational resamplers, polyphase decimators and interpolators, with real or
+complex data and taps.
+
+```elixir
+block = ExSdr.Filters.block(:fir_filter_ccf, taps: taps, decimation: 4, format: q15)
+{:ok, design} = ExHdl.Frame.to_sv(block, name: "decim4")
+```
+
+Nothing is known about the block's function: `ExHdl.Frame.analyze/2`
+traces the kernel on one period of `d` inputs (`rate: {d, l}`) and
+evaluates the Nx graph on affine forms (`ExHdl.Frame.Linear`). It accepts
+the kernel when the state is a delay line of the input and every output
+is a sum of constant taps times inputs, rounded once (a shift with a
+rounding constant) and saturated, with the same rounding in every output
+phase. The result (`ExHdl.IR.Multirate`) is `l` tap sets of `k` taps, the
+newest input each output phase reads, and the rounding. Kernels with
+anything else (the NCO of `freq_xlating_fir_filter`, a product of two
+inputs) are rejected with the reason.
+
+`ExHdl.Backends.SystemVerilog.Polyphase` builds one of two structures,
+bit-exact with `NxFixed.Block.run/4` under backpressure (AXI4-Stream,
+one clock enable from the output buffer, as the stream kernels):
+
+  * decimators (`l = 1`): `ceil(k / d)` multiply-accumulators per term,
+    multiplier `j` with the taps `j*d .. j*d + d - 1` in a `d`-entry ROM;
+    the partial sums move down the chain once per period (a transposed
+    FIR with every tap time-shared `d` times). One input per cycle, no
+    delay line.
+  * everything else: a window of the last `k` inputs and `k` multipliers
+    per term with an `l`-entry coefficient ROM per tap, an adder tree and
+    a sequencer that accepts an input or emits an output each cycle. One
+    output per cycle for interpolators and upsampling resamplers, one
+    input per cycle for downsampling ones.
+
+A term is an input component times a tap set (one for real data, two for
+complex data and real taps, four for complex taps); taps that are zero in
+every phase have no multiplier. test/frame_cosim_test.exs runs 15 ex_sdr
+filters (FIR decimation 2-8, interpolation 2-8, resamplers 3/2, 2/3 and
+5/4 with a phase, polyphase decimator on channel 0 and 1) under four
+traffic patterns.
+
+Yosys `synth_xilinx` (Zynq-7020), 63-tap low-pass, Q15, complex data:
+
+| Block | structure | latency | LUT | FF | DSP48E1 |
+|---|---|---|---|---|---|
+| fir_filter_ccf, decimation 4 | decimator | 7 | 58 | 89 | 32 |
+| fir_filter_ccf, decimation 8 | decimator | 7 | 89 | 134 | 16 |
+| pfb_decimator_ccf, 4 channels, channel 1 (complex taps) | decimator | 7 | 1049 | 957 | 50 |
+| interp_fir_filter_ccf, interpolation 4 | direct | 10 | 974 | 1007 | 32 |
+| rational_resampler_ccf, 3/2 | direct | 10 | 1319 | 1443 | 42 |
+| rational_resampler_ccf, 2/3 | direct | 11 | 1978 | 2015 | 64 |
+
+The decimators' accumulators are the DSP slices' P registers. Downsampling
+resamplers use their multipliers `l/d` of the time (a 2/3 resampler with
+32 taps per phase has 64); time sharing them is not done yet.
+
+### FFT
+
+`ExHdl.FFT.generate/2` generates a streaming FFT or IFFT of 2 to 65536
+points, bit-exact with `ExSdr.DSP.FFT.fft/2` (same options: `:format`,
+`:twiddle`, `:shifts`):
+
+```elixir
+{:ok, design} =
+  ExHdl.FFT.generate(8192, format: NxFixed.Num.q(16, 15), shifts: 13, name: "fft8k")
+```
+
+AXI4-Stream with `tdata = {im, re}` and `m_axis_tlast` on the last bin of
+every symbol; one sample per clock in and out; symbols back to back or
+with gaps, and each symbol leaves without waiting for the next. Options:
+`inverse: true` (IFFT as `swap(fft(swap(x)))`, the same butterflies),
+`order: :bit_reversed` (no reorder buffer). `ExHdl.FFT.model/2` is an
+integer model of the same arithmetic; the moduledoc describes the
+interface for composing it with other blocks.
+
+The reference is a radix-2 DIT FFT whose every stage rounds the twiddle
+product to the data format and saturates (and halves in the last
+`shifts` stages). Radix-2^2 would move twiddle products between stages and
+round differently, so the pipeline is radix-2 SDF, one stage per stage of
+the reference with its butterflies, twiddles (ROM, the reference's
+quantized values) and rounding. The stage takes the input in natural
+order and gives the bins in bit-reversed order; a reorder buffer of `n`
+words (one memory, frames alternating between natural and bit-reversed
+addresses) restores natural order. A stage stores the first half of each
+block, combines the second half with it (the sum leaves at once) and
+sends the differences in the free cycles after the block, so no stage
+needs further input to empty. Stages from 256 words per half keep first
+halves and differences in one memory. Stage 0 has no multiplier; every
+other stage has four (the quantized `w^0` is `1 - 2^-15`, not 1).
+
+test/fft_test.exs: the model against `ExSdr.DSP.FFT` for 2-1024 points
+in four formats (including truncation, 18-bit twiddles, 20-bit data) and
+three shift settings, 2048 and 8192 points; Verilator co-simulation of
+8, 64 (five configurations, inverse, bit-reversed), 2048 and 8192 points
+under four traffic patterns, bit for bit, with `tlast` and throughput.
+
+Yosys `synth_xilinx` (Zynq-7020), Q15 data and twiddles:
+
+| FFT | latency (cycles) | LUT | FF | SRL | DSP48E1 | RAMB36 |
+|---|---|---|---|---|---|---|
+| 2048 points, natural order | 4173 | 2989 | 3153 | 507 | 40 | 6 |
+| 8192 points, natural order | 16475 | 3528 | 3701 | 722 | 48 | 24 |
+| 8192 points, bit-reversed order | 8281 | 3488 | 3681 | 722 | 48 | 16 |
+
+Latency is from the last sample of a symbol to its last bin. For 8192
+points the memories are 8 RAMB36 for the stages, 8 for the twiddle ROMs
+(the reference's table per stage, `n - 1` words in all) and 8 for the
+reorder buffer; the twiddle ROMs could shrink by sharing one table
+between stages or by symmetry where the quantized values allow it.
+
+## OFDM front end in hardware
+
+`ExHdl.OFDM.*` turns `ExSdr.Comm.OFDM.FixedFrontEnd` (DVB-T 2k, QPSK, 16-QAM
+and 64-QAM) into one AXI4-Stream pipeline, bit-exact: sc16 samples in,
+code bits out (hard decisions, as ex_sdr produces them; there are no soft
+bits in `FixedFrontEnd`).
+
+| Stage | Module | Structure |
+|---|---|---|
+| frequency correction | `Correct` | stream kernel, state `n * inc mod 2^32`, NCO table, 1 sample per clock |
+| guard removal | `Guard` | counter, `tlast` per symbol |
+| FFT | `ExHdl.FFT` (hdl/frame) | composition point below |
+| channel estimate, equaliser, decisions | `Equalise`, `Equaliser`, `Plan` | frame kernel, double-buffered symbol RAM |
+| symbol and bit deinterleaver | `Permute` | double-buffered RAM, address ROM, any gather table |
+| bit unpacking | `Unpack` | |
+
+`Permute` is the generic frame permutation (`ExSdr.Comm.Permutation`
+tables, several tables used in turn): one item per clock in and out, a
+bank is read while the other is written, `tlast` per block.
+
+The equaliser needs the whole symbol, so it is a stream kernel with a
+frame memory (`memories:`): a writer fills the inactive bank with the FFT
+output, a sequencer sends row numbers of a schedule (`Plan`) through the
+kernel, one per clock. The schedule walks a symbol in interpolation order
+(pilot, pilot, the data carriers between them, next pilot, ...), so every
+pilot's channel estimate is computed once and shifted through two state
+registers. The kernel uses the nx_fixed operations of `FixedFrontEnd`
+unchanged (same constants, rounding, saturation), the width check proves
+every width, and the loop is one cycle (`ii = 1`).
+
+test/ofdm: each stage against the stage of `FixedFrontEnd` cut out in
+test/support/ofdm_ref.ex (whose chain equals `FixedFrontEnd.run/4`, checked
+first), then the chain with the software FFT and with `ExHdl.FFT` in the
+design, on ExSdr's DVB-T transmitter output with a carrier offset and
+noise, random valid and ready.
+
+### FFT composition point
+
+Two AXI4-Stream connections, `tdata = {im[15:0], re[15:0]}` signed in the
+data format (q(16, 12)): `fft_in` carries the corrected symbol without
+guard (2048 beats, `tlast` on the last), `fft_out` takes the 2048 bins in
+natural order. The FFT must be `ExSdr.DSP.FFT.fft/2` with `shifts: 5`
+and q(16, 15) twiddles, which `ExHdl.FFT` is. `FrontEnd.build(spec, fft:
+:hardware)` instantiates it, `fft: nil` leaves the ports open.
+
+Yosys `synth_xilinx` (Zynq-7020), DVB-T 2k:
+
+| Block | latency | LUT | FF | DSP48E1 | RAMB18 |
+|---|---|---|---|---|---|
+| Correct | 8 | 269 | 261 | 4 | 4 |
+| Equaliser QPSK | 19 | 616 | 592 | 8 | 20 |
+| Equaliser 16-QAM | 23 | 831 | 763 | 14 | 20 |
+| Equaliser 64-QAM | 24 | 1055 | 844 | 18 | 20 |
+| Guard (2048 + 64) | 2 | 47 | 80 | 0 | 0 |
+| Cell deinterleaver (1512 x 2 bit, two tables) | n + 4 | 53 | 53 | 0 | 3 |
+| Bit deinterleaver QPSK / 16-QAM / 64-QAM | n + 4 | 54 / 87 / 286 | 47 / 51 / 55 | 0 | 1 |
+| Front end QPSK without FFT | | 1067 | 1044 | 12 | 28 |
+| Front end QPSK with `ExHdl.FFT` | | 4054 | 4237 | 52 | 40 |
+
+A symbol takes 1688 equaliser rows (176 pilots, 1512 data carriers) of
+the 2048 clocks of its FFT output.
+
+### Limits and what ex_sdr would need
+
+* The first sample after reset is the start of a guard interval of a
+  class 0 symbol (`FixedFrontEnd.run/4` has the same rule); cell tables
+  start with table 0. No synchroniser yet.
+* `FixedFrontEnd` exposes only the final bits. The tests copy its private
+  `graph/5` and `class_words/6` (test/support/ofdm_ref.ex). The minimal
+  ex_sdr refactor: make `nco/2`, `class_words/6` and `axis_index/3` public
+  (or a `stages/…` function returning corrected samples, FFT output and
+  words), so the hardware tests compare against the library instead of a
+  copy. `ExHdl.OFDM.Plan` rebuilds the pilot and weight constants from
+  `spec.ofdm` as `tables/3` does (float32 first); a public per-class table
+  function would remove that duplication. Nothing in ex_sdr was changed.

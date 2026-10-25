@@ -15,6 +15,9 @@ defmodule ExHdl.Block do
     * `:bit`, `:byte`, `:symbol` - an unsigned 8-bit integer
     * `:none` - sources: an unused `u8` sample that paces the output
 
+  Linear `:frame` blocks (decimating and interpolating FIRs, resamplers)
+  generate with `ExHdl.Frame.to_sv/2`, using `frame_template/2`.
+
   Variable-rate blocks (`rate: {:variable, max}`) generate with `max`
   output lanes and a count (see `ExHdl.Backends.SystemVerilog.Scan`).
   Blocks without state (`init: nil`) get a `u8` zero as state, as in
@@ -44,6 +47,15 @@ defmodule ExHdl.Block do
       i when i in [:bit, :byte, :symbol, :none] -> Nx.template({}, :u8)
       other -> raise Error, "no hardware sample for items of type #{inspect(other)}"
     end
+  end
+
+  @doc "The template of `n` input items of `block` stacked on a first axis (a frame)."
+  def frame_template(%Block{} = block, n) do
+    block
+    |> sample_template()
+    |> Nx.Defn.Composite.traverse(fn t ->
+      Nx.template(Tuple.insert_at(Nx.shape(t), 0, n), Nx.type(t))
+    end)
   end
 
   @doc "The initial state (a `u8` zero for stateless blocks)."
@@ -84,6 +96,14 @@ defmodule ExHdl.Block do
   end
 
   defp check_stream!(%Block{kind: :stream}), do: :ok
+
+  defp check_stream!(%Block{kind: :frame, name: name}),
+    do:
+      raise(
+        Error,
+        "#{name}: only :stream blocks generate as stream kernels, this one is :frame " <>
+          "(linear frame filters: ExHdl.Frame.to_sv/2)"
+      )
 
   defp check_stream!(%Block{kind: kind, name: name}),
     do:
