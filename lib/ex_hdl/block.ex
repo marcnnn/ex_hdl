@@ -46,6 +46,15 @@ defmodule ExHdl.Block do
     end
   end
 
+  @doc "The template of `n` input items of `block` stacked on a first axis (a frame)."
+  def frame_template(%Block{} = block, n) do
+    block
+    |> sample_template()
+    |> Nx.Defn.Composite.traverse(fn t ->
+      Nx.template(Tuple.insert_at(Nx.shape(t), 0, n), Nx.type(t))
+    end)
+  end
+
   @doc "The initial state (a `u8` zero for stateless blocks)."
   def init(%Block{init: nil}), do: Nx.tensor(0, type: :u8)
   def init(%Block{init: init}), do: init
