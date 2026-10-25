@@ -201,7 +201,7 @@ defmodule ExHdl.RTL.NeedsTest do
       bb =
         black_box "inv_stub",
           sim_sources: %{
-            "inv_stub.sv" =>
+            "sim/inv_stub.sv" =>
               "module inv_stub (input logic [7:0] a, output logic [7:0] y);\n" <>
                 "  assign y = ~a;\nendmodule\n"
           } do
@@ -615,6 +615,74 @@ defmodule ExHdl.RTL.NeedsTest do
         module "if_top" do
           a = input(:a, 1)
           if a, do: nil
+        end
+      end
+    end
+  end
+
+  describe "ex_hdl_cores 4: expose/2" do
+    defp slave_mod do
+      module "slave_x" do
+        a = input(:a, 4)
+        y = output(:y, 4)
+        z = output(:z, 1)
+        r = reg(:r, 4)
+
+        sync do
+          r <~ a
+        end
+
+        y <~ r
+        z <~ reduce_or(a)
+      end
+    end
+
+    test "re-exports every data port of a hosted module, even with the instance as prefix" do
+      top =
+        module "host_x" do
+          x = instance(:x, slave_mod())
+          ps = expose(x, prefix: "x_y_")
+          assert Map.keys(ps) |> Enum.sort() == [:a, :y, :z]
+        end
+
+      assert Enum.map(top.ports, & &1.name) -- [:clk, :rst_n] == [:x_y_a, :x_y_y, :x_y_z]
+      lint!(top)
+
+      {_, out} =
+        top
+        |> Sim.new()
+        |> Sim.reset()
+        |> Sim.run([%{rst_n: 1, x_y_a: 5}, %{rst_n: 1, x_y_a: 0}])
+
+      assert Enum.map(out, &{&1.x_y_y, &1.x_y_z}) == [{0, 1}, {5, 0}]
+    end
+
+    test "only:, except:, dirs: and connect: combine" do
+      top =
+        module "host_x2" do
+          a = input(:a, 4)
+          u = instance(:u, slave_mod(), connect: [a: a])
+          expose(u, dirs: [:output], except: [:z])
+        end
+
+      assert Enum.map(top.ports, & &1.name) -- [:clk, :rst_n] == [:a, :y]
+      lint!(top)
+    end
+
+    test "a name clash says what to do" do
+      assert_raise ElaborationError,
+                   ~r/u_a .*instance wire; pass a prefix: other than "u_"/,
+                   fn ->
+                     module "host_x3" do
+                       u = instance(:u, slave_mod())
+                       expose(u, prefix: "u_")
+                     end
+                   end
+
+      assert_raise ElaborationError, ~r/no data port q/, fn ->
+        module "host_x4" do
+          u = instance(:u, slave_mod())
+          expose(u, only: [:q])
         end
       end
     end
