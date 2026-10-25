@@ -61,7 +61,8 @@ defmodule ExHdl.FFT do
   leaves at once and the difference is stored and leaves after the
   block. Each stage has its own memory for the first halves and one for
   the differences (block RAM for long stages, LUT RAM or registers for
-  short ones, chosen by synthesis) and a twiddle ROM of `m` entries.
+  short ones, chosen by synthesis; stages from 256 words per half share
+  one memory for both) and a twiddle ROM of `m` entries.
   Differences leave in free cycles, so the stage does not need the next
   block to push them out. The pipeline gives the bins in bit-reversed
   order; with `order: :natural` a reorder buffer of `n` words (one
