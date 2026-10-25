@@ -237,7 +237,7 @@ defmodule ExHdl.RTL.Sim.Compiler do
       Enum.map(flat.sync, & &1.clock) ++
         Enum.map(flat.mem_reads, & &1.clock) ++
         Enum.map(flat.mem_writes, & &1.clock) ++
-        Enum.flat_map(flat.models, &Map.keys(&1.clocks))
+        Enum.flat_map(flat.models, fn m -> Enum.map(m.clocks, &elem(&1, 0)) end)
 
     clocks = Enum.uniq(flat.clocks ++ Enum.sort(Enum.uniq(used_clocks) -- flat.clocks))
     clock_bit = clocks |> Enum.with_index() |> Map.new(fn {c, i} -> {c, 1 <<< i} end)
