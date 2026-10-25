@@ -49,11 +49,12 @@ defmodule ExHdl.OFDM.FrontEnd do
   with `Num.rescale` rounding, every stage saturated to the data format,
   the last five stages halved with rounding (output DFT / 32).
 
-  With `fft: module` (an `ExHdl.RTL` module with bundles `s_axis` and
-  `m_axis` of that kind) the FFT is instantiated between them; with
-  `fft: nil` (default) the two connections are the ports `fft_in_*`
-  (outputs) and `fft_out_*` (inputs), as a test bench or a larger design
-  wants them.
+  With `fft: :hardware` the streaming FFT of `ExHdl.FFT` is generated for
+  the format (`:shifts`, default 5) and instantiated between them;
+  `fft: module` takes any `ExHdl.RTL` module with bundles `s_axis` and
+  `m_axis` of that kind; with `fft: nil` (default) the two connections
+  are the ports `fft_in_*` (outputs) and `fft_out_*` (inputs), as a test
+  bench or a larger design wants them.
   """
   use ExHdl.RTL
 
@@ -62,12 +63,12 @@ defmodule ExHdl.OFDM.FrontEnd do
 
   @doc """
   Options: `:name` (default `"ofdm_front_end"`), `:fft` (see above),
-  `:format`, `:coef` (as `ExHdl.OFDM.Correct.default_opts/0`), `:family`,
-  `:clock_mhz` (for the kernels).
+  `:shifts` (halving stages of the FFT, default 5), `:format`, `:coef` (as
+  `ExHdl.OFDM.Correct.default_opts/0`), `:family`, `:clock_mhz` (for the
+  kernels).
   """
   def build(spec, opts \\ []) do
     name = Keyword.get(opts, :name, "ofdm_front_end")
-    fft_module = Keyword.get(opts, :fft)
     fmt = Keyword.take(opts, [:format, :coef])
     gen = Keyword.take(opts, [:family, :clock_mhz])
     o = spec.ofdm
@@ -87,6 +88,8 @@ defmodule ExHdl.OFDM.FrontEnd do
         spec.bits &&
           Permute.build(name: name <> "_bits", width: 1, tables: tables(spec.bits))
 
+      {:ok, fft_module, fft_design} = fft(Keyword.get(opts, :fft), spec, opts)
+
       top = %{
         name: name,
         fft: fft_module,
@@ -104,8 +107,40 @@ defmodule ExHdl.OFDM.FrontEnd do
          module: wrapper(top),
          correct: correct,
          equaliser: eq,
+         fft: fft_design,
          submodules: %{guard: guard, cells: cells, unpack: unpack, bits: bits}
        }}
+    end
+  end
+
+  defp fft(:hardware, spec, opts) do
+    f = Keyword.get(opts, :format, Correct.default_opts()[:format])
+    tw = Keyword.get(opts, :coef, Correct.default_opts()[:coef])
+
+    gen = [
+      format: f,
+      twiddle: tw,
+      shifts: Keyword.get(opts, :shifts, 5),
+      name: "#{opts[:name] || "ofdm_front_end"}_fft"
+    ]
+
+    with {:ok, d} <- ExHdl.FFT.generate(spec.ofdm.fft, gen), do: {:ok, fft_box(d), d}
+  end
+
+  defp fft(other, _spec, _opts), do: {:ok, other, nil}
+
+  # a generated FFT (a stream design with frame sideband) as a black box
+  defp fft_box(d) do
+    s_iface = Interface.axi_stream(data: d.in_width, keep: false)
+    m_iface = Interface.axi_stream(data: d.out_width, keep: false)
+
+    (d.in_width == 32 and d.out_width == 32) or
+      raise ArgumentError, "the FFT must take 32-bit samples"
+
+    black_box d.name, sources: %{"#{d.name}.sv" => d.source} do
+      domain(:sys)
+      slave(:s_axis, s_iface, domain: :sys, comb_from: :none)
+      master(:m_axis, m_iface, domain: :sys, comb_from: :none)
     end
   end
 
