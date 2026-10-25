@@ -222,7 +222,9 @@ defmodule ExHdl.RTL.ScanModelTest do
           {"ii: auto, typed ports", [ii: :auto], true},
           {"ii: 1 by channels, round robin", [channels: :auto_loop], false},
           {"channels in LUT RAM with tid, tuser and the clear sweep",
-           [channels: :auto_loop, state_mem: :distributed, tid: true, tuser: 5], false}
+           [channels: :auto_loop, state_mem: :distributed, tid: true, tuser: 5], false},
+          {"state folded over 3 rows of block RAM, round robin",
+           [channels: 3, state_mem: :block, state_fold: 3], false}
         ] do
       @label label
       @opts opts

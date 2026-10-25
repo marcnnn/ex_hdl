@@ -225,7 +225,10 @@ defmodule ExHdl.ChannelCosimTest do
           {:block, :clear, -5, []},
           {:distributed, :initial, 7, []},
           {:ultra, :clear, 300, []},
-          {:block, :clear, 0, [ram_latency: 3]}
+          {:block, :clear, 0, [ram_latency: 3]},
+          {:block, :clear, -5, [state_fold: 3]},
+          {:ultra, :initial, 300, [state_fold: 4]},
+          {:distributed, :clear, 7, [state_fold: 2, ram_latency: 2]}
         ] do
       @style style
       @init_mode init_mode
@@ -233,7 +236,9 @@ defmodule ExHdl.ChannelCosimTest do
       @extra extra
       test "#{style}, state_init: #{init_mode}, init #{init}, #{inspect(extra)}", ctx do
         rl = Keyword.get(@extra, :ram_latency, if(@style == :ultra, do: 2, else: 1))
-        n = ctx.l + rl
+        k = Keyword.get(@extra, :state_fold, 1)
+        # the fewest channels: n * k >= loop + read latency + k - 1
+        n = max(2, div(ctx.l + rl + k - 1 + k - 1, k))
         init = Nx.tensor(@init, type: :s16)
 
         {:ok, d} =
@@ -246,13 +251,21 @@ defmodule ExHdl.ChannelCosimTest do
               state_mem: @style,
               state_init: @init_mode,
               init: init,
-              name: "op_#{@style}_#{@init_mode}_#{rl}",
+              name: "op_#{@style}_#{@init_mode}_#{rl}_#{k}",
               param_names: ["a"]
             ] ++ @extra
           )
 
         assert d.busy == (@init_mode == :clear)
         assert d.source =~ ~s{ram_style = "#{@style}"}
+        assert d.state_fold == k and d.ii == n * k
+
+        if k > 1 do
+          assert d.source =~ "one sample every #{k} enabled cycles"
+          assert [%{bits: 16, width: w, depth: depth}] = d.state_memories
+          assert w == div(16 + k - 1, k) and depth == n * k
+        end
+
         {:ok, sim} = Verilator.build_stream(d)
         a = 9000
         order = for i <- 0..(length(ctx.xs) - 1), do: rem(i, n)
@@ -345,6 +358,82 @@ defmodule ExHdl.ChannelCosimTest do
                  )
 
         assert res.outputs == [expected]
+      end
+    end
+  end
+
+  describe "folded state memory" do
+    test "biquad cascade over 4 rows: several state words, tid with a channel missing, coefficient swap" do
+      spec = ExHdl.DSP.cascade([A.stage("eq1"), A.stage("eq2")])
+      opts = Keyword.drop(spec, [:fun, :args])
+      n = 6
+      present = Enum.to_list(0..(n - 1)) -- [2]
+      frames = 20
+
+      {:ok, d} =
+        ExHdl.DSP.scan_to_sv(
+          spec[:fun],
+          spec[:args],
+          opts ++
+            [
+              name: "bq_fold",
+              channels: n,
+              state_mem: :ultra,
+              state_fold: 4,
+              channel_params: :all,
+              tid: true,
+              tuser: 3
+            ]
+        )
+
+      assert d.state_fold == 4 and d.busy
+      # 24 cycles between samples of a channel: the four state stages merge
+      # into two memories (three stages, then one)
+      assert Enum.map(d.state_memories, & &1.bits) == [179, 83]
+      assert Enum.all?(d.state_memories, &(&1.width * 4 >= &1.bits and &1.depth == 4 * n))
+      {:ok, sim} = Verilator.build_stream(d)
+
+      order = for _f <- 0..(frames - 1), c <- present, do: c
+      samples = Map.new(present, &{&1, A.signal(frames - 4, &1) ++ A.loud(4)})
+      second = fn c -> A.design(:highpass, 80 + 10 * c) end
+      :rand.seed(:exsss, 17)
+      users = for _ <- order, do: :rand.uniform(8) - 1
+
+      expected =
+        Map.new(present, fn c ->
+          params = coef_list(coefs(c)) ++ coef_list(second.(c))
+
+          {y, _} =
+            NxFixed.run_scan_stacked(
+              spec[:fun],
+              Nx.tensor(samples[c], type: :s32),
+              spec[:init],
+              params,
+              param_ranges: spec[:param_ranges]
+            )
+
+          {c, Nx.to_flat_list(y)}
+        end)
+        |> interleave(order)
+
+      pc =
+        Enum.map(present, &{:write, &1, pc_values(coefs(&1)) ++ pc_values(second.(&1))}) ++
+          [:swap]
+
+      for {vp, rp, seed} <- @traffic do
+        assert {:ok, res} =
+                 Verilator.run_stream(sim, [interleave(samples, order)], [],
+                   valid_pct: vp,
+                   ready_pct: rp,
+                   seed: seed,
+                   tid: order,
+                   tuser: users,
+                   pc: pc
+                 )
+
+        assert res.outputs == [expected], "traffic #{inspect({vp, rp, seed})}"
+        assert res.tid == order
+        assert res.tuser == users
       end
     end
   end

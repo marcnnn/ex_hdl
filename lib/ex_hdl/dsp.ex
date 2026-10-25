@@ -23,8 +23,9 @@ defmodule ExHdl.DSP do
 
   `opts[:state]` is the index of the state argument in `args`. Runs the
   width check, then `ExHdl.Passes.Idioms` and `ExHdl.Passes.Recurrence`.
-  Further options: `:ii`, `:channels`, `:state_mem` and `:ram_latency`
-  (state of all channels in a memory, see `ExHdl.Backends.SystemVerilog.Scan`),
+  Further options: `:ii`, `:channels`, `:state_mem`, `:ram_latency` and
+  `:state_fold` (state of all channels in a memory, a channel's word over
+  `k` rows; see `ExHdl.Backends.SystemVerilog.Scan`),
   `:memories` (parameters that are RAMs read by `Nx.take`, `ExHdl.IR.Memory`),
   `frame: true` (the sample is `{data..., {first, last}}`, the flags come
   from the stream's `tlast`), timing overrides (`:family`, `:clock_mhz`,
