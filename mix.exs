@@ -23,10 +23,22 @@ defmodule ExHdl.MixProject do
   defp deps do
     [
       {:nx, "~> 1.0"},
-      {:nx_fixed, path: "../nx_fixed"},
+      sibling(:nx_fixed),
       # integration tests: SDR blocks through the hardware analyses
-      {:ex_sdr, path: "../ex_sdr", only: :test},
+      sibling(:ex_sdr, only: :test),
       {:stream_data, "~> 1.1", only: [:dev, :test]}
     ]
+  end
+
+  # A sibling checkout (by default ../<app>) when there is one, otherwise the
+  # GitHub repository. Inside deps/ always GitHub, so that every project in a
+  # dependency tree picks the same source.
+  defp sibling(app, opts \\ []) do
+    {path, opts} = Keyword.pop(opts, :path, "../#{app}")
+    nested? = Path.basename(Path.dirname(__DIR__)) == "deps"
+
+    if not nested? and File.dir?(Path.expand(path, __DIR__)),
+      do: {app, [path: path, override: true] ++ opts},
+      else: {app, [github: "marcnnn/#{app}"] ++ opts}
   end
 end

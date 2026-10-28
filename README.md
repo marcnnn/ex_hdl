@@ -8,24 +8,24 @@ generated as SystemVerilog, bit-identical.
 
 | Library | Scope |
 |---|---|
-| [nx_fixed](../nx_fixed) | number formats, fixed-point primitives, range analysis and width check for Nx |
-| [nx_simd](../nx_simd) | Nx compiler to native code for integer and quantized graphs |
-| [ex_sdr](../ex_sdr) | radio building blocks (DSP, channel coding, OFDM), DVB-T, GNU Radio comparisons |
+| [nx_fixed](https://github.com/marcnnn/nx_fixed) | number formats, fixed-point primitives, range analysis and width check for Nx |
+| [nx_simd](https://github.com/marcnnn/nx_simd) | Nx compiler to native code for integer and quantized graphs |
+| [ex_sdr](https://github.com/marcnnn/ex_sdr) | radio building blocks (DSP, channel coding, OFDM), DVB-T, GNU Radio comparisons |
 | **ex_hdl** (this one) | hardware: protocol DSL, SystemVerilog, scheduling and timing, co-simulation |
-| [elixir_type_laws](../elixir_type_laws) | set-theoretic laws checked against Elixir's type system |
+| [elixir_type_laws](https://github.com/marcnnn/elixir_type_laws) | set-theoretic laws checked against Elixir's type system |
 
 ExHdl only provides the basics: describing, simulating and building
 hardware. Function lives in the hardware library set built on it:
 
 | Library | Scope |
 |---|---|
-| [ex_hdl_cores](../ex_hdl_cores) | generic IP: FIFOs, CRC, arbiters, AXI4-Stream plumbing |
-| [ex_hdl_xilinx](../ex_hdl_xilinx) | Xilinx primitives, constraints, boards, Vivado |
-| [ex_net](../ex_net) | Ethernet MAC, PCS, VLAN/IPv4/UDP/IGMP |
-| [ex_ptp](../ex_ptp) | IEEE 1588: timestamping, wallclock, servo, BMCA |
-| [ex_aes67](../ex_aes67) | RTP streams, jitter buffer, SAP/SDP, RTSP, mDNS, NMOS |
-| [ex_audio](../ex_audio) | audio DSP kernels: EQ, dynamics, matrix mixer, meters |
-| [ex_pcie](../ex_pcie) | PCIe DMA and BAR access, host side over vfio |
+| [ex_hdl_cores](https://github.com/marcnnn/ex_hdl_cores) | generic IP: FIFOs, CRC, arbiters, AXI4-Stream plumbing |
+| [ex_hdl_xilinx](https://github.com/marcnnn/ex_hdl_xilinx) | Xilinx primitives, constraints, boards, Vivado |
+| [ex_net](https://github.com/marcnnn/ex_net) | Ethernet MAC, PCS, VLAN/IPv4/UDP/IGMP |
+| [ex_ptp](https://github.com/marcnnn/ex_ptp) | IEEE 1588: timestamping, wallclock, servo, BMCA |
+| [ex_aes67](https://github.com/marcnnn/ex_aes67) | RTP streams, jitter buffer, SAP/SDP, RTSP, mDNS, NMOS |
+| [ex_audio](https://github.com/marcnnn/ex_audio) | audio DSP kernels: EQ, dynamics, matrix mixer, meters |
+| [ex_pcie](https://github.com/marcnnn/ex_pcie) | PCIe DMA and BAR access, host side over vfio |
 
 ## Status
 
@@ -354,9 +354,9 @@ The split costs flip-flops: the adder trees of the pieces are registered
 per level (about 60 bits each), where Yosys's own mapping used 20 slices
 and fewer registers.
 
-The sibling libraries are path dependencies (`../nx_fixed`, and
-`../ex_sdr` for integration tests); `scripts/checkout_siblings.sh` clones
-them. Requires Elixir 1.18+ and Verilator 5 for co-simulation.
+The sibling libraries (nx_fixed, and ex_sdr for integration tests) come
+from checkouts next to this one (`../nx_fixed`, `../ex_sdr`) when there are
+any, otherwise from GitHub. Requires Elixir 1.18+ and Verilator 5 for co-simulation.
 
 ## Frame blocks in hardware
 
