@@ -549,3 +549,7 @@ the 2048 clocks of its FFT output.
   copy. `ExHdl.OFDM.Plan` rebuilds the pilot and weight constants from
   `spec.ofdm` as `tables/3` does (float32 first); a public per-class table
   function would remove that duplication. Nothing in ex_sdr was changed.
+
+## License
+
+Apache-2.0, see `LICENSE`.
