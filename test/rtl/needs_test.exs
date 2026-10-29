@@ -637,6 +637,7 @@ defmodule ExHdl.RTL.NeedsTest do
       end
     end
 
+    @tag :verilator
     test "re-exports every data port of a hosted module, even with the instance as prefix" do
       top =
         module "host_x" do
@@ -657,6 +658,7 @@ defmodule ExHdl.RTL.NeedsTest do
       assert Enum.map(out, &{&1.x_y_y, &1.x_y_z}) == [{0, 1}, {5, 0}]
     end
 
+    @tag :verilator
     test "only:, except:, dirs: and connect: combine" do
       top =
         module "host_x2" do

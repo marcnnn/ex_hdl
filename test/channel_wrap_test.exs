@@ -34,9 +34,9 @@ defmodule ExHdl.ChannelWrapTest do
     assert %{type: {:u, 160}} = Enum.find(bb.ports, &(&1.name == :pc_data))
   end
 
-  @tag :verilator
   for clock <- [:shared, :separate] do
     @clock clock
+    @tag :verilator
     test "a wrapped channel kernel lints inside an RTL design, pc_clock: #{clock}" do
       d = design("bq_w_#{@clock}", pc_clock: @clock)
       axis_in = Interface.axi_stream(data: d.in_width, keep: false, last: false, id: 4, user: 8)
