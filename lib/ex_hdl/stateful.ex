@@ -53,9 +53,11 @@ defmodule ExHdl.Stateful do
           add_wrap: 3,
           sub_wrap: 2,
           sub_wrap: 3,
-          match: 2
+          match: 2,
+          match_cond: 1
         ]
 
+      import ExHdl.RTL.Builder, only: [read_port: 2, write_port: 2]
       alias ExHdl.RTL.Interface
 
       Module.register_attribute(__MODULE__, :stateful_ports, accumulate: true)
@@ -129,7 +131,8 @@ defmodule ExHdl.Stateful do
             add_wrap: 3,
             sub_wrap: 2,
             sub_wrap: 3,
-            match: 2
+            match: 2,
+            match_cond: 1
           ]
 
         unquote(block)
@@ -187,8 +190,49 @@ defmodule ExHdl.Stateful do
             Expr.eq(subject, single)
         end
 
-      Expr.mux(cond_expr, res_val, acc)
+      mux_values(cond_expr, res_val, acc)
     end)
+  end
+
+  @doc """
+  Multi-branch conditional match across hardware expressions and software values.
+  Evaluates clauses sequentially, returning the value of the first true condition.
+  Works transparently with scalar values, maps, and tuples.
+  """
+  def match_cond(clauses) when is_list(clauses) do
+    {default, cases} =
+      case List.last(clauses) do
+        {:default, def_val} -> {def_val, :lists.droplast(clauses)}
+        {:_, def_val} -> {def_val, :lists.droplast(clauses)}
+        _ -> {0, clauses}
+      end
+
+    Enum.reduce(Enum.reverse(cases), default, fn {cond_expr, res_val}, acc ->
+      mux_values(cond_expr, res_val, acc)
+    end)
+  end
+
+  @doc false
+  def mux_values(cond_expr, %Expr{} = a, b), do: mux(cond_expr, a, b)
+  def mux_values(cond_expr, a, %Expr{} = b), do: mux(cond_expr, a, b)
+  def mux_values(cond_expr, %{__struct__: _} = a, b), do: mux(cond_expr, a, b)
+
+  def mux_values(cond_expr, %{} = a, %{} = b) do
+    for {k, va} <- a, into: %{} do
+      {k, mux_values(cond_expr, va, Map.fetch!(b, k))}
+    end
+  end
+
+  def mux_values(cond_expr, {a1, a2}, {b1, b2}) do
+    {mux_values(cond_expr, a1, b1), mux_values(cond_expr, a2, b2)}
+  end
+
+  def mux_values(cond_expr, {a1, a2, a3}, {b1, b2, b3}) do
+    {mux_values(cond_expr, a1, b1), mux_values(cond_expr, a2, b2), mux_values(cond_expr, a3, b3)}
+  end
+
+  def mux_values(cond_expr, a, b) do
+    mux(cond_expr, a, b)
   end
 
   @doc "Wrapping addition for hardware expressions and software integers."
