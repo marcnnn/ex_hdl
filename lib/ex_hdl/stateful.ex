@@ -43,6 +43,8 @@ defmodule ExHdl.Stateful do
 
       import ExHdl.Stateful,
         only: [
+          stateful: 2,
+          stateful: 3,
           unpack: 2,
           pack: 1,
           mux: 2,
@@ -72,26 +74,66 @@ defmodule ExHdl.Stateful do
 
     struct_fields = for r <- regs, do: {r.name, r.opts[:reset] || 0}
 
+    if ports != [] or regs != [] do
+      quote do
+        defstruct unquote(struct_fields)
+
+        def __stateful_ports__, do: unquote(Macro.escape(ports))
+        def __stateful_regs__, do: unquote(Macro.escape(regs))
+        def __stateful_mems__, do: unquote(Macro.escape(mems))
+
+        @doc "Elaborates the stateful component into an %ExHdl.RTL.Module{}."
+        def build(opts \\ []) do
+          ExHdl.Stateful.Compiler.build(__MODULE__, opts)
+        end
+
+        @doc "Simulates the component in pure Elixir on the BEAM."
+        def simulate(input_stream, initial_state \\ nil) do
+          init = initial_state || struct(__MODULE__)
+
+          Enum.map_reduce(input_stream, init, fn in_cycle, st ->
+            step(in_cycle, st)
+          end)
+        end
+      end
+    end
+  end
+
+  @doc """
+  Builds a dynamic / parameterized stateful hardware module:
+
+      stateful name, opts do
+        ports do ... end
+        state do ... end
+        memory ...
+        step fn inputs, state -> ... end
+      end
+  """
+  defmacro stateful(name, opts \\ [], do: block) do
     quote do
-      defstruct unquote(struct_fields)
+      ExHdl.Stateful.Dynamic.build(unquote(name), unquote(opts), fn ->
+        import Kernel, except: unquote(Ops.kernel_excludes())
+        import Bitwise, only: [band: 2, bor: 2, bnot: 1, bsl: 2, bsr: 2], warn: false
+        import ExHdl.RTL.Ops, warn: false
+        import ExHdl.Stateful.DSL, except: [ports: 1, state: 1, memory: 2]
+        import ExHdl.Stateful.Dynamic.DSL
+        import ExHdl.RTL.Expr, except: [mux: 2, mux: 3, add_wrap: 2, sub_wrap: 2]
 
-      def __stateful_ports__, do: unquote(Macro.escape(ports))
-      def __stateful_regs__, do: unquote(Macro.escape(regs))
-      def __stateful_mems__, do: unquote(Macro.escape(mems))
+        import ExHdl.Stateful,
+          only: [
+            unpack: 2,
+            pack: 1,
+            mux: 2,
+            mux: 3,
+            add_wrap: 2,
+            add_wrap: 3,
+            sub_wrap: 2,
+            sub_wrap: 3,
+            match: 2
+          ]
 
-      @doc "Elaborates the stateful component into an %ExHdl.RTL.Module{}."
-      def build(opts \\ []) do
-        ExHdl.Stateful.Compiler.build(__MODULE__, opts)
-      end
-
-      @doc "Simulates the component in pure Elixir on the BEAM."
-      def simulate(input_stream, initial_state \\ nil) do
-        init = initial_state || struct(__MODULE__)
-
-        Enum.map_reduce(input_stream, init, fn in_cycle, st ->
-          step(in_cycle, st)
-        end)
-      end
+        unquote(block)
+      end)
     end
   end
 
@@ -111,14 +153,6 @@ defmodule ExHdl.Stateful do
 
   @doc """
   Functional pattern match expression across both software and hardware.
-
-  Examples:
-
-      next_state = match state.mode, [
-        {0, :idle_result},
-        {[1, 2], :active_result},
-        {:default, :fallback}
-      ]
   """
   def match(subject, clauses) when is_integer(subject) or is_atom(subject) do
     Enum.find_value(clauses, fn
@@ -190,8 +224,6 @@ defmodule ExHdl.Stateful do
   @doc """
   Unpacks a word into fields. Works seamlessly on `%ExHdl.RTL.Expr{}` hardware
   signals and software integers/binaries.
-
-  `fields` is a list of `{name, width}` or `width` (with optional `{:s, w}` for signed).
   """
   def unpack(word, fields) when is_list(fields) do
     is_keyword = Keyword.keyword?(fields)
@@ -426,5 +458,162 @@ defmodule ExHdl.Stateful.Compiler do
     |> Module.split()
     |> List.last()
     |> Macro.underscore()
+  end
+end
+
+defmodule ExHdl.Stateful.Dynamic do
+  @moduledoc "Dynamic builder for parameterized stateful hardware modules."
+
+  alias ExHdl.RTL.Builder
+
+  @key {__MODULE__, :context}
+
+  def build(name, opts, fun) do
+    ctx = %{
+      ports: [],
+      regs: [],
+      mems: %{},
+      step_fn: nil
+    }
+
+    prev = Process.get(@key)
+    Process.put(@key, ctx)
+
+    try do
+      # 1. Execute elaboration block
+      fun.()
+      ctx = Process.get(@key)
+
+      ports_spec = Enum.reverse(ctx.ports)
+      regs_spec = Enum.reverse(ctx.regs)
+      step_fn = ctx.step_fn || raise(ArgumentError, "stateful #{name}: missing step function")
+
+      out_names = for p <- ports_spec, p.dir == :output, do: p.name
+      reg_names = for r <- regs_spec, do: r.name
+
+      Builder.build(:module, name, opts, fn ->
+        input_handles =
+          for p <- ports_spec, p.dir == :input, into: %{} do
+            {p.name, Builder.input(p.name, p.type, p.opts)}
+          end
+
+        reg_handles =
+          for r <- regs_spec, into: %{} do
+            handle =
+              if r.name in out_names do
+                out_port = Enum.find(ports_spec, &(&1.name == r.name and &1.dir == :output))
+                merged_opts = [reg: true, reset: r.opts[:reset] || 0] ++ out_port.opts ++ r.opts
+                Builder.output(r.name, r.type, merged_opts)
+              else
+                Builder.reg(r.name, r.type, r.opts)
+              end
+
+            {r.name, handle}
+          end
+
+        comb_out_handles =
+          for p <- ports_spec, p.dir == :output, p.name not in reg_names, into: %{} do
+            {p.name, Builder.output(p.name, p.type, p.opts)}
+          end
+
+        # Evaluate pure step function!
+        {outputs, next_state} = step_fn.(input_handles, reg_handles)
+
+        # Drive combinational outputs
+        for {out_name, out_handle} <- comb_out_handles do
+          case Map.fetch(outputs, out_name) do
+            {:ok, val} -> Builder.assign(out_handle, val)
+            :error -> :ok
+          end
+        end
+
+        # Drive next state inside sync
+        Builder.sync(:sys, fn ->
+          for r <- regs_spec do
+            reg_handle = reg_handles[r.name]
+            next_val = Map.get(next_state, r.name)
+
+            if next_val != nil do
+              Builder.assign(reg_handle, next_val)
+            end
+          end
+        end)
+      end)
+    after
+      Process.put(@key, prev)
+    end
+  end
+
+  def add_port(dir, name, type, opts) do
+    ctx = Process.get(@key)
+    Process.put(@key, %{ctx | ports: [%{dir: dir, name: name, type: type, opts: opts} | ctx.ports]})
+  end
+
+  def add_reg(name, type, opts) do
+    ctx = Process.get(@key)
+    Process.put(@key, %{ctx | regs: [%{name: name, type: type, opts: opts} | ctx.regs]})
+  end
+
+  def set_step(fun) do
+    ctx = Process.get(@key)
+    Process.put(@key, %{ctx | step_fn: fun})
+  end
+
+  defmodule DSL do
+    @moduledoc false
+
+    defmacro ports(do: block) do
+      quote do
+        import ExHdl.Stateful.Dynamic.DSL.Ports
+        unquote(block)
+      end
+    end
+
+    defmacro state(do: block) do
+      quote do
+        import ExHdl.Stateful.Dynamic.DSL.State
+        unquote(block)
+      end
+    end
+
+    def memory(name, opts) do
+      Builder.memory(name, opts)
+    end
+
+    def wire(name, expr) do
+      Builder.wire(name, expr, [])
+    end
+
+    def read_port(mem, opts) do
+      Builder.read_port(mem, opts)
+    end
+
+    def write_port(mem, opts) do
+      Builder.write_port(mem, opts)
+    end
+
+    def step(fun) when is_function(fun, 2) do
+      ExHdl.Stateful.Dynamic.set_step(fun)
+    end
+
+    defmodule Ports do
+      @moduledoc false
+
+      def input(name, type, opts \\ []) do
+        ExHdl.Stateful.Dynamic.add_port(:input, name, type, opts)
+      end
+
+      def output(name, type, opts \\ []) do
+        ExHdl.Stateful.Dynamic.add_port(:output, name, type, opts)
+      end
+    end
+
+    defmodule State do
+      @moduledoc false
+
+      def reg(name, type, opts \\ []) do
+        ExHdl.Stateful.Dynamic.add_reg(name, type, opts)
+      end
+    end
   end
 end
