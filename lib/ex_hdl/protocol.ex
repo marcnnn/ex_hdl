@@ -10,10 +10,12 @@ defmodule ExHdl.Protocol do
 
         defpacket :iq_frame, bus_width: 32, byte_order: :little do
           header on_mismatch: :drop_packet do
-            field :magic,      16, assert: 0x55AA
-            field :channel_id, 8,  type: :u8
-            field :gain_q15,   16, type: :s16
-            ...
+            <<
+              magic::16 - assert(0x55AA),
+              channel_id::8 - type(:u8),
+              gain_q15::16 - type(:s16),
+              ...
+            >>
           end
 
           payload :stream, type: {:complex, :s16}
@@ -24,40 +26,50 @@ defmodule ExHdl.Protocol do
   style of a P4 parser):
 
       defheader :eth do
-        field :dst, 48
-        field :src, 48
-        field :ethertype, 16, type: {:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800}
+        <<
+          dst::48,
+          src::48,
+          ethertype::16 - type({:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800})
+        >>
       end
 
       defheader :vlan do
-        field :pcp, 3
-        field :dei, 1, type: :flag
-        field :vid, 12
-        field :ethertype, 16, type: {:enum, vlan: 0x8100, ipv4: 0x0800}
+        <<
+          pcp::3,
+          dei::1 - flag,
+          vid::12,
+          ethertype::16 - type({:enum, vlan: 0x8100, ipv4: 0x0800})
+        >>
       end
 
       defheader :ipv4 do
-        field :version, 4, assert: 4
-        field :ihl, 4, header_length: 4          # header is ihl * 4 bytes
-        field :dscp_ecn, 8
-        field :total_length, 16, length: :total  # this header + everything after it
-        field :id, 16
-        field :flags, 3
-        field :frag_offset, 13
-        field :ttl, 8
-        field :protocol, 8
-        field :checksum, 16, checksum: :header
-        field :src, 32
-        field :dst, 32
-        field :options, :bytes                   # the rest of the header
+        <<
+          version::4 - assert(4) - error(:not_ipv4),
+          ihl::4 - header_length(4),
+          dscp_ecn::8,
+          total_length::16 - length(:total),
+          id::16,
+          flags::3,
+          frag_offset::13,
+          ttl::8,
+          protocol::8,
+          checksum::16 - checksum(:header),
+          src::32,
+          dst::32,
+          options::bytes
+        >>
       end
 
       defheader :udp do
-        field :src_port, 16
-        field :dst_port, 16, match: 4            # 4-entry runtime table in hardware
-        field :length, 16, length: :total
-        field :checksum, 16, checksum: :segment, optional: true,
-          pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
+        <<
+          src_port::16,
+          dst_port::16 - match(4),
+          length::16 - length(:total),
+          checksum::16 - checksum(:segment,
+            optional: true,
+            pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
+          )
+        >>
       end
 
       defpacket :udp_rx, bus_width: 64 do
@@ -68,27 +80,26 @@ defmodule ExHdl.Protocol do
         payload :data, type: :bytes
       end
 
-  ## Fields
+  Headers can also be declared using the legacy macro syntax:
+  `field :dst, 48`, `field :ethertype, 16, type: {:enum, ...}`.
 
-  `field name, bits, opts`. Options:
+  ## Fields & Bitstring Syntax
 
-    * `type:` - `:uN` / `:sN` (default unsigned), `:flag` (1 bit, a boolean)
-      or `{:enum, name: value, ...}` (decodes to the name if known, encodes
-      names or integers)
-    * `assert: value` - the packet is dropped unless the field has this value
-    * `error: reason` - decode returns `{:error, reason}` when this field's
-      check fails, instead of the default tuple
-    * `match: n` - compared at run time against a table: in hardware `n`
-      entries from input ports, on the BEAM the `match:` decode option
-    * `length: :total` - bytes from the start of this layer to the end of the
-      packet; computed on encode, checked on decode, and the packet is cut
-      there (Ethernet padding is dropped)
-    * `header_length: unit` - the layer's header is `value * unit` bytes; the
-      last field `field :options, :bytes` holds the bytes past the fixed part
-    * `checksum: :header` - RFC 1071 checksum over this layer's header
-    * `checksum: :segment` - checksum over `pseudo:` fields (each zero-extended
-      to 16-bit words), this layer and the payload; `optional: true` means a
-      transmitted 0 is not checked and a computed 0 is sent as `0xFFFF` (UDP)
+  Fields can be declared with native Elixir bitstrings (`<<...>>`) or `field/2,3`.
+  Bitstring modifiers map directly to field options:
+
+    * `name::bits` - unsigned integer of `bits` width
+    * `name::signed-bits` or `name::bits - signed` - signed integer
+    * `name::bits - flag` or `name::bits - type(:flag)` - 1-bit boolean flag
+    * `name::bits - type({:enum, name: value, ...})` - enum
+    * `name::bits - assert(value)` or `(name = value)::bits` or `name::bits - value`
+    * `name::bits - error(reason)` - custom error reason on mismatch
+    * `name::bits - match(n)` - runtime match table with `n` entries
+    * `name::bits - length(:total)` - layer total length
+    * `name::bits - header_length(unit)` - variable header multiplier
+    * `name::bits - checksum(:header)` - RFC 1071 header checksum
+    * `name::bits - checksum(:segment, optional: true, pseudo: [...])` - UDP segment checksum
+    * `name::bytes` or `name::binary` - variable-length tail
 
   ## Layers
 
@@ -122,7 +133,7 @@ defmodule ExHdl.Protocol do
   `ExHdl.Backends.SystemVerilog.Protocol` for the hardware.
   """
 
-  alias ExHdl.Protocol.Spec
+  alias ExHdl.Protocol.{Bitstring, Spec}
 
   defmacro __using__(_opts) do
     quote do
@@ -134,20 +145,24 @@ defmodule ExHdl.Protocol do
   end
 
   defmacro defpacket(name, opts \\ [], do: block) do
+    transformed_block = Bitstring.transform_packet_block(block)
+
     quote do
       ExHdl.Protocol.Builder.start(__MODULE__, unquote(name), unquote(opts))
       import ExHdl.Protocol.DSL
-      unquote(block)
+      unquote(transformed_block)
       import ExHdl.Protocol.DSL, only: []
       ExHdl.Protocol.Builder.finish(__MODULE__)
     end
   end
 
   defmacro defheader(name, do: block) do
+    transformed_block = Bitstring.transform_ast(block)
+
     quote do
       ExHdl.Protocol.Builder.start_header(__MODULE__, unquote(name))
       import ExHdl.Protocol.DSL, only: [field: 2, field: 3]
-      unquote(block)
+      unquote(transformed_block)
       import ExHdl.Protocol.DSL, only: []
       ExHdl.Protocol.Builder.finish_header(__MODULE__)
     end
@@ -195,11 +210,14 @@ end
 
 defmodule ExHdl.Protocol.DSL do
   @moduledoc false
+  alias ExHdl.Protocol.Bitstring
 
   defmacro header(opts \\ [], do: block) do
+    transformed_block = Bitstring.transform_ast(block)
+
     quote do
       ExHdl.Protocol.Builder.header(__MODULE__, unquote(opts))
-      unquote(block)
+      unquote(transformed_block)
     end
   end
 

@@ -155,9 +155,35 @@ defmodule ExHdl.Stateful do
   def mux(sel, list) when is_integer(sel) and is_list(list), do: Enum.at(list, sel)
 
   @doc """
-  Functional pattern match expression across both software and hardware.
+  Idiomatic pattern matching expression across both software and hardware.
+  Supports `match expr do pattern -> result ... end` as well as clause lists.
   """
-  def match(subject, clauses) when is_integer(subject) or is_atom(subject) do
+  defmacro match(subject, clauses) do
+    if Keyword.keyword?(clauses) and Keyword.has_key?(clauses, :do) do
+      do_block = Keyword.fetch!(clauses, :do)
+      clause_list =
+        case do_block do
+          [{:->, _, _} | _] -> do_block
+          {:->, _, _} -> [do_block]
+        end
+
+      cases =
+        Enum.map(clause_list, fn {:->, _meta, [[pattern], body]} ->
+          cond_expr = build_pattern_cond(subject, pattern)
+          {cond_expr, body}
+        end)
+
+      quote do
+        ExHdl.Stateful.match_cond(unquote(cases))
+      end
+    else
+      quote do
+        ExHdl.Stateful.runtime_match(unquote(subject), unquote(clauses))
+      end
+    end
+  end
+
+  def runtime_match(subject, clauses) when is_integer(subject) or is_atom(subject) do
     Enum.find_value(clauses, fn
       {:default, val} ->
         val
@@ -170,7 +196,7 @@ defmodule ExHdl.Stateful do
     end)
   end
 
-  def match(%Expr{} = subject, clauses) do
+  def runtime_match(%Expr{} = subject, clauses) do
     {default, cases} =
       case List.last(clauses) do
         {:default, def_val} -> {def_val, :lists.droplast(clauses)}
@@ -192,6 +218,49 @@ defmodule ExHdl.Stateful do
 
       mux_values(cond_expr, res_val, acc)
     end)
+  end
+
+  defp build_pattern_cond(_subject, {:_, _, _}), do: :default
+
+  defp build_pattern_cond(subject, {:when, _meta, [pat, guard]}) do
+    base = build_pattern_cond(subject, pat)
+
+    if base == :default do
+      guard
+    else
+      quote do: unquote(base) and unquote(guard)
+    end
+  end
+
+  defp build_pattern_cond(subject, pattern) do
+    sub_elems = tuple_elements(subject)
+    pat_elems = tuple_elements(pattern)
+
+    if length(sub_elems) > 1 and length(sub_elems) == length(pat_elems) do
+      Enum.zip(sub_elems, pat_elems)
+      |> Enum.map(fn {s, p} -> build_single_cond(s, p) end)
+      |> Enum.reject(&(&1 == :always_true))
+      |> case do
+        [] -> quote do: 1
+        [single] -> single
+        list ->
+          Enum.reduce(list, fn c, acc ->
+            quote do: unquote(acc) and unquote(c)
+          end)
+      end
+    else
+      build_single_cond(subject, pattern)
+    end
+  end
+
+  defp tuple_elements({:{}, _meta, elements}), do: elements
+  defp tuple_elements({a, b}), do: [a, b]
+  defp tuple_elements(other), do: [other]
+
+  defp build_single_cond(_s, {:_, _, _}), do: :always_true
+  defp build_single_cond(true, p), do: p
+  defp build_single_cond(s, p) do
+    quote do: unquote(s) == unquote(p)
   end
 
   @doc """

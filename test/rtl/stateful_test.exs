@@ -182,6 +182,50 @@ defmodule ExHdl.RTL.StatefulTest do
     assert u.lut > 0
   end
 
+  defmodule PatternFsm do
+    use ExHdl.Stateful
+
+    ports do
+      input :tick, 1
+      output :mode, 2
+      output :active, 1
+    end
+
+    state do
+      reg :mode, 2, reset: 0
+    end
+
+    def step(inputs, state) do
+      next_mode =
+        match {state.mode, inputs.tick} do
+          {0, 1} -> 1
+          {1, 1} -> 2
+          {2, 1} -> 0
+          _ -> state.mode
+        end
+
+      outputs = %{
+        mode: state.mode,
+        active:
+          match state.mode do
+            1 -> 1
+            2 -> 1
+            _ -> 0
+          end
+      }
+
+      next_state = %{state | mode: next_mode}
+      {outputs, next_state}
+    end
+  end
+
+  test "match do ... end macro works in simulation and hardware elaboration" do
+    m = PatternFsm.build()
+    assert m.name == "pattern_fsm"
+    sources = SV.generate(m)
+    assert Map.has_key?(sources, "pattern_fsm.sv")
+  end
+
   test "unpack and pack helpers work on integers and hardware expressions" do
     # Software integer unpacking
     # word = 1 (valid=1) << 56 | 0x1234 (tag) << 24 | 0x5678 (sample)

@@ -5,12 +5,14 @@ defmodule ExHdl.Test.Protocols do
   # The iq_frame from the architecture plan: 4 header words on a 32-bit bus.
   defpacket :iq_frame, bus_width: 32, byte_order: :little do
     header on_mismatch: :drop_packet do
-      field(:magic, 16, assert: 0x55AA)
-      field(:channel_id, 8, type: :u8)
-      field(:flags, 8, type: :u8)
-      field(:gain_q15, 16, type: :s16)
-      field(:seq_num, 16, type: :u16)
-      field(:timestamp, 64, type: :u64)
+      <<
+        magic::16 - assert(0x55AA),
+        channel_id::8 - type(:u8),
+        flags::8 - type(:u8),
+        gain_q15::16 - type(:s16),
+        seq_num::16 - type(:u16),
+        timestamp::64 - type(:u64)
+      >>
     end
 
     payload(:stream, type: {:complex, :s16})
@@ -20,12 +22,14 @@ defmodule ExHdl.Test.Protocols do
   # byte payload so the last beat can have a partial tkeep.
   defpacket :be_frame, bus_width: 64, byte_order: :big do
     header do
-      field(:version, 4, assert: 6)
-      field(:tclass, 8)
-      field(:flow, 20)
-      field(:len, 16)
-      field(:next, 8)
-      field(:hops, 8, type: :s8)
+      <<
+        version::4 - assert(6),
+        tclass::8,
+        flow::20,
+        len::16,
+        next::8,
+        hops::8 - type(:s8)
+      >>
     end
 
     payload(:data, type: :u8)
@@ -34,10 +38,12 @@ defmodule ExHdl.Test.Protocols do
   # 5-byte header on a 32-bit bus: the payload starts in lane 1.
   defpacket :odd_frame, bus_width: 32 do
     header do
-      field(:kind, 4, type: {:enum, data: 1, ctrl: 2})
-      field(:urgent, 1, type: :flag)
-      field(:tag, 3, assert: 5)
-      field(:seq, 32)
+      <<
+        kind::4 - type({:enum, data: 1, ctrl: 2}),
+        urgent::1 - flag,
+        tag::3 - assert(5),
+        seq::32
+      >>
     end
 
     payload(:words, type: :u16)
@@ -51,47 +57,53 @@ defmodule ExHdl.Test.NetProtocols do
   use ExHdl.Protocol
 
   defheader :eth do
-    field(:dst, 48)
-    field(:src, 48)
-    field(:ethertype, 16, type: {:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800})
+    <<
+      dst::48,
+      src::48,
+      ethertype::16 - type({:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800})
+    >>
   end
 
   defheader :vlan do
-    field(:pcp, 3)
-    field(:dei, 1, type: :flag)
-    field(:vid, 12)
-    field(:ethertype, 16, type: {:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800})
+    <<
+      pcp::3,
+      dei::1 - flag,
+      vid::12,
+      ethertype::16 - type({:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800})
+    >>
   end
 
   defheader :ipv4 do
-    field(:version, 4, assert: 4, error: :not_ipv4)
-    field(:ihl, 4, header_length: 4)
-    field(:dscp, 6)
-    field(:ecn, 2)
-    field(:total_length, 16, length: :total)
-    field(:id, 16)
-    field(:reserved, 1)
-    field(:df, 1, type: :flag)
-    field(:mf, 1, type: :flag)
-    field(:frag_offset, 13)
-    field(:ttl, 8)
-    field(:protocol, 8, type: {:enum, udp: 17})
-    field(:checksum, 16, checksum: :header)
-    field(:src, 32)
-    field(:dst, 32)
-    field(:options, :bytes)
+    <<
+      version::4 - assert(4) - error(:not_ipv4),
+      ihl::4 - header_length(4),
+      dscp::6,
+      ecn::2,
+      total_length::16 - length(:total),
+      id::16,
+      reserved::1,
+      df::1 - flag,
+      mf::1 - flag,
+      frag_offset::13,
+      ttl::8,
+      protocol::8 - type({:enum, udp: 17}),
+      checksum::16 - checksum(:header),
+      src::32,
+      dst::32,
+      options::bytes
+    >>
   end
 
   defheader :udp do
-    field(:src_port, 16)
-    field(:dst_port, 16, match: 4)
-    field(:length, 16, length: :total)
-
-    field(:checksum, 16,
-      checksum: :segment,
-      optional: true,
-      pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
-    )
+    <<
+      src_port::16,
+      dst_port::16 - match(4),
+      length::16 - length(:total),
+      checksum::16 - checksum(:segment,
+        optional: true,
+        pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
+      )
+    >>
   end
 
   for w <- [8, 32, 64] do

@@ -71,43 +71,54 @@ mix ex_hdl.gen.sv MyApp.Kernels --out hdl/generated --synth   # stream kernels, 
 ## Packets in hardware
 
 `defpacket` describes a header chain once; it becomes a BEAM codec and an
-AXI4-Stream parser and emitter. The AES67 receive chain:
+AXI4-Stream parser and emitter. Headers can be defined with idiomatic Elixir
+binary pattern matching syntax (`<<...>>`) or `field/2,3`. The AES67 receive chain:
 
 ```elixir
 defheader :eth do
-  field :dst, 48
-  field :src, 48
-  field :ethertype, 16, type: {:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800}
+  <<
+    dst::48,
+    src::48,
+    ethertype::16 - type({:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800})
+  >>
 end
 
 defheader :vlan do
-  field :pcp, 3
-  field :dei, 1, type: :flag
-  field :vid, 12
-  field :ethertype, 16, type: {:enum, vlan: 0x8100, ipv4: 0x0800}
+  <<
+    pcp::3,
+    dei::1 - flag,
+    vid::12,
+    ethertype::16 - type({:enum, vlan: 0x8100, ipv4: 0x0800})
+  >>
 end
 
 defheader :ipv4 do
-  field :version, 4, assert: 4, error: :not_ipv4
-  field :ihl, 4, header_length: 4
-  field :dscp_ecn, 8
-  field :total_length, 16, length: :total
-  field :id, 16
-  field :flags_frag, 16
-  field :ttl, 8
-  field :protocol, 8
-  field :checksum, 16, checksum: :header
-  field :src, 32
-  field :dst, 32
-  field :options, :bytes
+  <<
+    version::4 - assert(4) - error(:not_ipv4),
+    ihl::4 - header_length(4),
+    dscp_ecn::8,
+    total_length::16 - length(:total),
+    id::16,
+    flags_frag::16,
+    ttl::8,
+    protocol::8,
+    checksum::16 - checksum(:header),
+    src::32,
+    dst::32,
+    options::bytes
+  >>
 end
 
 defheader :udp do
-  field :src_port, 16
-  field :dst_port, 16, match: 4
-  field :length, 16, length: :total
-  field :checksum, 16, checksum: :segment, optional: true,
-    pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
+  <<
+    src_port::16,
+    dst_port::16 - match(4),
+    length::16 - length(:total),
+    checksum::16 - checksum(:segment,
+      optional: true,
+      pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
+    )
+  >>
 end
 
 defpacket :udp_rx, bus_width: 64 do
