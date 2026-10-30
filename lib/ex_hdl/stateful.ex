@@ -54,7 +54,9 @@ defmodule ExHdl.Stateful do
           sub_wrap: 2,
           sub_wrap: 3,
           match: 2,
-          match_cond: 1
+          match_cond: 1,
+          defpattern: 2,
+          defpatternp: 2
         ]
 
       import ExHdl.RTL.Builder, only: [read_port: 2, write_port: 2]
@@ -153,6 +155,52 @@ defmodule ExHdl.Stateful do
 
   def mux(%Expr{} = sel, list), do: Expr.mux(sel, list)
   def mux(sel, list) when is_integer(sel) and is_list(list), do: Enum.at(list, sel)
+
+  @doc """
+  Defines a public pattern-matched function whose clauses match across argument values.
+  Works transparently in both software simulation and hardware elaboration.
+  """
+  defmacro defpattern({name, meta, args}, [do: clauses]) do
+    expand_defpattern(:def, name, meta, args, clauses)
+  end
+
+  @doc """
+  Defines a private pattern-matched function whose clauses match across argument values.
+  """
+  defmacro defpatternp({name, meta, args}, [do: clauses]) do
+    expand_defpattern(:defp, name, meta, args, clauses)
+  end
+
+  defp expand_defpattern(kind, name, meta, args, clauses) do
+    clause_list =
+      case clauses do
+        [{:->, _, _} | _] -> clauses
+        {:->, _, _} -> [clauses]
+      end
+
+    subj =
+      case args do
+        [single] -> single
+        list -> {:{}, [], list}
+      end
+
+    transformed_clauses =
+      Enum.map(clause_list, fn {:->, cmeta, [patterns, body]} ->
+        pat =
+          case patterns do
+            [single] -> [single]
+            list -> [{:{}, [], list}]
+          end
+
+        {:->, cmeta, [pat, body]}
+      end)
+
+    quote do
+      unquote(kind)(unquote({name, meta, args})) do
+        unquote({:match, [], [subj, [do: transformed_clauses]]})
+      end
+    end
+  end
 
   @doc """
   Idiomatic pattern matching expression across both software and hardware.
@@ -258,6 +306,7 @@ defmodule ExHdl.Stateful do
   defp tuple_elements(other), do: [other]
 
   defp build_single_cond(_s, {:_, _, _}), do: :always_true
+  defp build_single_cond(_s, {name, _, ctx}) when is_atom(name) and is_atom(ctx), do: :always_true
   defp build_single_cond(true, p), do: p
   defp build_single_cond(s, p) do
     quote do: ExHdl.RTL.Ops.==(unquote(s), unquote(p))
