@@ -228,7 +228,7 @@ defmodule ExHdl.Stateful do
     if base == :default do
       guard
     else
-      quote do: unquote(base) and unquote(guard)
+      quote do: ExHdl.RTL.Ops.and(unquote(base), unquote(guard))
     end
   end
 
@@ -245,7 +245,7 @@ defmodule ExHdl.Stateful do
         [single] -> single
         list ->
           Enum.reduce(list, fn c, acc ->
-            quote do: unquote(acc) and unquote(c)
+            quote do: ExHdl.RTL.Ops.and(unquote(acc), unquote(c))
           end)
       end
     else
@@ -260,7 +260,7 @@ defmodule ExHdl.Stateful do
   defp build_single_cond(_s, {:_, _, _}), do: :always_true
   defp build_single_cond(true, p), do: p
   defp build_single_cond(s, p) do
-    quote do: unquote(s) == unquote(p)
+    quote do: ExHdl.RTL.Ops.==(unquote(s), unquote(p))
   end
 
   @doc """
