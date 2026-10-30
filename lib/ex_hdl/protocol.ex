@@ -3,20 +3,21 @@ defmodule ExHdl.Protocol do
   DSL for packet layouts that compile to both BEAM binary codecs and AXI4-Stream
   hardware.
 
+  Headers are written as plain Elixir binary patterns, the same ones a BEAM
+  parser would use in a function head, so patterns can be copied from and to
+  existing code. What a pattern cannot express (enums, checksums, lengths,
+  match tables) is given per field next to it.
+
   A packet with one fixed header:
 
       defmodule MySDR.Protocol do
         use ExHdl.Protocol
 
         defpacket :iq_frame, bus_width: 32, byte_order: :little do
-          header on_mismatch: :drop_packet do
-            <<
-              magic::16 - assert(0x55AA),
-              channel_id::8 - type(:u8),
-              gain_q15::16 - type(:s16),
-              ...
-            >>
-          end
+          header <<magic::16-little, channel_id::8, gain_q15::16-little-signed,
+                   seq_num::16-little, timestamp::64-little>>
+                 when magic == 0x55AA,
+                 on_mismatch: :drop_packet
 
           payload :stream, type: {:complex, :s16}
         end
@@ -25,60 +26,27 @@ defmodule ExHdl.Protocol do
   A chain of headers, where the next layer follows from a field value (in the
   style of a P4 parser):
 
-      defheader :eth do
-        <<
-          dst::48,
-          src::48,
-          ethertype::16 - type({:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800})
-        >>
-      end
+      defheader :eth, <<dst::48, src::48, ethertype::16>>,
+        ethertype: [type: {:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800}]
 
-      defheader :vlan do
-        <<
-          pcp::3,
-          dei::1 - flag,
-          vid::12,
-          ethertype::16 - type({:enum, vlan: 0x8100, ipv4: 0x0800})
-        >>
-      end
+      defheader :vlan, <<pcp::3, dei::1, vid::12, ethertype::16>>,
+        dei: [type: :flag],
+        ethertype: [type: {:enum, vlan: 0x8100, ipv4: 0x0800}]
 
-      defheader :ipv4 do
-        <<
-          version::4,
-          ihl::4,
-          dscp_ecn::8,
-          total_length::16,
-          id::16,
-          flags::3,
-          frag_offset::13,
-          ttl::8,
-          protocol::8,
-          checksum::16,
-          src::32,
-          dst::32,
-          options::bytes
-        >>
-        when version == 4 and
-             error(version, :not_ipv4) and
-             header_length(ihl, 4) and
-             length(total_length, :total) and
-             header_checksum(checksum)
-      end
+      defheader :ipv4,
+        <<version::4, ihl::4, dscp_ecn::8, total_length::16, id::16, flags_frag::16,
+          ttl::8, protocol::8, checksum::16, src::32, dst::32,
+          options::binary-size(ihl * 4 - 20)>>
+        when version == 4,
+        version: [error: :not_ipv4],
+        total_length: [length: :total],
+        checksum: [checksum: :header]
 
-      defheader :udp do
-        <<
-          src_port::16,
-          dst_port::16,
-          length::16,
-          checksum::16
-        >>
-        when hw_match(dst_port, 4) and
-             length(length, :total) and
-             segment_checksum(checksum,
-               optional: true,
-               pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
-             )
-      end
+      defheader :udp, <<src_port::16, dst_port::16, length::16, checksum::16>>,
+        dst_port: [match: 4],
+        length: [length: :total],
+        checksum: [checksum: :segment, optional: true,
+                   pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]]
 
       defpacket :udp_rx, bus_width: 64 do
         layer :eth, next: {:ethertype, vlan: :vlan, qinq: :vlan, ipv4: :ipv4}
@@ -88,30 +56,44 @@ defmodule ExHdl.Protocol do
         payload :data, type: :bytes
       end
 
-  Headers can also be declared using the legacy macro syntax:
-  `field :dst, 48`, `field :ethertype, 16, type: {:enum, ...}`.
+  ## Patterns
 
-  ## Fields & Bitstring Syntax
+  `ExHdl.Protocol.Bitstring` has the details. In short: `name::N` is an
+  unsigned field, `signed` makes it signed, `big` / `little` must agree with
+  the packet's `byte_order`, `name::binary-size(field * unit - fixed)` is the
+  variable tail of a header (IPv4 options, `field` gets `header_length: unit`),
+  a trailing unsized `rest::binary` is ignored, and guards `field == value`
+  become asserts.
 
-  Fields can be declared with native Elixir bitstrings (`<<...>>`) or `field/2,3`.
-  Bitstring modifiers map directly to field options:
+  Every `defheader name, pattern` also defines `match_name/1`, the pattern as
+  an ordinary function head: `binary -> {:ok, fields, rest} | :error` with raw
+  integer fields.
 
-    * `name::bits` - unsigned integer of `bits` width
-    * `name::signed-bits` or `name::bits - signed` - signed integer
-    * `name::bits - flag` or `name::bits - type(:flag)` - 1-bit boolean flag
-    * `name::bits - type({:enum, name: value, ...})` - enum
-    * `name::bits - assert(value)` or `(name = value)::bits` or `name::bits - value`
-    * `name::bits - error(reason)` - custom error reason on mismatch
-    * `name::bits - match(n)` - runtime match table with `n` entries
-    * `name::bits - length(:total)` - layer total length
-    * `name::bits - header_length(unit)` - variable header multiplier
-    * `name::bits - checksum(:header)` - RFC 1071 header checksum
-    * `name::bits - checksum(:segment, optional: true, pseudo: [...])` - UDP segment checksum
-    * `name::bytes` or `name::binary` - variable-length tail
+  ## Field options
+
+  Given as `field: [opts]` after the pattern (or as `field name, bits, opts`
+  in the older `do` block form, which takes `type: :uN | :sN` and `assert:`
+  too):
+
+    * `type:` - `:flag` (1 bit, a boolean) or `{:enum, name: value, ...}`
+      (decodes to the name if known, encodes names or integers)
+    * `error: reason` - decode returns `{:error, reason}` when this field's
+      assert fails, instead of the default tuple
+    * `match: n` - compared at run time against a table: in hardware `n`
+      entries from input ports, on the BEAM the `match:` decode option
+    * `length: :total` - bytes from the start of this layer to the end of the
+      packet; computed on encode, checked on decode, and the packet is cut
+      there (Ethernet padding is dropped)
+    * `header_length: unit` - the layer's header is `value * unit` bytes; the
+      last field (`:bytes`) holds the bytes past the fixed part
+    * `checksum: :header` - RFC 1071 checksum over this layer's header
+    * `checksum: :segment` - checksum over `pseudo:` fields (each zero-extended
+      to 16-bit words), this layer and the payload; `optional: true` means a
+      transmitted 0 is not checked and a computed 0 is sent as `0xFFFF` (UDP)
 
   ## Layers
 
-  `defheader name do ... end` declares a reusable header, `layer name, opts`
+  `defheader` declares a reusable header, `layer name, opts`
   places it in a packet (`header: other` or `header: {Module, other}` to use
   a header under another name). Options: `next: {field, cases}` with cases a
   map or keyword list from field values (or enum names) to the next layer or
@@ -145,7 +127,7 @@ defmodule ExHdl.Protocol do
 
   defmacro __using__(_opts) do
     quote do
-      import ExHdl.Protocol, only: [defpacket: 2, defpacket: 3, defheader: 2]
+      import ExHdl.Protocol, only: [defpacket: 2, defpacket: 3, defheader: 2, defheader: 3]
       Module.register_attribute(__MODULE__, :ex_hdl_packets, accumulate: true)
       Module.register_attribute(__MODULE__, :ex_hdl_headers, accumulate: true)
       @before_compile ExHdl.Protocol
@@ -153,28 +135,76 @@ defmodule ExHdl.Protocol do
   end
 
   defmacro defpacket(name, opts \\ [], do: block) do
-    transformed_block = Bitstring.transform_packet_block(block)
-
     quote do
       ExHdl.Protocol.Builder.start(__MODULE__, unquote(name), unquote(opts))
       import ExHdl.Protocol.DSL
-      unquote(transformed_block)
+      unquote(block)
       import ExHdl.Protocol.DSL, only: []
       ExHdl.Protocol.Builder.finish(__MODULE__)
     end
   end
 
-  defmacro defheader(name, do: block) do
-    transformed_block = Bitstring.transform_ast(block)
+  defmacro defheader(name, pattern_or_block, field_opts \\ [])
 
+  defmacro defheader(name, [do: block], []) do
     quote do
       ExHdl.Protocol.Builder.start_header(__MODULE__, unquote(name))
       import ExHdl.Protocol.DSL, only: [field: 2, field: 3]
-      unquote(transformed_block)
+      unquote(block)
       import ExHdl.Protocol.DSL, only: []
       ExHdl.Protocol.Builder.finish_header(__MODULE__)
     end
   end
+
+  defmacro defheader(name, pattern, field_opts) do
+    {fields, rest_var} = Bitstring.to_fields(pattern, field_opts)
+
+    quote do
+      ExHdl.Protocol.Builder.start_header(__MODULE__, unquote(name))
+      unquote_splicing(field_calls(fields))
+      ExHdl.Protocol.Builder.finish_header(__MODULE__)
+      unquote(match_function(name, pattern, fields, rest_var))
+    end
+  end
+
+  @doc false
+  def field_calls(fields) do
+    for {name, bits, opts} <- fields do
+      quote do
+        ExHdl.Protocol.Builder.field(__MODULE__, unquote(name), unquote(bits), unquote(opts))
+      end
+    end
+  end
+
+  # The pattern itself as a function head, so the BEAM compiler checks it and
+  # plain code can use it.
+  defp match_function(name, pattern, fields, rest_var) when is_atom(name) do
+    {{:<<>>, meta, segments}, guard} = Bitstring.split_guard(pattern)
+    fun = :"match_#{name}"
+    rest = Macro.unique_var(:rest, __MODULE__)
+
+    segments =
+      if rest_var do
+        {:"::", m, [_var, spec]} = List.last(segments)
+        Enum.drop(segments, -1) ++ [{:"::", m, [rest, spec]}]
+      else
+        segments ++ [quote(do: unquote(rest) :: bitstring)]
+      end
+
+    call = {fun, [], [{:<<>>, meta, segments}]}
+    head = if guard, do: {:when, [], [call, guard]}, else: call
+    vars = Map.new(segments, &segment_var/1)
+    map = {:%{}, [], for({f, _, _} <- fields, do: {f, Map.fetch!(vars, f)})}
+
+    quote do
+      @doc "Matches the `#{unquote(inspect(name))}` header pattern: `{:ok, fields, rest}` or `:error`."
+      def unquote(head), do: {:ok, unquote(map), unquote(rest)}
+      def unquote(fun)(bin) when is_bitstring(bin), do: :error
+    end
+  end
+
+  defp segment_var({:"::", _, [{n, _, _} = var, _]}), do: {n, var}
+  defp segment_var({n, _, _} = var), do: {n, var}
 
   defmacro __before_compile__(env) do
     specs = env.module |> Module.get_attribute(:ex_hdl_packets) |> Enum.reverse()
@@ -218,14 +248,31 @@ end
 
 defmodule ExHdl.Protocol.DSL do
   @moduledoc false
-  alias ExHdl.Protocol.Bitstring
 
-  defmacro header(opts \\ [], do: block) do
-    transformed_block = Bitstring.transform_ast(block)
+  # header opts do field ... end, or header pattern, [on_mismatch: ...] ++ field options
+  defmacro header(pattern_or_opts, opts \\ [])
 
+  defmacro header([do: block], []) do
+    quote do
+      ExHdl.Protocol.Builder.header(__MODULE__, [])
+      unquote(block)
+    end
+  end
+
+  defmacro header(opts, do: block) do
     quote do
       ExHdl.Protocol.Builder.header(__MODULE__, unquote(opts))
-      unquote(transformed_block)
+      unquote(block)
+    end
+  end
+
+  defmacro header(pattern, opts) do
+    {header_opts, field_opts} = Keyword.split(opts, [:on_mismatch])
+    {fields, _rest_var} = ExHdl.Protocol.Bitstring.to_fields(pattern, field_opts)
+
+    quote do
+      ExHdl.Protocol.Builder.header(__MODULE__, unquote(header_opts))
+      unquote_splicing(ExHdl.Protocol.field_calls(fields))
     end
   end
 
@@ -338,8 +385,30 @@ defmodule ExHdl.Protocol.Builder do
         {layers, wip.opts, false}
       end
 
+    byte_order = Keyword.get(opts, :byte_order, :big)
+
+    raw_layers =
+      for {lname, hname, fields, lopts} <- raw_layers,
+          do: {lname, hname, check_endian!(wip.name, byte_order, fields), lopts}
+
     spec = ExHdl.Protocol.Spec.build!(wip.name, opts, raw_layers, wip.payload, flat?)
     Module.put_attribute(mod, :ex_hdl_packets, spec)
+  end
+
+  # Pattern fields carry the endianness written in the pattern; it has to be
+  # the packet's byte order (single bytes and below have none).
+  defp check_endian!(pkt, byte_order, fields) do
+    for {name, bits, opts} <- fields do
+      {endian, opts} = Keyword.pop(opts, :endian)
+
+      if endian && endian != byte_order && is_integer(bits) && bits > 8 do
+        raise ArgumentError,
+              "defpacket #{inspect(pkt)}: field #{inspect(name)} is #{endian}-endian in the " <>
+                "pattern but the packet has byte_order: #{inspect(byte_order)}"
+      end
+
+      {name, bits, opts}
+    end
   end
 
   defp lookup_header!(_mod, pkt, {other, hname}) do

@@ -71,63 +71,33 @@ mix ex_hdl.gen.sv MyApp.Kernels --out hdl/generated --synth   # stream kernels, 
 ## Packets in hardware
 
 `defpacket` describes a header chain once; it becomes a BEAM codec and an
-AXI4-Stream parser and emitter. Headers can be defined with idiomatic Elixir
-binary pattern matching syntax (`<<...>>`) or `field/2,3`. The AES67 receive chain:
+AXI4-Stream parser and emitter. Headers are plain Elixir binary patterns, the
+ones a hand-written parser would put in a function head, so they can be
+copied from existing code. What a pattern cannot say (enums, checksums,
+lengths, match tables) goes per field next to it. The AES67 receive chain:
 
 ```elixir
-defheader :eth do
-  <<
-    dst::48,
-    src::48,
-    ethertype::16 - type({:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800})
-  >>
-end
+defheader :eth, <<dst::48, src::48, ethertype::16>>,
+  ethertype: [type: {:enum, vlan: 0x8100, qinq: 0x88A8, ipv4: 0x0800}]
 
-defheader :vlan do
-  <<
-    pcp::3,
-    dei::1 - flag,
-    vid::12,
-    ethertype::16 - type({:enum, vlan: 0x8100, ipv4: 0x0800})
-  >>
-end
+defheader :vlan, <<pcp::3, dei::1, vid::12, ethertype::16>>,
+  dei: [type: :flag],
+  ethertype: [type: {:enum, vlan: 0x8100, ipv4: 0x0800}]
 
-defheader :ipv4 do
-  <<
-    version::4,
-    ihl::4,
-    dscp_ecn::8,
-    total_length::16,
-    id::16,
-    flags_frag::16,
-    ttl::8,
-    protocol::8,
-    checksum::16,
-    src::32,
-    dst::32,
-    options::bytes
-  >>
-  when version == 4 and
-       error(version, :not_ipv4) and
-       header_length(ihl, 4) and
-       length(total_length, :total) and
-       header_checksum(checksum)
-end
+defheader :ipv4,
+          <<version::4, ihl::4, dscp_ecn::8, total_length::16, id::16, flags_frag::16,
+            ttl::8, protocol::8, checksum::16, src::32, dst::32,
+            options::binary-size(ihl * 4 - 20)>>
+          when version == 4,
+          version: [error: :not_ipv4],
+          total_length: [length: :total],
+          checksum: [checksum: :header]
 
-defheader :udp do
-  <<
-    src_port::16,
-    dst_port::16,
-    length::16,
-    checksum::16
-  >>
-  when hw_match(dst_port, 4) and
-       length(length, :total) and
-       segment_checksum(checksum,
-         optional: true,
-         pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
-       )
-end
+defheader :udp, <<src_port::16, dst_port::16, length::16, checksum::16>>,
+  dst_port: [match: 4],
+  length: [length: :total],
+  checksum: [checksum: :segment, optional: true,
+             pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]]
 
 defpacket :udp_rx, bus_width: 64 do
   layer :eth, next: {:ethertype, vlan: :vlan, qinq: :vlan, ipv4: :ipv4}
@@ -142,7 +112,11 @@ end
 fills in EtherTypes, IHL, lengths and checksums; `decode_udp_rx/2` checks
 them, cuts Ethernet padding and returns `{:ok, header, payload}` or an
 `{:error, {kind, {layer, field}, value}}` (`ExHdl.Protocol.Codec`);
-`decode_udp_rx_header/2` stops after the headers.
+`decode_udp_rx_header/2` stops after the headers. Each `defheader` also
+gets `match_ipv4/1` and so on: the pattern as an ordinary function head,
+returning `{:ok, fields, rest}` or `:error`. Guards `field == value` become
+asserts, `binary-size(ihl * 4 - 20)` makes `ihl` the header length, and the
+older `defheader :eth do field :dst, 48 ... end` form still works.
 
 The parser matches every header layout (here 33: 0-2 tags times 11 IHL
 values) in parallel against a byte register of the header, decides in the

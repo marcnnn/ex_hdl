@@ -1,5 +1,16 @@
 # RFC / Issue: Idiomatic Binary Pattern Matching DSL for `ExHdl.Protocol`
 
+## Status
+
+Phase 1 is done, in a different shape than sketched below: headers are
+real Elixir patterns (`defheader :udp, <<src_port::16, ...>>, dst_port:
+[match: 4]`), not bitstrings with invented modifiers such as
+`x::16 - type(...)` or pseudo-guards such as `header_checksum(c)`, which
+no BEAM code can use. Constants are `field == value` guards, the IPv4 tail
+is `options::binary-size(ihl * 4 - 20)`, and everything a pattern cannot
+say is a per-field keyword list. Each header gets `match_name/1`, the
+pattern compiled as a function head. See `ExHdl.Protocol.Bitstring`.
+
 ## Summary
 
 Refactor and extend `ExHdl.Protocol` to support standard Elixir binary pattern matching syntax (`<<...>>`) for protocol definitions alongside the existing `field`/`layer` macro syntax. This allows developers to declare packet protocols using idiomatic Elixir patterns (matching ecosystem norms such as Nerves and Erlang/OTP) while compiling to both zero-copy BEAM software codecs and synthesizable SystemVerilog AXI4-Stream hardware.

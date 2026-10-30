@@ -45,7 +45,12 @@ rtl_dsl = [
   field: 2,
   field: 3,
   field: 4,
-  window: 2
+  window: 2,
+  # ExHdl.Protocol
+  defheader: 2,
+  defheader: 3,
+  header: 1,
+  header: 2
 ]
 
 [
