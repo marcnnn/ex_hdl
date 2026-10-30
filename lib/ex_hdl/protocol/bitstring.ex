@@ -1,6 +1,7 @@
 defmodule ExHdl.Protocol.Bitstring do
   @moduledoc """
-  Translates Elixir bitstring syntax (`<<...>>`) into `ExHdl.Protocol` field declarations.
+  Translates Elixir bitstring syntax (`<<...>>`) and guards (`when ...`) into
+  `ExHdl.Protocol` field declarations.
 
   Supported segment forms:
     * `name::bits` - unsigned integer of `bits` width
@@ -15,11 +16,33 @@ defmodule ExHdl.Protocol.Bitstring do
     * `name::bits - checksum(:segment, optional: true, pseudo: [...])`
     * `name::bits - match(n)`
     * `name::bytes` or `name::binary` - variable-length tail
+
+  Supported guards (`when ...`):
+    * `field == val` - assertions on field values
+    * `header_length(field, unit)` - variable header multiplier
+    * `length(field, :total)` - total layer length
+    * `header_checksum(field)` - RFC 1071 header checksum
+    * `segment_checksum(field, opts)` - segment checksum (UDP)
+    * `hw_match(field, n)` or `match(field, n)` - hardware match table
+    * `error(field, reason)` - error tuple on mismatch
+    * `type(field, type_val)` - custom field type
   """
 
   @doc """
-  Parses a `{:<<>>, meta, segments}` AST into a list of `{name, bits, opts}`.
+  Parses a `{:<<>>, meta, segments}` or `{:when, _, [bitstring, guard_expr]}`
+  AST into a list of `{name, bits, opts}`.
   """
+  def to_fields({:when, _meta, [{:<<>>, _, _} = bitstring, guard_expr]}) do
+    fields = to_fields(bitstring)
+    guard_directives = parse_guards(guard_expr)
+
+    Enum.map(fields, fn {name, bits, opts} ->
+      extra_opts = Map.get(guard_directives, name, [])
+      merged_opts = Enum.reduce(extra_opts, opts, fn {k, v}, acc -> put_opt(acc, k, v) end)
+      {name, bits, merged_opts}
+    end)
+  end
+
   def to_fields({:<<>>, _meta, segments}) do
     {fields, _} =
       Enum.map_reduce(segments, 0, fn segment, offset ->
@@ -33,10 +56,19 @@ defmodule ExHdl.Protocol.Bitstring do
   end
 
   @doc """
-  Transforms an AST block: replaces any `{:<<>>, meta, segments}` with
-  calls to `ExHdl.Protocol.Builder.field(__MODULE__, name, bits, opts)`.
+  Transforms an AST block: replaces any `{:<<>>, meta, segments}` or
+  `{:when, _, [bitstring, guard]}` with calls to
+  `ExHdl.Protocol.Builder.field(__MODULE__, name, bits, opts)`.
   Expressions that are not bitstrings are preserved as-is.
   """
+  def transform_ast({:when, _meta, [{:<<>>, _, _}, _guard_expr]} = expr) do
+    fields = to_fields(expr)
+
+    quote do
+      unquote_splicing(emit_fields(fields))
+    end
+  end
+
   def transform_ast({:<<>>, _meta, _segments} = bitstring) do
     fields = to_fields(bitstring)
 
@@ -48,6 +80,10 @@ defmodule ExHdl.Protocol.Bitstring do
   def transform_ast({:__block__, meta, exprs}) do
     transformed_exprs =
       Enum.flat_map(exprs, fn
+        {:when, _meta, [{:<<>>, _, _}, _guard_expr]} = expr ->
+          fields = to_fields(expr)
+          emit_fields(fields)
+
         {:<<>>, _meta, _segments} = bitstring ->
           fields = to_fields(bitstring)
           emit_fields(fields)
@@ -63,9 +99,17 @@ defmodule ExHdl.Protocol.Bitstring do
 
   @doc """
   Transforms the body of `defpacket`:
-  If a top-level bitstring is present without an explicit `header` block,
-  it expands into `header do ... end`.
+  If a top-level bitstring or guarded bitstring is present without an explicit
+  `header` block, it expands into `header do ... end`.
   """
+  def transform_packet_block({:when, _meta, [{:<<>>, _, _}, _guard_expr]} = expr) do
+    quote do
+      header do
+        unquote(expr)
+      end
+    end
+  end
+
   def transform_packet_block({:<<>>, _meta, _segments} = bitstring) do
     quote do
       header do
@@ -77,6 +121,13 @@ defmodule ExHdl.Protocol.Bitstring do
   def transform_packet_block({:__block__, meta, exprs}) do
     transformed_exprs =
       Enum.map(exprs, fn
+        {:when, _wmeta, [{:<<>>, _, _}, _guard_expr]} = expr ->
+          quote do
+            header do
+              unquote(expr)
+            end
+          end
+
         {:<<>>, _bmeta, _segments} = bitstring ->
           quote do
             header do
@@ -144,6 +195,69 @@ defmodule ExHdl.Protocol.Bitstring do
   defp put_opt(opts, key, val) do
     Keyword.delete(opts, key) ++ [{key, val}]
   end
+
+  defp parse_guards(guard_expr) do
+    flatten_guards(guard_expr)
+    |> Enum.map(&parse_single_guard/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.reduce(%{}, fn {field, opts}, acc ->
+      Map.update(acc, field, opts, &(&1 ++ opts))
+    end)
+  end
+
+  defp flatten_guards({:and, _, [left, right]}), do: flatten_guards(left) ++ flatten_guards(right)
+  defp flatten_guards({:&&, _, [left, right]}), do: flatten_guards(left) ++ flatten_guards(right)
+  defp flatten_guards(other), do: [other]
+
+  defp parse_single_guard({:==, _, [{field, _, _}, val]}) when is_atom(field),
+    do: {field, [assert: val]}
+
+  defp parse_single_guard({:==, _, [val, {field, _, _}]}) when is_atom(field),
+    do: {field, [assert: val]}
+
+  defp parse_single_guard({:header_length, _, [{field, _, _}, unit]}),
+    do: {field, [header_length: unit]}
+
+  defp parse_single_guard({:length, _, [{field, _, _}, len]}),
+    do: {field, [length: len]}
+
+  defp parse_single_guard({:header_checksum, _, [{field, _, _}]}),
+    do: {field, [checksum: :header]}
+
+  defp parse_single_guard({:segment_checksum, _, [{field, _, _}, opts]}) when is_list(opts),
+    do: {field, [checksum: :segment] ++ opts}
+
+  defp parse_single_guard({:segment_checksum, _, [{field, _, _}]}),
+    do: {field, [checksum: :segment]}
+
+  defp parse_single_guard({:checksum, _, [{field, _, _}, :header]}),
+    do: {field, [checksum: :header]}
+
+  defp parse_single_guard({:checksum, _, [{field, _, _}, :segment, opts]}) when is_list(opts),
+    do: {field, [checksum: :segment] ++ opts}
+
+  defp parse_single_guard({:checksum, _, [{field, _, _}, :segment]}),
+    do: {field, [checksum: :segment]}
+
+  defp parse_single_guard({call, _, [{field, _, _}, n]}) when call in [:match, :hw_match],
+    do: {field, [match: n]}
+
+  defp parse_single_guard({:error, _, [{field, _, _}, reason]}),
+    do: {field, [error: reason]}
+
+  defp parse_single_guard({:type, _, [{field, _, _}, type_val]}),
+    do: {field, [type: type_val]}
+
+  defp parse_single_guard({:flag, _, [{field, _, _}]}),
+    do: {field, [type: :flag]}
+
+  defp parse_single_guard({:optional, _, [{field, _, _}, opt]}),
+    do: {field, [optional: opt]}
+
+  defp parse_single_guard({:pseudo, _, [{field, _, _}, ps]}),
+    do: {field, [pseudo: ps]}
+
+  defp parse_single_guard(_other), do: nil
 
   defp parse_modifiers(modifiers, initial_opts) do
     {bits, opts} =

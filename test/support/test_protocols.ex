@@ -6,13 +6,14 @@ defmodule ExHdl.Test.Protocols do
   defpacket :iq_frame, bus_width: 32, byte_order: :little do
     header on_mismatch: :drop_packet do
       <<
-        magic::16 - assert(0x55AA),
+        magic::16,
         channel_id::8 - type(:u8),
         flags::8 - type(:u8),
         gain_q15::16 - type(:s16),
         seq_num::16 - type(:u16),
         timestamp::64 - type(:u64)
       >>
+      when magic == 0x55AA
     end
 
     payload(:stream, type: {:complex, :s16})
@@ -23,13 +24,14 @@ defmodule ExHdl.Test.Protocols do
   defpacket :be_frame, bus_width: 64, byte_order: :big do
     header do
       <<
-        version::4 - assert(6),
+        version::4,
         tclass::8,
         flow::20,
         len::16,
         next::8,
         hops::8 - type(:s8)
       >>
+      when version == 6
     end
 
     payload(:data, type: :u8)
@@ -41,9 +43,10 @@ defmodule ExHdl.Test.Protocols do
       <<
         kind::4 - type({:enum, data: 1, ctrl: 2}),
         urgent::1 - flag,
-        tag::3 - assert(5),
+        tag::3,
         seq::32
       >>
+      when tag == 5
     end
 
     payload(:words, type: :u16)
@@ -75,35 +78,46 @@ defmodule ExHdl.Test.NetProtocols do
 
   defheader :ipv4 do
     <<
-      version::4 - assert(4) - error(:not_ipv4),
-      ihl::4 - header_length(4),
+      version::4,
+      ihl::4,
       dscp::6,
       ecn::2,
-      total_length::16 - length(:total),
+      total_length::16,
       id::16,
       reserved::1,
-      df::1 - flag,
-      mf::1 - flag,
+      df::1,
+      mf::1,
       frag_offset::13,
       ttl::8,
-      protocol::8 - type({:enum, udp: 17}),
-      checksum::16 - checksum(:header),
+      protocol::8,
+      checksum::16,
       src::32,
       dst::32,
       options::bytes
     >>
+    when version == 4 and
+         error(version, :not_ipv4) and
+         header_length(ihl, 4) and
+         length(total_length, :total) and
+         flag(df) and
+         flag(mf) and
+         type(protocol, {:enum, udp: 17}) and
+         header_checksum(checksum)
   end
 
   defheader :udp do
     <<
       src_port::16,
-      dst_port::16 - match(4),
-      length::16 - length(:total),
-      checksum::16 - checksum(:segment,
-        optional: true,
-        pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
-      )
+      dst_port::16,
+      length::16,
+      checksum::16
     >>
+    when hw_match(dst_port, 4) and
+         length(length, :total) and
+         segment_checksum(checksum,
+           optional: true,
+           pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
+         )
   end
 
   for w <- [8, 32, 64] do

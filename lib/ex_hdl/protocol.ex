@@ -44,32 +44,40 @@ defmodule ExHdl.Protocol do
 
       defheader :ipv4 do
         <<
-          version::4 - assert(4) - error(:not_ipv4),
-          ihl::4 - header_length(4),
+          version::4,
+          ihl::4,
           dscp_ecn::8,
-          total_length::16 - length(:total),
+          total_length::16,
           id::16,
           flags::3,
           frag_offset::13,
           ttl::8,
           protocol::8,
-          checksum::16 - checksum(:header),
+          checksum::16,
           src::32,
           dst::32,
           options::bytes
         >>
+        when version == 4 and
+             error(version, :not_ipv4) and
+             header_length(ihl, 4) and
+             length(total_length, :total) and
+             header_checksum(checksum)
       end
 
       defheader :udp do
         <<
           src_port::16,
-          dst_port::16 - match(4),
-          length::16 - length(:total),
-          checksum::16 - checksum(:segment,
-            optional: true,
-            pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
-          )
+          dst_port::16,
+          length::16,
+          checksum::16
         >>
+        when hw_match(dst_port, 4) and
+             length(length, :total) and
+             segment_checksum(checksum,
+               optional: true,
+               pseudo: [{:ipv4, :src}, {:ipv4, :dst}, {:ipv4, :protocol}, :length]
+             )
       end
 
       defpacket :udp_rx, bus_width: 64 do
